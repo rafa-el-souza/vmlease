@@ -1,7 +1,7 @@
 # distro-profiles Specification
 
 ## Purpose
-TBD - created by archiving change graduate-probehost-to-vmlease. Update Purpose after archive.
+Per-distro provisioning: a read-only profile registry (image + package/repo prep), stdlib `@@name@@` cloud-init rendering, and the rescue-write path for distros with no native provider image (Arch — resolve-latest → SHA256 → pinned-GPG-signature verify → rescue-write the cloudimg onto a cheap base host).
 ## Requirements
 ### Requirement: A read-only distro profile registry drives per-distro provisioning
 

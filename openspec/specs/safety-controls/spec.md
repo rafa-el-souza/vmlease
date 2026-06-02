@@ -1,7 +1,7 @@
 # safety-controls Specification
 
 ## Purpose
-TBD - created by archiving change graduate-probehost-to-vmlease. Update Purpose after archive.
+The guarantees that keep a throwaway-VM harness from leaking spend: the cost guard (host cap + cheap-server-type allowlist), the deterministic `vmlease=<run-id>` label scheme, confirm-before-create, guaranteed best-effort teardown, the `reap`/`status` orphan backstop, and provider-token-blindness.
 ## Requirements
 ### Requirement: The cost guard caps host count and restricts server types
 

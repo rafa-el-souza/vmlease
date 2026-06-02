@@ -163,7 +163,7 @@ def _host_from_server(server: dict[str, object]) -> Host:
 
 
 # --------------------------------------------------------------------------- #
-# The Hetzner implementation (subprocess; not exercised by Phase-1 unit tests)
+# The Hetzner implementation (subprocess; exercised via an injected fake runner)
 # --------------------------------------------------------------------------- #
 class HetznerProvider:
     """``hcloud``-CLI-backed provider. Relies on the active context; no token here.

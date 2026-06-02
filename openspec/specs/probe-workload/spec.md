@@ -1,7 +1,7 @@
 # probe-workload Specification
 
 ## Purpose
-TBD - created by archiving change graduate-probehost-to-vmlease. Update Purpose after archive.
+The probe battery workload: declarative `Probe`/`Battery` data loaded from JSON, tag-ordered execution (read-only → operator-space → host-root) over SSH, a self-describing host-detail snapshot, and timestamped JSON results (timestamp injected, not clock-read).
 ## Requirements
 ### Requirement: A battery is declarative data loaded from JSON
 

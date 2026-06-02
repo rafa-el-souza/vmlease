@@ -1,7 +1,7 @@
 # vm-provisioning Specification
 
 ## Purpose
-TBD - created by archiving change graduate-probehost-to-vmlease. Update Purpose after archive.
+The provision → (transform) → run-workload → always-teardown spine: build a matrix into labelled host specs, render a `plan` dry-run that makes zero provider calls, and execute each host in isolation (one host's failure never discards another's results) with optional parallelism, over a `Provider` abstraction.
 ## Requirements
 ### Requirement: Matrix builds into labelled host specs deterministically
 
