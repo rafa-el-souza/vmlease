@@ -21,13 +21,13 @@ install:  ## sync the env + dev tools
 	@uv sync --quiet
 
 lint:  ## strict lint, no autofix
-	@uv run --quiet ruff check --output-format concise src tests
+	@uv run --quiet ruff check -q --output-format concise src tests && echo "✓ lint clean (exit 0)"
 
 format:  ## apply ruff's SAFE autofixes (NOT `ruff format`, which is banned)
 	@uv run --quiet ruff check --fix src tests
 
 typecheck:  ## strict type check
-	@uv run --quiet mypy --strict src tests
+	@uv run --quiet mypy --no-error-summary --strict src tests && echo "✓ types clean (exit 0)"
 
 test:  ## run the suite (warnings are errors; per-test output shown only on failure)
 	@uv run --quiet python -W error -m unittest discover -s tests -t . --buffer
