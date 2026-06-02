@@ -1,0 +1,25 @@
+# Pre-commit hook — run the strict gate before every commit, via the Makefile
+# targets (the single source of truth for project commands). NOTE: each hook runs
+# the full check over the whole tree on every commit (pass_filenames: false /
+# always_run: true), so keep the working tree green before each per-task commit.
+repos:
+  - repo: local
+    hooks:
+      - id: lint
+        name: make lint
+        entry: make lint
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: typecheck
+        name: make typecheck
+        entry: make typecheck
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: test
+        name: make test
+        entry: make test
+        language: system
+        pass_filenames: false
+        always_run: true
