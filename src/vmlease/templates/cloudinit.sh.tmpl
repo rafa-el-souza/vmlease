@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# vmlease cloud-init — prepare a throwaway host for the probe battery.
+# Rendered (logic-free) from a DistroProfile: @@distro_key@@ via @@package_manager@@.
+# Slots use a double-at delimiter; every shell $VAR / $(...) passes through untouched.
+set -Eeuo pipefail
+
+vmlease_cloudinit_main() {
+  local operator='@@operator@@'
+
+  # --- refresh the system to a clean baseline (manager-derived) -----------
+  @@system_update@@
+
+  # --- create the non-root, sudo-capable operator account -----------------
+  if ! id "$operator" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$operator"
+  fi
+  # passwordless sudo for the throwaway operator (host is disposable; this is
+  # the escalation path a host-root probe needs).
+  local sudoers_file="/etc/sudoers.d/90-vmlease-$operator"
+  install -m 0440 /dev/stdin "$sudoers_file" <<SUDOERS
+$operator ALL=(ALL) NOPASSWD: ALL
+SUDOERS
+  # sanity-check the drop-in parses (a malformed sudoers file can lock out
+  # sudo on a real host — validate before trusting it).
+  visudo -c -f "$sudoers_file" >/dev/null
+
+  # --- install the rootless-docker prerequisite package set ---------------
+  @@install_block@@
+
+  # --- drop the throwaway probe public key for the operator ---------------
+  install -d -m 0700 -o "$operator" -g "$operator" "/home/$operator/.ssh"
+  install -m 0600 -o "$operator" -g "$operator" /dev/stdin "/home/$operator/.ssh/authorized_keys" <<'PUBKEY'
+@@operator_pubkey@@
+PUBKEY
+
+  # --- readiness sentinel the harness polls for over SSH ------------------
+  touch /var/lib/vmlease-ready
+  echo "vmlease cloud-init complete for $operator (@@distro_key@@)"
+}
+
+vmlease_cloudinit_main "$@"
