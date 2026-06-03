@@ -1,50 +1,71 @@
-"""Arch rescue-write transform — turn a just-created host INTO an Arch host.
+"""Rescue-write transform — turn a just-created host INTO a no-native-image distro.
 
-Hetzner has no Arch image, so an Arch host is provisioned in two moves:
+Hetzner has no image for some distros (e.g. Arch), so such a host is provisioned
+in two moves:
 
 1. create a cheap base host (e.g. debian-13) WITH vmlease's normal cloud-init
    ``--user-data`` attached (Hetzner stores it on the server's metadata);
-2. **rescue-write** the verified Arch *cloudimg* qcow2 onto that host's disk and
-   reboot — the cloudimg ships cloud-init, which reads Hetzner's ``hetzner``
-   datasource on first boot and applies the SAME ``--user-data`` prep + injected
-   key as every other distro (verified on a real host 2026-06-01).
+2. **rescue-write** a verified *cloudimg* qcow2 onto that host's disk and reboot
+   — the cloudimg ships cloud-init, which reads Hetzner's ``hetzner`` datasource
+   on first boot and applies the SAME ``--user-data`` prep + injected key as every
+   other distro (verified on a real host 2026-06-01).
 
-So there is **no snapshot** and no run-to-run state: the pinned-signature verify
-(:mod:`vmlease.archimage`) runs FRESH on every Arch build — verify-every-run,
-strictly stronger than verify-once-into-a-reused-snapshot, and nothing billable
-lingers. The build cost is one ~530 MiB fetch + a `qemu-img convert` + two
-reboots (~2-3 min), which is acceptable for the security gain.
+*Which* image, and *how it is trusted*, is the per-distro
+:class:`~vmlease.rescue_image.RescueImageSpec` (Arch resolve-latest + pinned-GPG;
+a pinned golden image, sha-only). This module owns the image-generic SPINE: the
+spec's ``resolve_and_verify`` is the trust gate (run FIRST, before any mutation);
+the verified source is then delivered to the rescue system — a
+:class:`~vmlease.rescue_image.RemoteUrl` is curled on the rescue side, a
+:class:`~vmlease.rescue_image.LocalFile` is scp-pushed to it — and the rescue side
+re-verifies the sha before ``qemu-img convert``.
 
-This module owns the orchestration: the pure argv builders + the rescue-write
-script renderer are unit-tested; the live provider/ssh/reboot calls are the
-billable path, behind injected seams. Every host-side step is a fail-loud probe
-(detect the disk, re-verify the sha) rather than a hardcoded assumption — the
-recipe encoded here is the real-host-proven one.
+So there is **no snapshot** and no run-to-run state: the verify runs FRESH on
+every build — verify-every-run, strictly stronger than
+verify-once-into-a-reused-snapshot, and nothing billable lingers. The build cost
+is one ~530 MiB fetch + a `qemu-img convert` + two reboots (~2-3 min), which is
+acceptable for the security gain.
+
+The pure argv builders + the rescue-write script renderer are unit-tested; the
+live provider/ssh/reboot calls are the billable path, behind injected seams.
+Every host-side step is a fail-loud probe (detect the disk, re-verify the sha)
+rather than a hardcoded assumption — the recipe encoded here is the
+real-host-proven one.
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from vmlease.rescue_image import LocalFile, RemoteUrl, ResolveDeps
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from vmlease.archimage import ArchVersion, ResolvedImage
     from vmlease.distro import DistroProfile
     from vmlease.model import Host
+    from vmlease.rescue_image import ResolvedRescueImage
+
+# The fixed rescue-side path the image lands at — both delivery modes converge
+# here: a ``RemoteUrl`` is curled to it; a ``LocalFile`` is scp-pushed to it by the
+# orchestrator before the script runs. The sha re-check + convert read this path.
+RESCUE_IMAGE_PATH = "/tmp/vmlease-rescue.qcow2"
 
 # The on-rescue-system write script. Runs as root in the Hetzner rescue system,
 # which a real-host run confirmed ships qemu-img + curl + sha256sum. It probes the disk
 # device (never hardcodes sda vs nvme), re-verifies the sha after transfer, and
 # converts qcow2 -> raw onto the disk. ``@@...@@`` slots are filled by
-# :func:`render_rescue_script` (logic-free; shell ``$`` passes through).
+# :func:`render_rescue_script` (logic-free; shell ``$`` passes through). The
+# ``@@fetch_cmd@@`` slot is the source-specific acquisition step: a ``curl`` for a
+# remote URL, a presence check for an already-pushed local file.
 _RESCUE_WRITE_SCRIPT = """#!/usr/bin/env bash
 set -Eeuo pipefail
 
 vmlease_rescue_write() {
-  local url='@@qcow2_url@@' expected_sha='@@expected_sha256@@'
+  local image='@@image_path@@' expected_sha='@@expected_sha256@@'
 
   # probe the real root block device (NOT assumed sda vs nvme0n1).
   local disk
@@ -54,13 +75,15 @@ vmlease_rescue_write() {
 
   command -v qemu-img >/dev/null 2>&1 || { echo 'RESCUE_FAIL: qemu-img absent' >&2; exit 12; }
 
-  # fetch + RE-verify the sha (defence in depth: the operator side already
-  # verified sha+signature; the rescue side re-checks integrity post-transfer).
-  curl -fsSL "$url" -o /tmp/arch.qcow2 || { echo 'RESCUE_FAIL: download failed' >&2; exit 13; }
-  echo "${expected_sha}  /tmp/arch.qcow2" | sha256sum -c - \
+  # acquire the image at the fixed path (curl a remote URL, or assert a pushed
+  # local file is present), then RE-verify the sha (defence in depth: the
+  # operator side already verified sha[+signature]; the rescue side re-checks
+  # integrity post-transfer, source-independent).
+  @@fetch_cmd@@
+  echo "${expected_sha}  ${image}" | sha256sum -c - \
     || { echo 'RESCUE_FAIL: sha256 mismatch on rescue side' >&2; exit 14; }
 
-  qemu-img convert -O raw /tmp/arch.qcow2 "$disk" \
+  qemu-img convert -O raw "$image" "$disk" \
     || { echo 'RESCUE_FAIL: qemu-img convert failed' >&2; exit 15; }
   sync
   echo 'RESCUE_WRITE_OK'
@@ -119,18 +142,44 @@ def parse_rescue_password(enable_rescue_stdout: str) -> str:
     return m.group(1)
 
 
-def render_rescue_script(qcow2_url: str, expected_sha256: str) -> str:
-    """Render the on-rescue-system write script (logic-free slot fill)."""
+def render_fetch_cmd(source: RemoteUrl | LocalFile) -> str:
+    """The source-specific acquisition step for the on-rescue-system script.
+
+    - :class:`RemoteUrl`: ``curl -fsSL <url> -o <path>`` (the rescue side fetches);
+      the URL is :func:`shlex.quote`-escaped so it cannot break out of the script.
+    - :class:`LocalFile`: a ``test -f <path>`` presence check (the orchestrator has
+      already scp-pushed the file to that fixed path; the script only asserts it).
+
+    Both leave the image at :data:`RESCUE_IMAGE_PATH`, where the sha re-check +
+    ``qemu-img convert`` read it.
+    """
+    if isinstance(source, RemoteUrl):
+        return (
+            f"curl -fsSL {shlex.quote(source.url)} -o {RESCUE_IMAGE_PATH} "
+            "|| { echo 'RESCUE_FAIL: download failed' >&2; exit 13; }"
+        )
+    return (
+        f"test -f {RESCUE_IMAGE_PATH} "
+        "|| { echo 'RESCUE_FAIL: pushed image absent' >&2; exit 13; }"
+    )
+
+
+def render_rescue_script(source: RemoteUrl | LocalFile, expected_sha256: str) -> str:
+    """Render the on-rescue-system write script (logic-free slot fill).
+
+    The ``source`` drives only the rendered ``@@fetch_cmd@@`` acquisition step; the
+    disk probe, sha re-check, and convert are source-independent.
+    """
     from vmlease.templating import render
 
-    return render(_RESCUE_WRITE_SCRIPT, {"qcow2_url": qcow2_url, "expected_sha256": expected_sha256})
-
-
-def rescue_image_url(version: ArchVersion, profile: DistroProfile) -> str:
-    """The mirror URL of the profile's rescue image for ``version``."""
-    from vmlease.archimage import version_dir_url
-
-    return f"{version_dir_url(version)}{profile.rescue_image}"
+    return render(
+        _RESCUE_WRITE_SCRIPT,
+        {
+            "fetch_cmd": render_fetch_cmd(source),
+            "image_path": RESCUE_IMAGE_PATH,
+            "expected_sha256": expected_sha256,
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -142,13 +191,12 @@ class RescueWriteDeps:
 
     Each is a seam so the orchestration is unit-testable without hcloud/ssh/network:
 
-    - ``verify``: resolve the latest image AND verify it (SHA256 + the pinned
-      ``arch-boxes`` GPG signature), returning the validated
-      :class:`~vmlease.archimage.ResolvedImage`. This is the **trust gate** —
-      it runs FIRST, before any host mutation, so an unauthentic image aborts the
-      build before a single billable/destructive step. Raising here is the
-      fail-closed path. The live wiring delegates to
-      :func:`vmlease.archimage.resolve_and_verify` with the pinned key.
+    - ``resolve_deps``: the IO seams (:class:`~vmlease.rescue_image.ResolveDeps`)
+      the profile's :class:`~vmlease.rescue_image.RescueImageSpec` uses to resolve
+      + verify its image. The spec call is the **trust gate** — it runs FIRST,
+      before any host mutation, so an unauthentic image (bad sha, or bad signature
+      for a signed spec) aborts the build before a single billable/destructive
+      step. Raising there is the fail-closed path.
     - ``cli``: run an ``hcloud`` argv -> ``(rc, stdout, stderr)`` (provider CLI).
     - ``ssh_root``: run a shell script on the rescue/host as root over ssh,
       returning ``(exit_code, combined_output)``.
@@ -156,35 +204,50 @@ class RescueWriteDeps:
       (hostname=='rescue'). The post-write target-OS readiness is NOT here — it
       is owned by the probe phase's operator-readiness wait (different principal /
       key), so the rescue-write only ISSUES the final reset.
+    - ``push_to_rescue``: scp a LOCAL image file to the rescue system at the fixed
+      rescue-side path (``ip, local_path, remote_path``) — used only when the
+      resolved source is a :class:`~vmlease.rescue_image.LocalFile`; a
+      :class:`~vmlease.rescue_image.RemoteUrl` is curled by the script instead.
     """
 
-    verify: Callable[[DistroProfile], ResolvedImage]
+    resolve_deps: ResolveDeps
     cli: Callable[[list[str]], tuple[int, str, str]]
     ssh_root: Callable[[str, str], tuple[int, str]]
     wait_rescue_ready: Callable[[str], None]
+    push_to_rescue: Callable[[str, Path, str], None]
 
 
 def rescue_write_host(host: Host, profile: DistroProfile, deps: RescueWriteDeps, ssh_key_name: str) -> None:
     """Transform ``host`` into the rescue-write distro IN PLACE (the real-host recipe).
 
-    Order is load-bearing for trust: **verify FIRST** (SHA256 + pinned-key GPG
-    signature, via ``deps.verify``) — so an unauthentic or tampered image aborts
-    BEFORE any rescue/reset mutation — then enable rescue, reset into it, write the
-    image onto the disk (the rescue side re-checks the SHA post-transfer), disable
+    Order is load-bearing for trust: **verify FIRST** (the profile's
+    ``RescueImageSpec.resolve_and_verify`` — SHA256, plus a pinned-key signature
+    for a signed spec) — so an unauthentic or tampered image aborts BEFORE any
+    rescue/reset mutation — then enable rescue, reset into it, deliver the image
+    (curl a remote URL on the rescue side, or scp-push a local file to it), write
+    it onto the disk (the rescue side re-checks the SHA post-transfer), disable
     rescue, reset into the written disk. Raises :class:`ArchBuildError` (or the
     verify's :class:`~vmlease.archimage.ArchImageError`) on any failure; the
     caller (runner) tears the host down regardless.
     """
+    spec = profile.rescue_image
+    if spec is None:
+        raise ArchBuildError(f"distro {profile.key!r} has no rescue_image spec; cannot rescue-write")
     # TRUST GATE — must precede every mutation. A bad signature / sha raises here,
     # before enable-rescue, so nothing destructive runs against an untrusted image.
-    resolved = deps.verify(profile)
-    url = rescue_image_url(resolved.version, profile)
+    resolved: ResolvedRescueImage = spec.resolve_and_verify(deps.resolve_deps)
 
     _check(deps.cli(build_enable_rescue_argv(host.id, ssh_key_name)), "enable-rescue")
     _check(deps.cli(build_reset_argv(host.id)), "reset-into-rescue")
     deps.wait_rescue_ready(host.ipv4)
 
-    script = render_rescue_script(url, resolved.expected_sha256)
+    # LocalFile delivery: push the verified file to the fixed rescue-side path
+    # BEFORE the script (which then only asserts its presence). RemoteUrl is curled
+    # by the script instead — no push.
+    if isinstance(resolved.source, LocalFile):
+        deps.push_to_rescue(host.ipv4, resolved.source.path, RESCUE_IMAGE_PATH)
+
+    script = render_rescue_script(resolved.source, resolved.expected_sha256)
     rc, out = deps.ssh_root(host.ipv4, script)
     if rc != 0 or "RESCUE_WRITE_OK" not in out:
         raise ArchBuildError(f"rescue write failed (rc={rc}) for {host.name}: {out[-400:]!r}")
@@ -204,47 +267,6 @@ def _check(result: tuple[int, str, str], step: str) -> None:
     rc, _out, err = result
     if rc != 0:
         raise ArchBuildError(f"hcloud {step} failed (rc={rc}): {err[:200]!r}")
-
-
-def build_verify(
-    *,
-    text_fetcher: Callable[[str], str],
-    fetcher: Callable[[str], bytes],
-    gpg_runner: Callable[[list[str]], tuple[int, str, str]],
-    keyring_path: str,
-    write_temp: Callable[[bytes], str],
-    fingerprint: str = "",
-) -> Callable[[DistroProfile], ResolvedImage]:
-    """Build the trust-gate ``verify`` seam: resolve-latest + SHA256 + pinned-key sig.
-
-    Delegates to :func:`vmlease.archimage.resolve_and_verify`, which returns a
-    :class:`~vmlease.archimage.ResolvedImage` only when BOTH the SHA256 and the
-    detached GPG signature against the pinned ``arch-boxes`` fingerprint pass —
-    raising :class:`~vmlease.archimage.ArchImageError` otherwise (fail-closed).
-    The ``profile`` arg is accepted for signature uniformity; the image identity
-    is the Arch mirror's latest, independent of the profile.
-    """
-    import subprocess
-
-    from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT, resolve_and_verify
-
-    fp = fingerprint or DEFAULT_ARCH_KEY_FINGERPRINT
-
-    def _gpg(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        rc, out, err = gpg_runner(argv)
-        return subprocess.CompletedProcess(argv, rc, out, err)
-
-    def _verify(profile: DistroProfile) -> ResolvedImage:
-        return resolve_and_verify(
-            text_fetcher=text_fetcher,
-            fetcher=fetcher,
-            gpg_runner=_gpg,
-            keyring_path=keyring_path,
-            expected_fingerprint=fp,
-            write_temp=write_temp,
-        )
-
-    return _verify
 
 
 def build_keyring_import_argv(keyring_path: str, fingerprint: str) -> list[str]:
@@ -322,12 +344,14 @@ def build_live_rescue_writer(
 
     The stdlib seams (``run`` subprocess runner, ``sleep``, ``fetch_text`` /
     ``fetch_bytes`` URL fetchers, ``write_temp``) default to live implementations
-    but are injectable, so the factory's WIRING — the **trust gate** (SHA256 +
-    pinned-key GPG signature via :func:`build_verify`), the ssh argv shape, the
-    readiness-retry loop — is unit-testable without real I/O. ``keyring_path`` is
-    the gpg keyring holding the pinned ``arch-boxes`` key (set up by the caller).
+    but are injectable, so the factory's WIRING — the **trust gate**
+    (:class:`~vmlease.rescue_image.ResolveDeps` the profile's spec verifies with),
+    the ssh/scp argv shape, the readiness-retry loop — is unit-testable without
+    real I/O. ``keyring_path`` is the gpg keyring holding the pinned ``arch-boxes``
+    key (set up by the caller), passed through to the Arch spec's signature check.
     The orchestration LOGIC lives in the already-tested :func:`rescue_write_host`.
     """
+    import subprocess
     import time
 
     _sleep = sleep if sleep is not None else time.sleep
@@ -335,8 +359,9 @@ def build_live_rescue_writer(
     def _cli(argv: list[str]) -> tuple[int, str, str]:
         return run(argv, None)
 
-    def _gpg_runner(argv: list[str]) -> tuple[int, str, str]:
-        return run(argv, None)
+    def _gpg_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        rc, out, err = run(argv, None)
+        return subprocess.CompletedProcess(argv, rc, out, err)
 
     def _ssh_root(ipv4: str, script: str) -> tuple[int, str]:
         # fresh host key each OS swap → don't pin known_hosts; feed the script on stdin.
@@ -364,14 +389,26 @@ def build_live_rescue_writer(
             _sleep(4)
         raise ArchBuildError(f"host {ipv4} not reachable in RESCUE after {attempts} attempts; last: {last!r}")
 
-    verify = build_verify(
+    def _push_to_rescue(ipv4: str, local: Path, remote: str) -> None:
+        # scp the verified LOCAL image to the rescue system as root, using the
+        # SAME registered rescue key the rescue ssh authenticates with (NOT the
+        # throwaway operator key). Reuses build_scp_argv's recycled-IP hardening.
+        from vmlease.model import Host as _Host
+        from vmlease.ssh import build_scp_argv
+
+        argv = build_scp_argv(_Host(id="", name="", ipv4=ipv4), "root", Path(private_key_path), local, remote)
+        rc, _out, err = run(argv, None)
+        if rc != 0:
+            raise ArchBuildError(f"scp of {local} to root@{ipv4}:{remote} failed (rc={rc}): {err[:200]!r}")
+
+    resolve_deps = ResolveDeps(
         text_fetcher=fetch_text, fetcher=fetch_bytes, gpg_runner=_gpg_runner,
-        keyring_path=keyring_path, write_temp=write_temp,
+        write_temp=write_temp, keyring_path=keyring_path,
     )
 
     deps = RescueWriteDeps(
-        verify=verify, cli=_cli, ssh_root=_ssh_root,
-        wait_rescue_ready=_wait_rescue,
+        resolve_deps=resolve_deps, cli=_cli, ssh_root=_ssh_root,
+        wait_rescue_ready=_wait_rescue, push_to_rescue=_push_to_rescue,
     )
 
     def _writer(host: Host, profile: DistroProfile) -> None:

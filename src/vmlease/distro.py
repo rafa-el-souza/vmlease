@@ -16,6 +16,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
+from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
+
 
 @dataclass(frozen=True)
 class DistroProfile:
@@ -43,12 +46,14 @@ class DistroProfile:
             this distro, overriding the package-manager default
             (:func:`system_update_command`). Empty for most (the manager default
             covers every distro under that manager).
-        rescue_image: When non-empty, this distro has no native Hetzner image and
-            is built by a rescue-write transform (:mod:`vmlease.archbuild`):
+        rescue_image: When set, this distro has no native Hetzner image and is
+            built by a rescue-write transform (:mod:`vmlease.archbuild`):
             ``default_image`` is the cheap BASE host to provision, and this is the
-            mirror filename of the verified cloud image to write onto its disk
-            (e.g. ``"Arch-Linux-x86_64-cloudimg.qcow2"``). Empty for native-image
-            distros (the common case).
+            injected :class:`~vmlease.rescue_image.RescueImageSpec` that resolves +
+            trust-gates the cloud image to write onto its disk (Arch:
+            :class:`~vmlease.rescue_image.ArchRescueImageSpec`; a pinned golden
+            image: :class:`~vmlease.rescue_image.GoldenRescueImageSpec`). ``None``
+            for native-image distros (the common case).
         notes: Free-text provenance / per-distro gotchas (for the results report).
     """
 
@@ -59,13 +64,13 @@ class DistroProfile:
     docker_repo_slug: str = ""
     extra_setup: tuple[str, ...] = ()
     system_update_override: str = ""
-    rescue_image: str = ""
+    rescue_image: RescueImageSpec | None = None
     notes: str = ""
 
     @property
     def needs_rescue_write(self) -> bool:
         """``True`` iff this distro is provisioned via a rescue-write transform."""
-        return bool(self.rescue_image)
+        return self.rescue_image is not None
 
 
 # Package sets validated on real hosts — the rootless-docker prerequisites a probe
@@ -125,7 +130,7 @@ _PROFILES: dict[str, DistroProfile] = {
         # cloudimg ships cloud-init -> reads the hetzner datasource -> applies the
         # SAME --user-data prep as every other distro (verified on a real host 2026-06-01).
         default_image="debian-13",
-        rescue_image="Arch-Linux-x86_64-cloudimg.qcow2",
+        rescue_image=ArchRescueImageSpec(fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT),
         package_manager="pacman",
         packages=(
             "systemd", "rsync", "acl", "e2fsprogs", "procps-ng", "shadow",
