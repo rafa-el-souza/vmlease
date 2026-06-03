@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Provision throwaway cloud VMs, run a workload over SSH, and always tear them down — a project-agnostic VM-provisioning + probe harness."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 authors = [{ name = "zerotrust-ai", email = "287701868+zerotrust-ai@users.noreply.github.com" }]
 keywords = ["hetzner", "provisioning", "vm", "ssh", "cloud-init", "throwaway", "probe"]
 dependencies = []
