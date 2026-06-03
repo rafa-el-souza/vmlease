@@ -13,8 +13,10 @@ Layering (each seam is a typed Protocol so the layers mock cleanly):
 - :mod:`vmlease.ssh` — the ``SshRunner`` Protocol + an OpenSSH impl.
 - :mod:`vmlease.distro` — per-distro cloud-init / package profiles.
 - :mod:`vmlease.battery` — load a declarative battery (probes as data).
+- :mod:`vmlease.workload` — the ``Workload`` Protocol + ``ProbeWorkload`` (the
+  injected unit of on-host work; the probe battery is the reference impl).
 - :mod:`vmlease.safety` — run-id/label generation, cost guard, reap.
-- :mod:`vmlease.runner` — orchestrate provision -> probe -> teardown.
+- :mod:`vmlease.runner` — orchestrate provision -> run a workload -> teardown.
 - :mod:`vmlease.cli` — ``plan | run | status | reap``.
 
 Every layer sits behind a mockable seam, so the whole flow is unit-tested

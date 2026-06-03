@@ -194,7 +194,7 @@ def rescue_write_host(host: Host, profile: DistroProfile, deps: RescueWriteDeps,
     # NOTE: we do NOT wait for the booted target OS here. The written Arch cloudimg
     # provisions the ssh key for the OPERATOR (via cloud-init), not necessarily
     # root — so an archbuild-side root wait is both wrong-principal and redundant
-    # with the probe phase's own operator-readiness wait (_probe_one_host ->
+    # with the runner's own operator-readiness gate (_run_one_host ->
     # ssh.wait_until_ready, with the throwaway operator key). Issuing the reset is
     # enough; the operator-readiness wait owns "the target booted".
 

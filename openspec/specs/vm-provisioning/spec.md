@@ -23,8 +23,8 @@ same token yields the same specs and labels.
 ### Requirement: The plan dry-run makes zero provider calls
 
 The system SHALL render a `plan` that shows exactly what a real run would provision — one plan item per
-host, including image, server type, distro key, and probe count — while making **no** provider calls and
-running the cost guard so a guard refusal surfaces before any spend.
+host, including image, server type, distro key, and a summary of the **injected workload** — while
+making **no** provider calls and running the cost guard so a guard refusal surfaces before any spend.
 
 #### Scenario: Plan provisions nothing
 
@@ -35,6 +35,12 @@ running the cost guard so a guard refusal surfaces before any spend.
 
 - **WHEN** `plan` is invoked on a matrix that violates the cost guard
 - **THEN** the guard refusal is raised during planning, before any provider call
+
+#### Scenario: Plan describes the injected workload, not a hardcoded probe count
+
+- **WHEN** `plan` is invoked with an injected workload
+- **THEN** each plan item includes that workload's summary (for the probe workload, its probe count)
+  rather than assuming a probe battery
 
 ### Requirement: Per-host isolation never loses another host's results
 
