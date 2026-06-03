@@ -16,7 +16,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 # vmlease is a real package, so import it directly — this keeps mypy --strict
@@ -405,6 +405,58 @@ class TestBattery(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# battery.lint_battery — non-fatal authoring guardrails
+# --------------------------------------------------------------------------- #
+class TestBatteryLint(unittest.TestCase):
+    def _p(self, pid: str, cmd: str, tag: ProbeTag) -> Probe:
+        return Probe(id=pid, title=pid, command=cmd, tag=tag)
+
+    def _b(self, *probes: Probe) -> model.Battery:
+        return model.Battery(name="t", probes=tuple(probes))
+
+    def test_clean_battery_no_warnings(self) -> None:
+        b = self._b(
+            self._p("A", "uname -a", ProbeTag.READ_ONLY),
+            self._p("B", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
+        )
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_order_surprise_warns_with_both_orders(self) -> None:
+        # authored host-root THEN read-only → executes read-only first (tag-rank)
+        b = self._b(
+            self._p("SETUP", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
+            self._p("VERIFY", "check; exit $?", ProbeTag.READ_ONLY),
+        )
+        warns = battery_mod.lint_battery(b)
+        self.assertTrue(any("tag-rank" in w for w in warns))
+        self.assertTrue(any("VERIFY" in w and "SETUP" in w for w in warns))
+
+    def test_order_matching_authoring_has_no_order_warning(self) -> None:
+        b = self._b(
+            self._p("A", "uname -a; exit $?", ProbeTag.READ_ONLY),
+            self._p("B", "do; exit $?", ProbeTag.MUTATING_HOST_ROOT),
+        )
+        self.assertFalse(any("tag-rank" in w for w in battery_mod.lint_battery(b)))
+
+    def test_vacuous_ok_conditional_echo_warns(self) -> None:
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        warns = battery_mod.lint_battery(b)
+        self.assertTrue(any("'V'" in w and "exit $rc" in w for w in warns))
+
+    def test_vacuous_ok_trailing_echo_warns(self) -> None:
+        b = self._b(self._p("V", "do-thing; echo DONE", ProbeTag.READ_ONLY))
+        self.assertTrue(any("'V'" in w for w in battery_mod.lint_battery(b)))
+
+    def test_exit_gated_command_not_flagged(self) -> None:
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_plain_command_not_flagged(self) -> None:
+        b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+
+# --------------------------------------------------------------------------- #
 # distro
 # --------------------------------------------------------------------------- #
 class TestDistro(unittest.TestCase):
@@ -531,6 +583,23 @@ class TestCli(unittest.TestCase):
         p = Path(d) / "b.json"
         p.write_text(_BATTERY_JSON, encoding="utf-8")
         return str(p)
+
+    def test_plan_surfaces_lint_warnings_to_stderr(self) -> None:
+        # a vacuously-ok probe → plan warns (non-fatal) on stderr, still exits 0
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "lint.json"
+            p.write_text(
+                json.dumps({"name": "lint", "probes": [
+                    {"id": "V", "title": "v", "command": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+                ]}),
+                encoding="utf-8",
+            )
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main(["plan", "--battery", str(p), "--distros", "ubuntu", "--run-token", "lint-run"])
+            self.assertEqual(rc, 0)  # non-fatal
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("exit $rc", err.getvalue())
 
     def test_plan_ok(self) -> None:
         with tempfile.TemporaryDirectory() as d:

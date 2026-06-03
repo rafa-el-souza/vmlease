@@ -28,10 +28,10 @@ from vmlease.archbuild import (
     build_live_rescue_writer,
     ensure_arch_keyring,
 )
-from vmlease.battery import BatteryError, load_battery
+from vmlease.battery import BatteryError, lint_battery, load_battery
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
-from vmlease.model import UploadSpec
+from vmlease.model import Battery, UploadSpec
 from vmlease.providers import HetznerProvider, ProviderError
 from vmlease.results import write_results
 from vmlease.runner import Matrix, RescueWriter, execute, plan
@@ -91,6 +91,12 @@ def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
     )
 
 
+def _warn_battery(battery: Battery) -> None:
+    """Print non-fatal authoring warnings (tag-order surprise, vacuous ok) to stderr."""
+    for w in lint_battery(battery):
+        print(f"warning: {w}", file=sys.stderr)
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         battery = load_battery(Path(args.battery))
@@ -99,6 +105,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
@@ -123,6 +130,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
