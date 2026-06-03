@@ -43,27 +43,27 @@ class Workload(Protocol):
         ...
 
 
-class HostDetailProbe:
-    """The fixed host-detail snapshot command (self-describing results header)."""
-
-    command: str = (
-        "{ echo '## os-release'; cat /etc/os-release; echo '## uname'; uname -a; "
-        "echo '## systemd'; systemctl --version | head -1; "
-        "echo '## cgroup'; stat -fc %T /sys/fs/cgroup; "
-        "echo '## id'; id; "
-        "echo '## tools'; command -v docker dockerd-rootless-setuptool.sh "
-        "rootlesskit slirp4netns fuse-overlayfs newuidmap runsc 2>/dev/null; } 2>&1 || true"
-    )
+# The fixed host-detail snapshot command — the self-describing results header an
+# operator reads first (os-release, kernel, init, cgroup, id, tool inventory).
+# Pure data, captured once as a module constant.
+_HOST_DETAIL_COMMAND = (
+    "{ echo '## os-release'; cat /etc/os-release; echo '## uname'; uname -a; "
+    "echo '## systemd'; systemctl --version | head -1; "
+    "echo '## cgroup'; stat -fc %T /sys/fs/cgroup; "
+    "echo '## id'; id; "
+    "echo '## tools'; command -v docker dockerd-rootless-setuptool.sh "
+    "rootlesskit slirp4netns fuse-overlayfs newuidmap runsc 2>/dev/null; } 2>&1 || true"
+)
 
 
 class ProbeWorkload:
     """The probe battery as a :class:`Workload`: host-detail snapshot + battery.
 
-    Byte-faithful to the pre-seam ``_probe_one_host`` body: it captures the
-    self-describing host-detail snapshot as the results header, then runs the
-    battery in tag order, returning one :class:`~vmlease.model.HostRun`. Readiness
-    and upload staging are NOT here — the runner owns them (they are
-    transport-generic, shared by every workload).
+    Byte-faithful to the pre-seam probe path: it captures the self-describing
+    host-detail snapshot as the results header, then runs the battery in tag
+    order, returning one :class:`~vmlease.model.HostRun`. Readiness and upload
+    staging are NOT here — the runner owns them (they are transport-generic,
+    shared by every workload).
     """
 
     def __init__(self, battery: Battery) -> None:
@@ -74,9 +74,9 @@ class ProbeWorkload:
         """The probe-count token the ``plan`` dry-run renders (e.g. ``probes=3``)."""
         return f"probes={len(self._battery.probes)}"
 
-    def run(self, spec: HostSpec, host: Host, ssh: SshRunner) -> HostRun:
+    def run(self, spec: HostSpec, host: Host, ssh: SshRunner, /) -> HostRun:
         detail_probe = Probe(
-            id="_detail", title="host detail", command=HostDetailProbe().command, tag=ProbeTag.READ_ONLY
+            id="_detail", title="host detail", command=_HOST_DETAIL_COMMAND, tag=ProbeTag.READ_ONLY
         )
         detail = ssh.run_probe(host, detail_probe).stdout
         results: list[ProbeResult] = [ssh.run_probe(host, probe) for probe in self._battery.ordered()]

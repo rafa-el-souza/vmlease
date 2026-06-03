@@ -251,7 +251,7 @@ def _run_one_host(
 def _best_effort_destroy(provider: Provider, host: Host) -> str:
     """Destroy ``host``; return a warning note if it failed (never raises).
 
-    A teardown failure must not lose the probe results, so it is reported as a
+    A teardown failure must not lose the collected results, so it is reported as a
     note (the orphan is reap-able) rather than propagated.
     """
     try:

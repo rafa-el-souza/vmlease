@@ -1072,7 +1072,7 @@ class _RecordingWorkload:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def run(self, spec: HostSpec, host: Host, conn: ssh.SshRunner) -> model.HostRun:
+    def run(self, spec: HostSpec, host: Host, ssh: ssh.SshRunner, /) -> model.HostRun:
         self.calls.append(host.name)
         return model.HostRun(host_spec=spec, detail="recorded", results=())
 
@@ -1113,7 +1113,7 @@ class TestWorkloadSeam(unittest.TestCase):
         class _OrderWorkload:
             plan_summary = "order"
 
-            def run(self, spec: HostSpec, host: Host, conn: ssh.SshRunner) -> model.HostRun:
+            def run(self, spec: HostSpec, host: Host, ssh: ssh.SshRunner, /) -> model.HostRun:
                 order.append("run")
                 return model.HostRun(host_spec=spec, detail="", results=())
 
