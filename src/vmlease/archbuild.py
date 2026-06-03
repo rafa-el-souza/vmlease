@@ -35,6 +35,7 @@ real-host-proven one.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -144,7 +145,8 @@ def parse_rescue_password(enable_rescue_stdout: str) -> str:
 def render_fetch_cmd(source: RemoteUrl | LocalFile) -> str:
     """The source-specific acquisition step for the on-rescue-system script.
 
-    - :class:`RemoteUrl`: ``curl -fsSL '<url>' -o <path>`` (the rescue side fetches).
+    - :class:`RemoteUrl`: ``curl -fsSL <url> -o <path>`` (the rescue side fetches);
+      the URL is :func:`shlex.quote`-escaped so it cannot break out of the script.
     - :class:`LocalFile`: a ``test -f <path>`` presence check (the orchestrator has
       already scp-pushed the file to that fixed path; the script only asserts it).
 
@@ -153,7 +155,7 @@ def render_fetch_cmd(source: RemoteUrl | LocalFile) -> str:
     """
     if isinstance(source, RemoteUrl):
         return (
-            f"curl -fsSL '{source.url}' -o {RESCUE_IMAGE_PATH} "
+            f"curl -fsSL {shlex.quote(source.url)} -o {RESCUE_IMAGE_PATH} "
             "|| { echo 'RESCUE_FAIL: download failed' >&2; exit 13; }"
         )
     return (

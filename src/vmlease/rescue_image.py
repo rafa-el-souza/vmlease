@@ -114,12 +114,12 @@ class ArchRescueImageSpec:
     to :func:`vmlease.archimage.resolve_and_verify` (resolve-latest → fetch →
     ``verify_sha256`` → ``verify_signature`` against the pinned fingerprint) and
     returns a :class:`RemoteUrl` of the resolved qcow2 (the rescue side curls it).
-    The Arch constants live here as this instance's config; the gpg keyring path
-    is a runtime IO seam (on :class:`ResolveDeps`), not static config.
+    This instance's only config is the pinned signing-key ``fingerprint`` (the
+    sole per-instance variation + the security pin); the mirror base + qcow2 name
+    remain :mod:`vmlease.archimage`'s constants, as the Arch resolver. The gpg
+    keyring path is a runtime IO seam (on :class:`ResolveDeps`), not static config.
     """
 
-    mirror_base: str
-    qcow2_name: str
     fingerprint: str
 
     def resolve_and_verify(self, deps: ResolveDeps, /) -> ResolvedRescueImage:

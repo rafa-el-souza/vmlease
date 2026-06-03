@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT, MIRROR_BASE, QCOW2_NAME
+from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
 from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
 
 
@@ -130,11 +130,7 @@ _PROFILES: dict[str, DistroProfile] = {
         # cloudimg ships cloud-init -> reads the hetzner datasource -> applies the
         # SAME --user-data prep as every other distro (verified on a real host 2026-06-01).
         default_image="debian-13",
-        rescue_image=ArchRescueImageSpec(
-            mirror_base=MIRROR_BASE,
-            qcow2_name=QCOW2_NAME,
-            fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT,
-        ),
+        rescue_image=ArchRescueImageSpec(fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT),
         package_manager="pacman",
         packages=(
             "systemd", "rsync", "acl", "e2fsprogs", "procps-ng", "shadow",

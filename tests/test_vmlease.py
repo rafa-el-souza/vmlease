@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -1606,7 +1607,8 @@ class TestArchBuild(unittest.TestCase):
         from vmlease.rescue_image import RemoteUrl
         s = archbuild.render_rescue_script(RemoteUrl("https://m/Arch.qcow2"), "a" * 64)
         self.assertIn("https://m/Arch.qcow2", s)
-        self.assertIn(f"curl -fsSL 'https://m/Arch.qcow2' -o {archbuild.RESCUE_IMAGE_PATH}", s)
+        # a metachar-free URL needs no quoting; shlex.quote leaves it bare
+        self.assertIn(f"curl -fsSL https://m/Arch.qcow2 -o {archbuild.RESCUE_IMAGE_PATH}", s)
         self.assertIn("a" * 64, s)
         # the script probes the disk (never hardcodes sda) and re-verifies the sha
         self.assertIn("lsblk", s)
@@ -1624,6 +1626,23 @@ class TestArchBuild(unittest.TestCase):
         # both sources still re-verify the sha on the rescue side
         self.assertIn("sha256sum -c", s)
         self.assertIn("b" * 64, s)
+
+    def test_render_fetch_cmd_remote_url_is_shell_quoted(self) -> None:
+        from vmlease.rescue_image import RemoteUrl
+        # a URL with a single quote + shell metachars must not break out of the
+        # root-side script — shlex.quote escapes it safely.
+        evil = "https://m/x.qcow2'; rm -rf /; echo '"
+        cmd = archbuild.render_fetch_cmd(RemoteUrl(evil))
+        self.assertEqual(
+            cmd,
+            f"curl -fsSL {shlex.quote(evil)} -o {archbuild.RESCUE_IMAGE_PATH} "
+            "|| { echo 'RESCUE_FAIL: download failed' >&2; exit 13; }",
+        )
+        # the quoted argument round-trips back to the exact URL under shell parsing,
+        # so the injection payload is inert (a single curl arg, not extra commands).
+        _, _, rest = cmd.partition("curl -fsSL ")
+        quoted_arg = rest[: rest.index(" -o ")]
+        self.assertEqual(shlex.split(quoted_arg), [evil])
 
     # The Arch profile's spec resolves the latest mirror image; these fakes drive
     # its injected IO seams (ResolveDeps) so it produces the real RemoteUrl + sha
@@ -1933,10 +1952,7 @@ class TestRescueImageSpec(unittest.TestCase):
         from vmlease.rescue_image import ArchRescueImageSpec, RemoteUrl
         qcow = b"the-disk-image"
         sha = hashlib.sha256(qcow).hexdigest()
-        spec = ArchRescueImageSpec(
-            mirror_base=archimage.MIRROR_BASE, qcow2_name=archimage.QCOW2_NAME,
-            fingerprint=archimage.DEFAULT_ARCH_KEY_FINGERPRINT,
-        )
+        spec = ArchRescueImageSpec(fingerprint=archimage.DEFAULT_ARCH_KEY_FINGERPRINT)
         resolved = spec.resolve_and_verify(self._arch_deps(qcow))
         self.assertEqual(resolved.expected_sha256, sha)
         self.assertIsInstance(resolved.source, RemoteUrl)
@@ -2001,7 +2017,7 @@ class TestRescueImageSpec(unittest.TestCase):
 
     def test_both_instances_satisfy_protocol(self) -> None:
         from vmlease.rescue_image import ArchRescueImageSpec, GoldenRescueImageSpec, RescueImageSpec
-        arch = ArchRescueImageSpec(mirror_base="m", qcow2_name="q", fingerprint="F")
+        arch = ArchRescueImageSpec(fingerprint="F")
         golden = GoldenRescueImageSpec(sha256="a" * 64, url="https://m/x")
         self.assertIsInstance(arch, RescueImageSpec)
         self.assertIsInstance(golden, RescueImageSpec)
@@ -2018,7 +2034,6 @@ class TestDistroRescue(unittest.TestCase):
         self.assertIsInstance(arch.rescue_image, ArchRescueImageSpec)
         self.assertIsInstance(arch.rescue_image, RescueImageSpec)  # Protocol conformance
         assert isinstance(arch.rescue_image, ArchRescueImageSpec)
-        self.assertEqual(arch.rescue_image.qcow2_name, "Arch-Linux-x86_64-cloudimg.qcow2")
         self.assertEqual(arch.rescue_image.fingerprint, archimage.DEFAULT_ARCH_KEY_FINGERPRINT)
         self.assertEqual(arch.default_image, "debian-13")  # cheap base to rescue-write
 
