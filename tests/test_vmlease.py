@@ -833,6 +833,12 @@ class TestSsh(unittest.TestCase):
         # -- guard, then source-with-trailing-slash (contents-into-dest), then dest
         self.assertEqual(argv[-3:], ["--", "/src/tree/", "probe@9.9.9.9:~/dest"])
 
+    def test_build_rsync_argv_quotes_key_path_with_space(self) -> None:
+        # a space in the key path must not word-split the -e ssh value
+        argv = ssh.build_rsync_argv(self._host(), "probe", Path("/tmp/my key/id"), Path("/src/tree"), "~/dest")
+        e_val = argv[argv.index("-e") + 1]
+        self.assertIn("'/tmp/my key/id'", e_val)
+
     def test_upload_dir_runs_rsync_via_seam(self) -> None:
         seen: list[list[str]] = []
 

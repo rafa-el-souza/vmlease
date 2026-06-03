@@ -14,6 +14,7 @@ subprocess runner (capture-style for probes/upload, a streaming seam for
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import threading
 import time
@@ -36,13 +37,33 @@ Sleeper = Callable[[float], None]
 # socket (the pure argv builder is unit-tested; the kill mechanic is smoke-tested).
 StreamSubprocessRunner = Callable[[list[str], Callable[[str], None], float], int]
 
+# The recycled-IP hardening, ONE source for every transport's argv (rule: a value
+# in two places drifts — so all builders splice this, and ``build_rsync_argv``
+# joins it into its ``-e ssh …`` string). ``UserKnownHostsFile=/dev/null`` +
+# ``StrictHostKeyChecking=accept-new`` survive a reused IP carrying a new host key
+# (the run-2 bug); ``BatchMode`` fails fast instead of prompting; ``ConnectTimeout``
+# bounds each attempt.
+_BASE_SSH_OPTS: tuple[str, ...] = (
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=10",
+)
+
+# How long the stream reader thread may keep draining the pipe after the process
+# has exited before :func:`_default_stream_runner` returns — bounded so a wedged
+# pipe can never hang the return (a tail of post-exit output may be dropped, which
+# is benign for streamed CI logs).
+_PUMP_DRAIN_TIMEOUT = 5.0
+
 
 class SshError(RuntimeError):
-    """An SSH-level failure distinct from a probe's own non-zero exit.
+    """An SSH-level failure distinct from a command's own non-zero exit.
 
-    A probe that runs and exits non-zero is a normal :class:`ProbeResult` (the
-    battery interprets it). ``SshError`` is the transport failing — the host
-    never became reachable within the readiness budget.
+    A probe (or streamed gate) that runs and exits non-zero is normal data the
+    caller interprets. ``SshError`` is the transport failing: the host never
+    became reachable within the readiness budget, an upload/directory-push exited
+    non-zero, or a streamed command outlived its timeout and was killed.
     """
 
 
@@ -95,10 +116,7 @@ def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: s
     return [
         "ssh",
         "-i", str(private_key_path),
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
+        *_BASE_SSH_OPTS,
         f"{operator}@{host.ipv4}",
         command,
     ]
@@ -119,10 +137,7 @@ def build_scp_argv(host: Host, operator: str, private_key_path: Path, local: Pat
     return [
         "scp",
         "-i", str(private_key_path),
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
+        *_BASE_SSH_OPTS,
         "--",
         str(local),
         f"{operator}@{host.ipv4}:{remote}",
@@ -148,10 +163,7 @@ def build_ssh_stream_argv(host: Host, operator: str, private_key_path: Path, com
         "ssh",
         "-tt",
         "-i", str(private_key_path),
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
+        *_BASE_SSH_OPTS,
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=3",
         f"{operator}@{host.ipv4}",
@@ -166,15 +178,12 @@ def build_rsync_argv(host: Host, operator: str, private_key_path: Path, local: P
     the tree but DROPS symlinks pointing outside it — so a source tree can never
     cause an out-of-tree file (e.g. ``evil -> /etc/passwd``) to be shipped to the
     worker. ``-e ssh …`` carries the SAME recycled-IP hardening as the other
-    transports. ``--`` guards option injection. The trailing ``/`` on the source
-    copies its CONTENTS into ``remote``. Pure — the impl runs it.
+    transports (joined from the one ``_BASE_SSH_OPTS`` source, with the key path
+    ``shlex.quote``d so a space in it can't word-split the ``-e`` value). ``--``
+    guards option injection. The trailing ``/`` on the source copies its CONTENTS
+    into ``remote``. Pure — the impl runs it.
     """
-    ssh_cmd = (
-        f"ssh -i {private_key_path} "
-        "-o UserKnownHostsFile=/dev/null "
-        "-o StrictHostKeyChecking=accept-new "
-        "-o BatchMode=yes -o ConnectTimeout=10"
-    )
+    ssh_cmd = f"ssh -i {shlex.quote(str(private_key_path))} {' '.join(_BASE_SSH_OPTS)}"
     return [
         "rsync",
         "-a",
@@ -312,5 +321,5 @@ def _default_stream_runner(argv: list[str], on_output: Callable[[str], None], ti
             proc.kill()
             proc.wait()
             raise SshError(f"streamed command timed out after {timeout}s and was killed") from exc
-        pump.join(timeout=5)
+        pump.join(timeout=_PUMP_DRAIN_TIMEOUT)
         return proc.returncode
