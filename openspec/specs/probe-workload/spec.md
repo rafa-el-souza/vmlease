@@ -94,3 +94,30 @@ non-zero — and SHALL still tear the host down.
 - **WHEN** a run has no upload specs
 - **THEN** no upload step runs and the host lifecycle is identical to a run without the upload feature
 
+### Requirement: A loaded battery is linted for footguns, surfaced non-fatally
+
+The system SHALL lint a loaded battery for two footguns and surface **non-fatal** warnings, **without**
+changing the tag-rank execution order or the exit-code `ok` semantics (both unchanged and still in
+force): (a) the **authored** probe order differs from the **execution** order — so an author who assumes
+array order sees the real tag-rank sequence; (b) a probe command that is **not exit-gated** yet prints
+success/failure tokens — so its `ok`, which reflects only the exit code, would be vacuous. The lint SHALL
+NOT raise, reorder, or alter `ok` — it only warns.
+
+#### Scenario: An order-surprise battery warns
+
+- **WHEN** a battery's authored probe order differs from its tag-rank execution order
+- **THEN** a non-fatal warning naming both orders is surfaced, and the run still proceeds in execution
+  order
+
+#### Scenario: A vacuously-ok probe warns
+
+- **WHEN** a probe's command prints success/failure tokens but is not gated with an explicit exit
+- **THEN** a non-fatal warning naming the probe is surfaced (its `ok` reflects only the exit code), and
+  the run still proceeds
+
+#### Scenario: A clean battery warns nothing
+
+- **WHEN** a battery's authored order equals its execution order and no probe has an un-gated
+  token-printing tail
+- **THEN** no lint warning is surfaced
+

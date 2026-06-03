@@ -32,6 +32,18 @@ vmlease reap   --run-token <slug>                               # destroy every 
 
 The Hetzner provider relies on the operator's active `hcloud` context (configured out of band).
 
+### Authoring a battery (two footguns `vmlease` warns about)
+
+A battery is a JSON list of probes. Two contract details bite "set up, then verify" batteries — `plan`
+and `run` emit non-fatal `warning:`s for both (see `lint_battery`):
+
+- **Probes execute in tag-rank order, NOT authoring order** — read-only → operator-space → host-root
+  (stable within a rank). A verifier that must run *after* a `mutating:host-root` setup probe has to be
+  tagged so it sorts after it; otherwise it inspects the host *before* the setup and passes/fails for the
+  wrong reason.
+- **A probe's `ok` is its command's exit code** — so gate assertions with `exit $rc`. A command ending in
+  `… && echo OK || echo FAIL` always exits 0, so `ok` is `true` no matter which token it printed.
+
 ## Development
 
 All project commands run through the `Makefile` (which wraps `uv`):
