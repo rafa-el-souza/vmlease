@@ -10,7 +10,8 @@ Layering (each seam is a typed Protocol so the layers mock cleanly):
 - :mod:`vmlease.model` — frozen dataclasses + enums (the shared vocabulary).
 - :mod:`vmlease.providers` — the ``Provider`` Protocol + a Hetzner impl
   (wraps the ``hcloud`` CLI; never reads the token).
-- :mod:`vmlease.ssh` — the ``SshRunner`` Protocol + an OpenSSH impl.
+- :mod:`vmlease.ssh` — the ``SshRunner`` Protocol + an OpenSSH impl (run/capture,
+  single-file upload, readiness, streaming-with-timeout-kill, directory push).
 - :mod:`vmlease.distro` — per-distro cloud-init / package profiles.
 - :mod:`vmlease.battery` — load a declarative battery (probes as data).
 - :mod:`vmlease.workload` — the ``Workload`` Protocol + ``ProbeWorkload`` (the

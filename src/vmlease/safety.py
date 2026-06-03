@@ -91,6 +91,39 @@ def validate_upload_source(local: Path) -> None:
         raise UploadError(f"upload source {local} is not readable")
 
 
+def validate_upload_dir_source(local: Path) -> None:
+    """Refuse a problematic **directory** upload source fail-closed.
+
+    Mirrors :func:`validate_upload_source`'s posture for a directory entry point,
+    inspected without following a symlink (``lstat``):
+
+    1. missing → "does not exist";
+    2. the final component is a symlink → "is a symlink";
+    3. any component in the resolved chain is a symlink
+       (``realpath`` != ``abspath``) → "path contains a symlink component";
+    4. not a directory → "is not a directory";
+    5. not readable → "is not readable".
+
+    This guards the **entry-point** directory only. Within-tree symlink safety
+    during transfer is the recursive push's job (``rsync --safe-links`` ships
+    in-tree symlinks but drops ones pointing outside the tree), so a source tree
+    cannot exfiltrate an out-of-tree file. Raises :class:`UploadError` on the first
+    failing check; returns ``None`` for a plain, readable, non-symlinked directory.
+    """
+    try:
+        info = os.lstat(local)
+    except FileNotFoundError as exc:
+        raise UploadError(f"upload source {local} does not exist") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise UploadError(f"upload source {local} is a symlink (refused — its target is not read or shipped)")
+    if os.path.realpath(local) != os.path.abspath(local):
+        raise UploadError(f"upload source {local} path contains a symlink component (refused)")
+    if not stat.S_ISDIR(info.st_mode):
+        raise UploadError(f"upload source {local} is not a directory")
+    if not os.access(local, os.R_OK):
+        raise UploadError(f"upload source {local} is not readable")
+
+
 def validate_remote_dest(remote: str) -> None:
     """Refuse a problematic upload remote destination fail-closed.
 
