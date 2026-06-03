@@ -31,10 +31,11 @@ from vmlease.archbuild import (
 from vmlease.battery import BatteryError, load_battery
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
+from vmlease.model import UploadSpec
 from vmlease.providers import HetznerProvider, ProviderError
 from vmlease.results import write_results
 from vmlease.runner import Matrix, RescueWriter, execute, plan
-from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, make_run_id, reap
+from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, UploadError, make_run_id, reap
 from vmlease.ssh import OpenSshRunner
 
 
@@ -62,15 +63,31 @@ def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: s
     return build_live_rescue_writer(rescue_key_path, ssh_key_name, keyring_path)
 
 
+def _parse_upload(value: str) -> UploadSpec:
+    """Parse one ``--upload LOCAL[:REMOTE]`` value into an :class:`UploadSpec`.
+
+    Splits on the **first** ``:`` for ``LOCAL:REMOTE``; with no ``:`` the remote
+    defaults to ``~/<basename(local)>``. Validation (refuse a symlink / bad dest
+    / etc.) happens later in the safety layer, before any spend.
+    """
+    local_str, sep, remote = value.partition(":")
+    local = Path(local_str)
+    if not sep:
+        remote = f"~/{local.name}"
+    return UploadSpec(local=local, remote=remote)
+
+
 def _matrix_from_args(args: argparse.Namespace) -> Matrix:
     battery = load_battery(Path(args.battery))
     distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
+    uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
     return Matrix(
         battery=battery,
         distro_keys=distro_keys,
         server_type=args.server_type,
         run_token=args.run_token,
         firewall=args.firewall,
+        uploads=uploads,
     )
 
 
@@ -78,7 +95,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         matrix = _matrix_from_args(args)
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError) as exc:
+    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(f"battery: {matrix.battery.name}  ({len(matrix.battery.probes)} probes)")
@@ -100,7 +117,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     try:
         matrix = _matrix_from_args(args)
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError) as exc:
+    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -188,6 +205,11 @@ def _add_matrix_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--max-hosts", type=int, default=DEFAULT_MAX_HOSTS, help="cost-guard host cap")
     sp.add_argument("--run-token", required=True, help="determinism seam for the run-id")
     sp.add_argument("--firewall", default="", help="provider firewall name to attach to every host (default: none)")
+    sp.add_argument(
+        "--upload", action="append", metavar="LOCAL[:REMOTE]",
+        help="upload a local regular file to every host after readiness, before the battery "
+        "(default remote: ~/<basename>); repeatable; validated fail-closed before any spend",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -42,6 +42,10 @@ class SshRunner(Protocol):
         """Execute ``probe.command`` on ``host`` and capture its outcome."""
         ...
 
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        """Copy local file ``local`` to ``remote`` on ``host`` over SSH."""
+        ...
+
 
 def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: str) -> list[str]:
     """Build the ``ssh`` argv for ``command`` on ``host`` as ``operator``.
@@ -64,6 +68,31 @@ def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: s
         "-o", "ConnectTimeout=10",
         f"{operator}@{host.ipv4}",
         command,
+    ]
+
+
+def build_scp_argv(host: Host, operator: str, private_key_path: Path, local: Path, remote: str) -> list[str]:
+    """Build the ``scp`` argv to copy ``local`` to ``remote`` on ``host``.
+
+    Mirrors :func:`build_ssh_argv` exactly — same identity key and the same
+    recycled-IP hardening (``UserKnownHostsFile=/dev/null`` +
+    ``StrictHostKeyChecking=accept-new`` so a reused IP with a new host key is
+    not a refused connection; ``BatchMode`` + a fixed ``ConnectTimeout`` so the
+    transfer fails fast instead of prompting). The ``--`` terminates option
+    parsing so neither path can be read as a flag — belt-and-suspenders with the
+    safety layer's leading-dash refusal on the remote destination. Pure — the
+    impl runs it.
+    """
+    return [
+        "scp",
+        "-i", str(private_key_path),
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "--",
+        str(local),
+        f"{operator}@{host.ipv4}:{remote}",
     ]
 
 
@@ -93,6 +122,22 @@ class OpenSshRunner:
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        """scp ``local`` to ``remote`` on ``host``; raise on a non-zero scp exit.
+
+        Runs the ``scp`` argv through the same injected ``runner`` seam
+        ``run_probe`` uses (so no test opens a socket). A non-zero return is a
+        transport failure — raised as :class:`SshError`, the same contract as
+        :meth:`wait_until_ready` — distinct from a probe's own non-zero exit.
+        """
+        argv = build_scp_argv(host, self._operator, self._key, local, remote)
+        proc = self._run(argv)
+        if proc.returncode != 0:
+            raise SshError(
+                f"upload of {local} to {self._operator}@{host.ipv4}:{remote} failed "
+                f"(scp exit {proc.returncode}): {proc.stderr.strip()}"
+            )
 
     def wait_until_ready(self, host: Host, *, attempts: int = 30) -> None:
         """Poll until the cloud-init readiness sentinel exists, or raise.

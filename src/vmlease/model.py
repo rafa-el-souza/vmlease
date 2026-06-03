@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 
 class ProbeTag(StrEnum):
@@ -88,6 +89,28 @@ class HostSpec:
     distro_key: str
     labels: dict[str, str] = field(default_factory=dict)
     firewall: str = ""
+
+
+@dataclass(frozen=True)
+class UploadSpec:
+    """One file to scp onto every host after readiness, before the battery.
+
+    Immutable data, no I/O. The runner uploads ``local`` to ``remote`` on each
+    host once it is ready and before the first probe. The safety layer validates
+    both fields (a problematic source/dest is refused before any spend); this
+    type just carries the request.
+
+    Attributes:
+        local: The local regular file to upload (validated: no symlink, regular,
+            readable — see :func:`vmlease.safety.validate_upload_source`).
+        remote: The destination path on the host (validated: no ``..``, no
+            shell-unsafe chars, no leading ``-`` — see
+            :func:`vmlease.safety.validate_remote_dest`). Defaults, when the CLI
+            derives it, to ``~/<basename(local)>``.
+    """
+
+    local: Path
+    remote: str
 
 
 @dataclass(frozen=True)
