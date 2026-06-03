@@ -8,6 +8,12 @@ download + verify** half — fully unit-testable with the network/gpg behind
 injected runners — and stops short of the billable rescue-write (a separate,
 live step). The "rebuild only if the latest version changed" decision lives here.
 
+This is the **Arch instance** of the generic ``RescueImageSpec`` seam
+(:mod:`vmlease.rescue_image`): :class:`~vmlease.rescue_image.ArchRescueImageSpec`
+re-homes these functions (resolve-latest + sha + pinned-GPG) as one trust model;
+a pinned golden image (sha-only) is the other. This module is kept, not deleted —
+its Arch logic is the spec's body.
+
 Security note: the image is trusted ONLY after BOTH checks pass — the SHA256
 (integrity) and the detached GPG signature against the **pinned** Arch
 release-engineering signing key (authenticity). The key fingerprint is pinned in

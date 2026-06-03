@@ -30,6 +30,7 @@ from vmlease import (
     keypair,
     model,
     providers,
+    rescue_image,
     results,
     runner,
     safety,
@@ -1601,9 +1602,11 @@ class TestArchBuild(unittest.TestCase):
         with self.assertRaises(archbuild.ArchBuildError):
             archbuild.parse_rescue_password("Rescue enabled, no password line\n")
 
-    def test_render_rescue_script_fills_slots_and_probes_disk(self) -> None:
-        s = archbuild.render_rescue_script("https://m/Arch.qcow2", "a" * 64)
+    def test_render_rescue_script_remote_url_renders_curl(self) -> None:
+        from vmlease.rescue_image import RemoteUrl
+        s = archbuild.render_rescue_script(RemoteUrl("https://m/Arch.qcow2"), "a" * 64)
         self.assertIn("https://m/Arch.qcow2", s)
+        self.assertIn(f"curl -fsSL 'https://m/Arch.qcow2' -o {archbuild.RESCUE_IMAGE_PATH}", s)
         self.assertIn("a" * 64, s)
         # the script probes the disk (never hardcodes sda) and re-verifies the sha
         self.assertIn("lsblk", s)
@@ -1612,19 +1615,45 @@ class TestArchBuild(unittest.TestCase):
         # shell vars pass through the @@ templating untouched
         self.assertIn("$disk", s)
 
-    def _resolved(self) -> archimage.ResolvedImage:
-        from vmlease.archimage import ArchVersion, ResolvedImage
-        return ResolvedImage(version=ArchVersion(date=20260601, serial=539459), qcow2_bytes=b"img", expected_sha256="a" * 64)
+    def test_render_rescue_script_local_file_renders_presence_check(self) -> None:
+        from vmlease.rescue_image import LocalFile
+        s = archbuild.render_rescue_script(LocalFile(Path("/local/golden.qcow2")), "b" * 64)
+        # a LocalFile is already pushed → the script asserts presence, does NOT curl
+        self.assertIn(f"test -f {archbuild.RESCUE_IMAGE_PATH}", s)
+        self.assertNotIn("curl -fsSL", s)  # no actual fetch command (the comment mentions curl)
+        # both sources still re-verify the sha on the rescue side
+        self.assertIn("sha256sum -c", s)
+        self.assertIn("b" * 64, s)
 
-    def _deps(self, *, ssh_out: str = "RESCUE_WRITE_OK", ssh_rc: int = 0, cli_rc: int = 0, verify_raises: bool = False) -> tuple[archbuild.RescueWriteDeps, list[list[str]]]:
-        from vmlease.archimage import ArchImageError
+    # The Arch profile's spec resolves the latest mirror image; these fakes drive
+    # its injected IO seams (ResolveDeps) so it produces the real RemoteUrl + sha
+    # — byte-faithful to the pre-extraction resolve-latest + sha + pinned-GPG.
+    _ARCH_QCOW = b"the-disk-image"
+
+    def _arch_resolve_deps(self) -> rescue_image.ResolveDeps:
+        from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
+        from vmlease.rescue_image import ResolveDeps
+        sha = hashlib.sha256(self._ARCH_QCOW).hexdigest()
+
+        def text_fetcher(url: str) -> str:
+            if url == archimage.MIRROR_BASE:
+                return "v20260601.539459/"
+            return f"{sha}  Arch-Linux-x86_64-cloudimg.qcow2"
+
+        def fetcher(url: str) -> bytes:
+            return self._ARCH_QCOW if url.endswith(".qcow2") else b"SIGBYTES"
+
+        return ResolveDeps(
+            text_fetcher=text_fetcher, fetcher=fetcher,
+            gpg_runner=_fake_subprocess(0, f"[GNUPG:] VALIDSIG {DEFAULT_ARCH_KEY_FINGERPRINT} 2026 0 0\n"),
+            write_temp=lambda _b: "/tmp/stage", keyring_path="/k",
+        )
+
+    def _deps(self, *, ssh_out: str = "RESCUE_WRITE_OK", ssh_rc: int = 0, cli_rc: int = 0,
+              resolve_deps: rescue_image.ResolveDeps | None = None,
+              push_calls: list[tuple[str, Path, str]] | None = None,
+              ) -> tuple[archbuild.RescueWriteDeps, list[list[str]]]:
         cli_calls: list[list[str]] = []
-        resolved = self._resolved()
-
-        def verify(_profile: distro.DistroProfile) -> archimage.ResolvedImage:
-            if verify_raises:
-                raise ArchImageError("bad signature")
-            return resolved
 
         def cli(argv: list[str]) -> tuple[int, str, str]:
             cli_calls.append(argv)
@@ -1633,9 +1662,14 @@ class TestArchBuild(unittest.TestCase):
         def ssh_root(_ip: str, _script: str) -> tuple[int, str]:
             return (ssh_rc, ssh_out)
 
+        def push_to_rescue(ip: str, local: Path, remote: str) -> None:
+            if push_calls is not None:
+                push_calls.append((ip, local, remote))
+
         deps = archbuild.RescueWriteDeps(
-            verify=verify, cli=cli, ssh_root=ssh_root,
-            wait_rescue_ready=lambda _ip: None,
+            resolve_deps=resolve_deps if resolve_deps is not None else self._arch_resolve_deps(),
+            cli=cli, ssh_root=ssh_root, wait_rescue_ready=lambda _ip: None,
+            push_to_rescue=push_to_rescue,
         )
         return deps, cli_calls
 
@@ -1648,6 +1682,13 @@ class TestArchBuild(unittest.TestCase):
         verbs = [a[2] for a in cli_calls]  # hcloud server <verb>
         self.assertEqual(verbs, ["enable-rescue", "reset", "disable-rescue", "reset"])
 
+    def test_rescue_write_host_remote_url_no_push(self) -> None:
+        # Arch resolves a RemoteUrl → the rescue side curls it; no scp push.
+        push_calls: list[tuple[str, Path, str]] = []
+        deps, _ = self._deps(push_calls=push_calls)
+        archbuild.rescue_write_host(self._host(), distro.get_profile("arch"), deps, "mykey")
+        self.assertEqual(push_calls, [])
+
     def test_rescue_write_host_write_failure_raises(self) -> None:
         deps, _ = self._deps(ssh_out="RESCUE_FAIL: sha mismatch", ssh_rc=14)
         with self.assertRaises(archbuild.ArchBuildError):
@@ -1658,20 +1699,45 @@ class TestArchBuild(unittest.TestCase):
         with self.assertRaises(archbuild.ArchBuildError):
             archbuild.rescue_write_host(self._host(), distro.get_profile("arch"), deps, "mykey")
 
-    def test_trust_gate_aborts_before_any_mutation(self) -> None:
-        # verify (SHA256 + pinned-key signature) runs FIRST; a bad image raises
-        # BEFORE any hcloud cli step → zero mutations against an untrusted image.
-        from vmlease.archimage import ArchImageError
-        deps, cli_calls = self._deps(verify_raises=True)
-        with self.assertRaises(ArchImageError):
-            archbuild.rescue_write_host(self._host(), distro.get_profile("arch"), deps, "mykey")
-        self.assertEqual(cli_calls, [])  # NOTHING ran — fail-closed before enable-rescue
+    def test_local_file_pushed_before_script(self) -> None:
+        # a golden LocalFile spec → push_to_rescue invoked with the fixed remote path.
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        qcow = b"golden-bytes"
+        sha = hashlib.sha256(qcow).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "golden.qcow2"
+            local.write_bytes(qcow)
+            profile = distro.DistroProfile(
+                key="golden", default_image="debian-13", package_manager="apt",
+                packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
+            )
+            push_calls: list[tuple[str, Path, str]] = []
+            deps, _ = self._deps(push_calls=push_calls)
+            archbuild.rescue_write_host(self._host(), profile, deps, "mykey")
+        self.assertEqual(len(push_calls), 1)
+        self.assertEqual(push_calls[0][0], "1.2.3.4")
+        self.assertEqual(push_calls[0][1], local)
+        self.assertEqual(push_calls[0][2], archbuild.RESCUE_IMAGE_PATH)
 
-    def test_rescue_image_url(self) -> None:
-        from vmlease.archimage import latest_version
-        v = latest_version("v20260601.539459/")
-        url = archbuild.rescue_image_url(v, distro.get_profile("arch"))
-        self.assertTrue(url.endswith("v20260601.539459/Arch-Linux-x86_64-cloudimg.qcow2"))
+    def test_trust_gate_aborts_before_any_mutation(self) -> None:
+        # resolve_and_verify (SHA256 + pinned-key signature) runs FIRST; a bad image
+        # raises BEFORE any hcloud cli step → zero mutations against an untrusted image.
+        from vmlease.archimage import ArchImageError
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        profile = distro.DistroProfile(
+            key="golden", default_image="debian-13", package_manager="apt",
+            packages=(), rescue_image=GoldenRescueImageSpec(sha256="0" * 64, url="https://m/x.qcow2"),
+        )
+        # the fetched bytes' sha will NOT match the pinned digest → refusal.
+        from vmlease.rescue_image import ResolveDeps
+        rd = ResolveDeps(
+            text_fetcher=lambda _u: "", fetcher=lambda _u: b"not-the-pinned-bytes",
+            gpg_runner=_fake_subprocess(0, ""), write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+        )
+        deps, cli_calls = self._deps(resolve_deps=rd)
+        with self.assertRaises(ArchImageError):
+            archbuild.rescue_write_host(self._host(), profile, deps, "mykey")
+        self.assertEqual(cli_calls, [])  # NOTHING ran — fail-closed before enable-rescue
 
     def _live_fakes(self, qcow: bytes) -> tuple[Callable[[list[str], str | None], tuple[int, str, str]], list[list[str]], Callable[[str], str], Callable[[str], bytes]]:
         from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
@@ -1716,6 +1782,74 @@ class TestArchBuild(unittest.TestCase):
         ssh_calls = [a for a in runs if a[0] == "ssh"]
         self.assertIn("/home/op/.ssh/key", ssh_calls[0])
         self.assertIn("StrictHostKeyChecking=accept-new", ssh_calls[0])
+
+    def test_build_live_rescue_writer_local_file_scps(self) -> None:
+        # a golden LOCAL profile through the live factory → the push_to_rescue
+        # closure scps the file (root@ip via the rescue key) before the script.
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        qcow = b"golden-local"
+        sha = hashlib.sha256(qcow).hexdigest()
+        runs: list[list[str]] = []
+
+        def fake_run(argv: list[str], stdin: str | None) -> tuple[int, str, str]:
+            runs.append(argv)
+            if argv[0] == "ssh":
+                if stdin and "hostname" in stdin:
+                    return (0, "rescue\n", "")
+                return (0, "RESCUE_WRITE_OK", "")
+            return (0, "", "")
+
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "golden.qcow2"
+            local.write_bytes(qcow)
+            profile = distro.DistroProfile(
+                key="golden", default_image="debian-13", package_manager="apt",
+                packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
+            )
+            writer = archbuild.build_live_rescue_writer(
+                "/home/op/.ssh/rescue", "mykey", "/tmp/keyring.gpg",
+                run=fake_run, sleep=lambda _s: None,
+            )
+            writer(Host(id="9", name="g", ipv4="1.2.3.4"), profile)
+        scp_calls = [a for a in runs if a[0] == "scp"]
+        self.assertEqual(len(scp_calls), 1)
+        self.assertIn("/home/op/.ssh/rescue", scp_calls[0])  # the rescue key
+        self.assertIn(f"root@1.2.3.4:{archbuild.RESCUE_IMAGE_PATH}", scp_calls[0])
+        self.assertNotIn("gpg", [a[0] for a in runs])  # golden → no gpg verify
+
+    def test_build_live_rescue_writer_scp_failure_raises(self) -> None:
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        qcow = b"golden-local"
+        sha = hashlib.sha256(qcow).hexdigest()
+
+        def fake_run(argv: list[str], stdin: str | None) -> tuple[int, str, str]:
+            if argv[0] == "scp":
+                return (1, "", "permission denied")
+            if argv[0] == "ssh" and stdin and "hostname" in stdin:
+                return (0, "rescue\n", "")
+            return (0, "", "")
+
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "golden.qcow2"
+            local.write_bytes(qcow)
+            profile = distro.DistroProfile(
+                key="golden", default_image="debian-13", package_manager="apt",
+                packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
+            )
+            writer = archbuild.build_live_rescue_writer(
+                "/k", "mykey", "/tmp/keyring.gpg", run=fake_run, sleep=lambda _s: None,
+            )
+            with self.assertRaises(archbuild.ArchBuildError):
+                writer(Host(id="9", name="g", ipv4="1.2.3.4"), profile)
+
+    def test_rescue_write_host_no_spec_raises(self) -> None:
+        # a profile with no rescue_image spec cannot be rescue-written (guard).
+        profile = distro.DistroProfile(
+            key="nope", default_image="debian-13", package_manager="apt", packages=(),
+        )
+        deps, _ = self._deps()
+        with self.assertRaises(archbuild.ArchBuildError):
+            archbuild.rescue_write_host(self._host(), profile, deps, "mykey")
 
     def test_build_live_rescue_writer_readiness_timeout(self) -> None:
         # verify passes, but ssh never returns 0 → bounded readiness loop raises
@@ -1762,18 +1896,137 @@ class TestArchBuild(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# rescue_image — the RescueImageSpec seam (Arch + golden)
+# --------------------------------------------------------------------------- #
+class TestRescueImageSpec(unittest.TestCase):
+    def _arch_deps(self, qcow: bytes) -> rescue_image.ResolveDeps:
+        from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
+        from vmlease.rescue_image import ResolveDeps
+        sha = hashlib.sha256(qcow).hexdigest()
+
+        def text_fetcher(url: str) -> str:
+            return "v20260601.539459/" if url == archimage.MIRROR_BASE else f"{sha}  x.qcow2"
+
+        return ResolveDeps(
+            text_fetcher=text_fetcher,
+            fetcher=lambda u: qcow if u.endswith(".qcow2") else b"SIG",
+            gpg_runner=_fake_subprocess(0, f"[GNUPG:] VALIDSIG {DEFAULT_ARCH_KEY_FINGERPRINT} 2026 0 0\n"),
+            write_temp=lambda _b: "/tmp/stage", keyring_path="/k",
+        )
+
+    def _golden_deps(self, *, fetcher: Callable[[str], bytes] | None = None) -> rescue_image.ResolveDeps:
+        from vmlease.rescue_image import ResolveDeps
+        # text_fetcher/gpg_runner must NEVER be touched by a golden spec → make them
+        # raise so any accidental use fails loudly.
+        def boom_text(_u: str) -> str:
+            raise AssertionError("golden spec must not call text_fetcher")
+
+        def boom_gpg(_argv: list[str]) -> subprocess.CompletedProcess[str]:
+            raise AssertionError("golden spec must not invoke gpg")
+
+        return ResolveDeps(
+            text_fetcher=boom_text, fetcher=fetcher if fetcher is not None else (lambda _u: b""),
+            gpg_runner=boom_gpg, write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+        )
+
+    def test_arch_spec_yields_remote_url_and_sha(self) -> None:
+        from vmlease.rescue_image import ArchRescueImageSpec, RemoteUrl
+        qcow = b"the-disk-image"
+        sha = hashlib.sha256(qcow).hexdigest()
+        spec = ArchRescueImageSpec(
+            mirror_base=archimage.MIRROR_BASE, qcow2_name=archimage.QCOW2_NAME,
+            fingerprint=archimage.DEFAULT_ARCH_KEY_FINGERPRINT,
+        )
+        resolved = spec.resolve_and_verify(self._arch_deps(qcow))
+        self.assertEqual(resolved.expected_sha256, sha)
+        self.assertIsInstance(resolved.source, RemoteUrl)
+        assert isinstance(resolved.source, RemoteUrl)
+        self.assertTrue(resolved.source.url.endswith("v20260601.539459/Arch-Linux-x86_64-cloudimg.qcow2"))
+
+    def test_golden_url_yields_remote_url_no_gpg(self) -> None:
+        from vmlease.rescue_image import GoldenRescueImageSpec, RemoteUrl
+        qcow = b"golden-url-bytes"
+        sha = hashlib.sha256(qcow).hexdigest()
+        spec = GoldenRescueImageSpec(sha256=sha, url="https://m/golden.qcow2")
+        resolved = spec.resolve_and_verify(self._golden_deps(fetcher=lambda _u: qcow))
+        self.assertEqual(resolved.expected_sha256, sha)
+        self.assertIsInstance(resolved.source, RemoteUrl)
+        assert isinstance(resolved.source, RemoteUrl)
+        self.assertEqual(resolved.source.url, "https://m/golden.qcow2")
+
+    def test_golden_local_yields_local_file_no_gpg(self) -> None:
+        from vmlease.rescue_image import GoldenRescueImageSpec, LocalFile
+        qcow = b"golden-local-bytes"
+        sha = hashlib.sha256(qcow).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "golden.qcow2"
+            local.write_bytes(qcow)
+            spec = GoldenRescueImageSpec(sha256=sha, path=local)
+            resolved = spec.resolve_and_verify(self._golden_deps())  # fetcher unused
+            self.assertEqual(resolved.expected_sha256, sha)
+            self.assertIsInstance(resolved.source, LocalFile)
+            assert isinstance(resolved.source, LocalFile)
+            self.assertEqual(resolved.source.path, local)
+
+    def test_golden_url_sha_mismatch_refuses(self) -> None:
+        from vmlease.archimage import ArchImageError
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        spec = GoldenRescueImageSpec(sha256="0" * 64, url="https://m/golden.qcow2")
+        with self.assertRaises(ArchImageError):
+            spec.resolve_and_verify(self._golden_deps(fetcher=lambda _u: b"wrong-bytes"))
+
+    def test_golden_local_sha_mismatch_refuses(self) -> None:
+        from vmlease.archimage import ArchImageError
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "golden.qcow2"
+            local.write_bytes(b"wrong-bytes")
+            spec = GoldenRescueImageSpec(sha256="0" * 64, path=local)
+            with self.assertRaises(ArchImageError):
+                spec.resolve_and_verify(self._golden_deps())
+
+    def test_golden_requires_exactly_one_source(self) -> None:
+        from vmlease.archimage import ArchImageError
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        # neither url nor path
+        with self.assertRaises(ArchImageError):
+            GoldenRescueImageSpec(sha256="a" * 64).resolve_and_verify(self._golden_deps())
+        # both url AND path
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "x.qcow2"
+            local.write_bytes(b"x")
+            both = GoldenRescueImageSpec(sha256="a" * 64, url="https://m/x", path=local)
+            with self.assertRaises(ArchImageError):
+                both.resolve_and_verify(self._golden_deps())
+
+    def test_both_instances_satisfy_protocol(self) -> None:
+        from vmlease.rescue_image import ArchRescueImageSpec, GoldenRescueImageSpec, RescueImageSpec
+        arch = ArchRescueImageSpec(mirror_base="m", qcow2_name="q", fingerprint="F")
+        golden = GoldenRescueImageSpec(sha256="a" * 64, url="https://m/x")
+        self.assertIsInstance(arch, RescueImageSpec)
+        self.assertIsInstance(golden, RescueImageSpec)
+
+
+# --------------------------------------------------------------------------- #
 # distro — the rescue-write Arch profile
 # --------------------------------------------------------------------------- #
 class TestDistroRescue(unittest.TestCase):
     def test_arch_needs_rescue_write(self) -> None:
+        from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
         arch = distro.get_profile("arch")
         self.assertTrue(arch.needs_rescue_write)
-        self.assertEqual(arch.rescue_image, "Arch-Linux-x86_64-cloudimg.qcow2")
+        self.assertIsInstance(arch.rescue_image, ArchRescueImageSpec)
+        self.assertIsInstance(arch.rescue_image, RescueImageSpec)  # Protocol conformance
+        assert isinstance(arch.rescue_image, ArchRescueImageSpec)
+        self.assertEqual(arch.rescue_image.qcow2_name, "Arch-Linux-x86_64-cloudimg.qcow2")
+        self.assertEqual(arch.rescue_image.fingerprint, archimage.DEFAULT_ARCH_KEY_FINGERPRINT)
         self.assertEqual(arch.default_image, "debian-13")  # cheap base to rescue-write
 
     def test_native_distros_do_not_need_rescue_write(self) -> None:
         for key in ("ubuntu", "debian", "fedora"):
-            self.assertFalse(distro.get_profile(key).needs_rescue_write)
+            profile = distro.get_profile(key)
+            self.assertFalse(profile.needs_rescue_write)
+            self.assertIsNone(profile.rescue_image)
 
 
 if __name__ == "__main__":

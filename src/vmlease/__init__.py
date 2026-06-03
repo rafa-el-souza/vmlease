@@ -13,6 +13,11 @@ Layering (each seam is a typed Protocol so the layers mock cleanly):
 - :mod:`vmlease.ssh` — the ``SshRunner`` Protocol + an OpenSSH impl (run/capture,
   single-file upload, readiness, streaming-with-timeout-kill, directory push).
 - :mod:`vmlease.distro` — per-distro cloud-init / package profiles.
+- :mod:`vmlease.rescue_image` — the ``RescueImageSpec`` Protocol (per-distro image
+  acquisition + trust gate): ``ArchRescueImageSpec`` (resolve-latest + pinned-GPG,
+  over :mod:`vmlease.archimage`) and ``GoldenRescueImageSpec`` (fixed URL | local
+  qcow2, sha-only) → a verified ``(digest, RemoteUrl | LocalFile)`` the
+  :mod:`vmlease.archbuild` spine delivers to the rescue system.
 - :mod:`vmlease.battery` — load a declarative battery (probes as data).
 - :mod:`vmlease.workload` — the ``Workload`` Protocol + ``ProbeWorkload`` (the
   injected unit of on-host work; the probe battery is the reference impl).
