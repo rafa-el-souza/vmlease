@@ -451,6 +451,12 @@ class TestBatteryLint(unittest.TestCase):
         b = self._b(self._p("V", "grep x f && echo OK || echo FAIL; exit $?", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())
 
+    def test_exit_word_inside_echo_string_is_not_gating(self) -> None:
+        # the c004 false-negative: "exit" appears only inside an echo string, the
+        # command is NOT actually exit-gated -> must still warn (statement-level check)
+        b = self._b(self._p("A", 'echo "setup exit: $RC"; check && echo OK || echo FAIL', ProbeTag.READ_ONLY))
+        self.assertTrue(any("'A'" in w for w in battery_mod.lint_battery(b)))
+
     def test_plain_command_not_flagged(self) -> None:
         b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())

@@ -131,8 +131,13 @@ def _looks_vacuously_ok(command: str) -> bool:
     ``|| echo``) or a trailing ``echo`` segment — when there is no ``exit`` to make
     the status reflect the assertion. A plain command (``uname -a``) or an
     ``exit``-gated one is not flagged.
+
+    The ``exit`` check is **statement-level** (after a separator / at the start), not
+    a bare substring: the word "exit" inside an echo string (e.g.
+    ``echo "setup exit: $RC"``) does NOT gate the status — matching it there was a
+    false negative that hid genuinely-vacuous probes.
     """
-    if re.search(r"\bexit\b", command):
+    if re.search(r"(?:^|[;&|{}()\n])\s*exit\b", command):
         return False
     if "&& echo" in command or "|| echo" in command:
         return True
