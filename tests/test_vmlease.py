@@ -112,6 +112,13 @@ class FakeSshRunner:
         # call log stays upload-then-detail like the live readiness gate).
         return None
 
+    def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+        self.ran.append(f"stream:{command}")
+        return 0
+
+    def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+        self.ran.append(f"upload_dir:{remote}")
+
 
 def _demo_workload() -> workload.ProbeWorkload:
     """The probe battery as a workload — the injected default for runner tests."""
@@ -760,6 +767,103 @@ class TestSsh(unittest.TestCase):
     def test_ssh_runner_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeSshRunner(), ssh.SshRunner)
 
+    # --- D9.2 streaming command execution + hard-timeout/kill ---
+
+    def test_build_ssh_stream_argv_forces_pty_and_keepalive(self) -> None:
+        argv = ssh.build_ssh_stream_argv(self._host(), "probe", Path("/tmp/k"), "make check")
+        self.assertEqual(argv[0], "ssh")
+        self.assertIn("-tt", argv)  # PTY → the dropped client SIGHUPs the remote
+        self.assertIn("ServerAliveInterval=15", argv)
+        self.assertIn("ServerAliveCountMax=3", argv)
+        self.assertIn("UserKnownHostsFile=/dev/null", argv)  # recycled-IP hardening preserved
+        self.assertEqual(argv[-1], "make check")
+
+    def test_run_streaming_delivers_output_and_returns_exit(self) -> None:
+        seen_argv: list[list[str]] = []
+
+        def fake_stream(argv: list[str], on_output: Callable[[str], None], timeout: float) -> int:
+            seen_argv.append(argv)
+            on_output("building\n")
+            on_output("FAILED\n")
+            return 2  # a non-zero gate exit is DATA, not a transport error
+
+        chunks: list[str] = []
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), stream_runner=fake_stream)
+        rc = r.run_streaming(self._host(), "make check", chunks.append, timeout=60.0)
+        self.assertEqual(rc, 2)
+        self.assertEqual(chunks, ["building\n", "FAILED\n"])  # delivered incrementally
+        self.assertIn("-tt", seen_argv[0])
+        self.assertEqual(seen_argv[0][-1], "make check")
+
+    def test_run_streaming_timeout_raises_ssh_error(self) -> None:
+        def fake_stream(argv: list[str], on_output: Callable[[str], None], timeout: float) -> int:
+            raise ssh.SshError(f"timed out after {timeout}s and was killed")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), stream_runner=fake_stream)
+        with self.assertRaises(ssh.SshError):
+            r.run_streaming(self._host(), "sleep 999", lambda _s: None, timeout=1.0)
+
+    def test_default_stream_runner_streams_local_output_and_returns_exit(self) -> None:
+        # the REAL default impl, exercised with a LOCAL command (no ssh, no socket):
+        # proves the pump-thread + line delivery + exit-code path.
+        chunks: list[str] = []
+        rc = ssh._default_stream_runner(["printf", "alpha\\nbeta\\n"], chunks.append, 10.0)
+        self.assertEqual(rc, 0)
+        self.assertEqual("".join(chunks), "alpha\nbeta\n")
+
+    def test_default_stream_runner_nonzero_exit_returned(self) -> None:
+        rc = ssh._default_stream_runner(["sh", "-c", "exit 5"], lambda _s: None, 10.0)
+        self.assertEqual(rc, 5)  # a non-zero exit is returned, not raised
+
+    def test_default_stream_runner_timeout_kills_and_raises(self) -> None:
+        # a local command that outlives the timeout is killed and raises SshError
+        with self.assertRaises(ssh.SshError):
+            ssh._default_stream_runner(["sleep", "10"], lambda _s: None, 0.2)
+
+    # --- D9.3 recursive directory push (safe symlinks) ---
+
+    def test_build_rsync_argv_safe_links_and_hardening(self) -> None:
+        argv = ssh.build_rsync_argv(self._host(), "probe", Path("/tmp/k"), Path("/src/tree"), "~/dest")
+        self.assertEqual(argv[0], "rsync")
+        self.assertIn("-a", argv)
+        self.assertIn("--safe-links", argv)  # out-of-tree symlinks dropped — no exfil
+        e_idx = argv.index("-e")
+        self.assertIn("UserKnownHostsFile=/dev/null", argv[e_idx + 1])  # hardening rides in -e ssh
+        self.assertIn("StrictHostKeyChecking=accept-new", argv[e_idx + 1])
+        # -- guard, then source-with-trailing-slash (contents-into-dest), then dest
+        self.assertEqual(argv[-3:], ["--", "/src/tree/", "probe@9.9.9.9:~/dest"])
+
+    def test_upload_dir_runs_rsync_via_seam(self) -> None:
+        seen: list[list[str]] = []
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as d:
+            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn)
+            r.upload_dir(self._host(), Path(d), "~/dest")
+        self.assertEqual(seen[0][0], "rsync")
+        self.assertIn("--safe-links", seen[0])
+
+    def test_upload_dir_raises_ssh_error_on_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(23, "", "rsync failed"))
+            with self.assertRaises(ssh.SshError):
+                r.upload_dir(self._host(), Path(d), "~/dest")
+
+    def test_upload_dir_validates_source_before_transfer(self) -> None:
+        seen: list[list[str]] = []
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn)
+        with self.assertRaises(safety.UploadError):
+            r.upload_dir(self._host(), Path("/no/such/dir"), "~/dest")
+        self.assertEqual(seen, [])  # validated fail-closed before any rsync
+
 
 def OpenSshRunnerForTest(runner_fn: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> ssh.OpenSshRunner:
     return ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
@@ -840,6 +944,56 @@ class TestUploadValidation(unittest.TestCase):
                 self.assertIn("not readable", str(cm.exception))
             finally:
                 os.chmod(f, 0o600)  # restore so TemporaryDirectory can clean up
+
+    def test_dir_source_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            safety.validate_upload_dir_source(Path(d))  # no raise — a plain readable dir
+
+    def test_dir_source_missing_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_dir_source(Path(d) / "nope")
+            self.assertIn("does not exist", str(cm.exception))
+
+    def test_dir_source_symlink_final_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            realdir = Path(d) / "realdir"
+            realdir.mkdir()
+            link = Path(d) / "linkdir"
+            os.symlink(realdir, link)
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_dir_source(link)
+            self.assertIn("symlink", str(cm.exception))
+
+    def test_dir_source_symlink_in_parent_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            realdir = Path(d) / "realdir"
+            (realdir / "sub").mkdir(parents=True)
+            linkdir = Path(d) / "linkdir"
+            os.symlink(realdir, linkdir)
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_dir_source(linkdir / "sub")
+            self.assertIn("symlink component", str(cm.exception))
+
+    def test_dir_source_non_directory_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "w.whl"
+            f.write_bytes(b"WHEEL")
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_dir_source(f)
+            self.assertIn("not a directory", str(cm.exception))
+
+    def test_dir_source_unreadable_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            sub = Path(d) / "sub"
+            sub.mkdir()
+            os.chmod(sub, 0o000)
+            try:
+                with self.assertRaises(safety.UploadError) as cm:
+                    safety.validate_upload_dir_source(sub)
+                self.assertIn("not readable", str(cm.exception))
+            finally:
+                os.chmod(sub, 0o700)  # restore so TemporaryDirectory can clean up
 
     def test_remote_happy_path(self) -> None:
         safety.validate_remote_dest("~/w.whl")  # no raise
@@ -986,6 +1140,12 @@ class TestExecute(unittest.TestCase):
             def wait_until_ready(self, host: Host) -> None:
                 return None
 
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(self._matrix(("ubuntu", "debian")), prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe")
         self.assertEqual(len(runs), 2)  # BOTH recorded
@@ -1051,6 +1211,12 @@ class TestExecute(unittest.TestCase):
             def wait_until_ready(self, host: Host) -> None:
                 return None
 
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
         m = runner.Matrix(_demo_workload(), ("ubuntu", "debian"), "cpx22", "run-par2")
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe", max_parallel=2)
@@ -1109,6 +1275,12 @@ class TestWorkloadSeam(unittest.TestCase):
 
             def wait_until_ready(self, host: Host) -> None:
                 order.append("ready")
+
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
 
         class _OrderWorkload:
             plan_summary = "order"
