@@ -67,3 +67,30 @@ caller (not read from the clock), keeping the output deterministic and testable.
 - **WHEN** results are written
 - **THEN** the filename and content use the injected timestamp, with no wall-clock read in the library
 
+### Requirement: Caller-specified files are uploaded to each host before the battery
+
+The system SHALL upload each caller-specified local file to every host over SSH, after the host's
+readiness gate and before the probe battery (including the host-detail snapshot), so the file is present
+for the first probe. An upload SHALL be transferred to the caller-specified remote destination (default
+`~/<basename>`). If an upload does not complete, the system SHALL fail that host with a transport error
+(an `SshError`-class host failure recorded as an error result with no probe results) — not a probe
+non-zero — and SHALL still tear the host down.
+
+#### Scenario: An upload lands before the first probe
+
+- **WHEN** a host becomes ready and the run has one or more upload specs
+- **THEN** every upload is transferred over SSH after readiness and before the host-detail snapshot and
+  battery, so the uploaded file is present for the first probe
+
+#### Scenario: An upload transport failure fails the host, not a probe
+
+- **WHEN** an upload's transfer exits non-zero (a transport failure)
+- **THEN** the host is recorded as an `SshError`-class host failure with no probe results, the remaining
+  battery does not run on that host, and the host is still torn down — it is not recorded as a probe
+  non-zero result
+
+#### Scenario: No upload spec leaves the lifecycle unchanged
+
+- **WHEN** a run has no upload specs
+- **THEN** no upload step runs and the host lifecycle is identical to a run without the upload feature
+
