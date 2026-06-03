@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -83,10 +84,14 @@ def _fake_subprocess(
 class FakeSshRunner:
     """Scripted SshRunner: returns exit 0 by default, or raises/fails per config."""
 
-    def __init__(self, *, fail_on: str | None = None, raise_on: str | None = None) -> None:
-        self.ran: list[str] = []
+    def __init__(
+        self, *, fail_on: str | None = None, raise_on: str | None = None, raise_upload: bool = False
+    ) -> None:
+        self.ran: list[str] = []  # ordered call log: "upload:<remote>" then probe ids
+        self.uploads: list[tuple[Path, str]] = []
         self._fail_on = fail_on
         self._raise_on = raise_on
+        self._raise_upload = raise_upload
 
     def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
         self.ran.append(probe.id)
@@ -94,6 +99,12 @@ class FakeSshRunner:
             raise ssh.SshError(f"boom on {probe.id}")
         code = 7 if probe.id == self._fail_on else 0
         return ProbeResult(probe_id=probe.id, tag=probe.tag, exit_code=code, stdout=f"out-{probe.id}", stderr="")
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        self.ran.append(f"upload:{remote}")
+        self.uploads.append((local, remote))
+        if self._raise_upload:
+            raise ssh.SshError(f"upload of {local} failed")
 
 
 def _fake_keypair(tmp: Path) -> keypair.Keypair:
@@ -460,6 +471,37 @@ class TestRunner(unittest.TestCase):
         with self.assertRaises(distro.UnknownDistroError):
             runner.plan(m)
 
+    def test_plan_validates_good_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "w.whl"
+            local.write_bytes(b"WHEEL")
+            m = runner.Matrix(
+                battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+                uploads=(model.UploadSpec(local=local, remote="~/w.whl"),),
+            )
+            items = runner.plan(m)
+            self.assertEqual(len(items), 1)
+
+    def test_plan_rejects_bad_upload_source(self) -> None:
+        # fail-closed: a bad upload aborts plan (zero provider calls) before spend
+        m = runner.Matrix(
+            battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+            uploads=(model.UploadSpec(local=Path("/no/such/file.whl"), remote="~/f.whl"),),
+        )
+        with self.assertRaises(safety.UploadError):
+            runner.plan(m)
+
+    def test_plan_rejects_bad_upload_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "w.whl"
+            local.write_bytes(b"WHEEL")
+            m = runner.Matrix(
+                battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+                uploads=(model.UploadSpec(local=local, remote="~/../etc/x"),),
+            )
+            with self.assertRaises(safety.UploadError):
+                runner.plan(m)
+
 
 # --------------------------------------------------------------------------- #
 # cli — plan subcommand (zero provider calls)
@@ -499,6 +541,41 @@ class TestCli(unittest.TestCase):
     def test_plan_unknown_distro_returns_2(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             rc = cli.main(["plan", "--battery", self._write_battery(d), "--distros", "plan9", "--run-token", "cli-run"])
+            self.assertEqual(rc, 2)
+
+    def test_parse_upload_default_remote(self) -> None:
+        spec = cli._parse_upload("/src/dist/sandbox_ai-0.1.whl")
+        self.assertEqual(spec.local, Path("/src/dist/sandbox_ai-0.1.whl"))
+        self.assertEqual(spec.remote, "~/sandbox_ai-0.1.whl")
+
+    def test_parse_upload_explicit_remote_splits_first_colon(self) -> None:
+        spec = cli._parse_upload("/src/w.whl:/opt/a:b/w.whl")
+        self.assertEqual(spec.local, Path("/src/w.whl"))
+        self.assertEqual(spec.remote, "/opt/a:b/w.whl")  # split on the FIRST colon only
+
+    def test_upload_flag_repeatable_into_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
+                "--upload", "/a/x.whl", "--upload", "/b/y.bin:~/dest/y.bin",
+            ])
+            m = cli._matrix_from_args(ns)
+            self.assertEqual(len(m.uploads), 2)
+            self.assertEqual(m.uploads[0].remote, "~/x.whl")
+            self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
+
+    def test_plan_rejects_bad_upload_no_provider_call(self) -> None:
+        # the free-plan fail-closed path: a symlink source is refused at plan,
+        # exit 2, and (since plan makes zero provider calls) nothing is provisioned.
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "real.whl"
+            target.write_bytes(b"WHEEL")
+            link = Path(d) / "link.whl"
+            os.symlink(target, link)
+            rc = cli.main([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                "--run-token", "cli-run", "--upload", str(link),
+            ])
             self.assertEqual(rc, 2)
 
 
@@ -619,6 +696,36 @@ class TestSsh(unittest.TestCase):
         res = r.run_probe(self._host(), probe)
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
 
+    def test_build_scp_argv(self) -> None:
+        argv = ssh.build_scp_argv(self._host(), "probe", Path("/tmp/k"), Path("/src/w.whl"), "~/w.whl")
+        self.assertEqual(argv[0], "scp")
+        # the same recycled-IP hardening as build_ssh_argv
+        self.assertIn("BatchMode=yes", argv)
+        self.assertIn("UserKnownHostsFile=/dev/null", argv)
+        self.assertIn("StrictHostKeyChecking=accept-new", argv)
+        self.assertIn("ConnectTimeout=10", argv)
+        self.assertIn("-i", argv)
+        # the -- option terminator precedes the two positional path args
+        self.assertEqual(argv[-3:], ["--", "/src/w.whl", "probe@9.9.9.9:~/w.whl"])
+
+    def test_upload_runs_scp_via_seam(self) -> None:
+        seen: list[list[str]] = []
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "scp")
+        self.assertEqual(seen[0][-1], "probe@9.9.9.9:~/w.whl")
+
+    def test_upload_raises_ssh_error_on_nonzero(self) -> None:
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1, "", "no route"), sleeper=lambda _x: None)
+        with self.assertRaises(ssh.SshError):
+            r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
+
     def test_wait_until_ready_polls_then_succeeds(self) -> None:
         # fail twice then succeed; sleeper is a no-op recorder
         seq = [1, 1, 0]
@@ -657,6 +764,95 @@ class TestReap(unittest.TestCase):
         reaped = safety.reap(prov, "r1")
         self.assertEqual(len(reaped), 1)
         self.assertEqual(len(prov.destroyed), 1)
+
+
+# --------------------------------------------------------------------------- #
+# safety — upload source / remote-dest validators (fail-closed before spend)
+# --------------------------------------------------------------------------- #
+class TestUploadValidation(unittest.TestCase):
+    def test_source_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "w.whl"
+            f.write_bytes(b"WHEEL")
+            safety.validate_upload_source(f)  # no raise
+
+    def test_source_missing_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_source(Path(d) / "nope.whl")
+            self.assertIn("does not exist", str(cm.exception))
+
+    def test_source_symlink_final_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "real.whl"
+            target.write_bytes(b"WHEEL")
+            link = Path(d) / "link.whl"
+            os.symlink(target, link)
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_source(link)
+            self.assertIn("symlink", str(cm.exception))
+
+    def test_source_symlink_in_parent_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            realdir = Path(d) / "realdir"
+            realdir.mkdir()
+            f = realdir / "w.whl"
+            f.write_bytes(b"WHEEL")
+            linkdir = Path(d) / "linkdir"
+            os.symlink(realdir, linkdir)
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_source(linkdir / "w.whl")
+            self.assertIn("symlink component", str(cm.exception))
+
+    def test_source_directory_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_source(Path(d))
+            self.assertIn("not a regular file", str(cm.exception))
+
+    def test_source_fifo_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            fifo = Path(d) / "pipe"
+            os.mkfifo(fifo)
+            with self.assertRaises(safety.UploadError) as cm:
+                safety.validate_upload_source(fifo)
+            self.assertIn("not a regular file", str(cm.exception))
+
+    def test_source_unreadable_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "w.whl"
+            f.write_bytes(b"WHEEL")
+            os.chmod(f, 0o000)
+            try:
+                with self.assertRaises(safety.UploadError) as cm:
+                    safety.validate_upload_source(f)
+                self.assertIn("not readable", str(cm.exception))
+            finally:
+                os.chmod(f, 0o600)  # restore so TemporaryDirectory can clean up
+
+    def test_remote_happy_path(self) -> None:
+        safety.validate_remote_dest("~/w.whl")  # no raise
+        safety.validate_remote_dest("/opt/app/wheels/w-1.0+local.whl")  # no raise
+
+    def test_remote_empty_refused(self) -> None:
+        with self.assertRaises(safety.UploadError) as cm:
+            safety.validate_remote_dest("")
+        self.assertIn("empty", str(cm.exception))
+
+    def test_remote_traversal_refused(self) -> None:
+        with self.assertRaises(safety.UploadError) as cm:
+            safety.validate_remote_dest("~/../../etc/cron.d/x")
+        self.assertIn("..", str(cm.exception))
+
+    def test_remote_leading_dash_refused(self) -> None:
+        with self.assertRaises(safety.UploadError) as cm:
+            safety.validate_remote_dest("-oProxyCommand=evil")
+        self.assertIn("-", str(cm.exception))
+
+    def test_remote_bad_char_refused(self) -> None:
+        with self.assertRaises(safety.UploadError) as cm:
+            safety.validate_remote_dest("~/w.whl; rm -rf /")
+        self.assertIn("disallowed character", str(cm.exception))
 
 
 # --------------------------------------------------------------------------- #
@@ -706,6 +902,42 @@ class TestExecute(unittest.TestCase):
         # battery ran in tag order on each host (P1 read-only first, P12 host-root last)
         self.assertEqual(fssh.ran[-1], "P12")
 
+    def _upload_matrix(self, remote: str = "~/w.whl") -> tuple[runner.Matrix, Path]:
+        # a matrix carrying one upload; returns it plus the (real, valid) local file
+        tmp = Path(tempfile.mkdtemp())
+        local = tmp / "w.whl"
+        local.write_bytes(b"WHEEL")
+        m = runner.Matrix(
+            battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+            uploads=(model.UploadSpec(local=local, remote=remote),),
+        )
+        return m, local
+
+    def test_upload_precedes_first_probe(self) -> None:
+        # the lifecycle contract: upload lands after readiness, before detail/battery
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        m, local = self._upload_matrix()
+        with tempfile.TemporaryDirectory() as d:
+            runner.execute(m, prov, self._factory(fssh), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(fssh.uploads, [(local, "~/w.whl")])
+        # "upload:~/w.whl" appears in the call log BEFORE the first probe (_detail)
+        self.assertEqual(fssh.ran[0], "upload:~/w.whl")
+        self.assertEqual(fssh.ran[1], "_detail")
+
+    def test_upload_failure_is_host_error_and_tears_down(self) -> None:
+        # an upload that raises SshError is a transport host-failure (error HostRun),
+        # NOT a probe non-zero — and the host is still torn down.
+        prov = FakeProvider()
+        failing = FakeSshRunner(raise_upload=True)
+        m, _local = self._upload_matrix()
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(m, prov, self._factory(failing), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].detail.startswith("ERROR:"))  # transport failure recorded
+        self.assertEqual(runs[0].results, ())  # no probes ran
+        self.assertEqual(len(prov.destroyed), 1)  # torn down despite the failure
+
     def test_cloudinit_rendered_per_distro(self) -> None:
         prov = FakeProvider()
         with tempfile.TemporaryDirectory() as d:
@@ -736,6 +968,9 @@ class TestExecute(unittest.TestCase):
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
                 return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
 
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(self._matrix(("ubuntu", "debian")), prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe")
@@ -795,6 +1030,9 @@ class TestExecute(unittest.TestCase):
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
                 return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
 
         m = runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu", "debian"), "cpx22", "run-par2")
         with tempfile.TemporaryDirectory() as d:

@@ -16,11 +16,15 @@ time/rng so runs stay reproducible and testable), so tests pin it exactly.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from vmlease.model import Host
     from vmlease.providers import Provider
 
@@ -39,6 +43,73 @@ _RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,38}$")
 
 class CostGuardError(ValueError):
     """A matrix would exceed the host cap or use a non-allowlisted server type."""
+
+
+class UploadError(ValueError):
+    """An upload source or remote destination is problematic and is refused.
+
+    Raised fail-closed *before any provider call* (in ``plan`` and at the top of
+    ``execute``), so a bad ``--upload`` aborts before spend, never on a
+    half-built billable host.
+    """
+
+
+# Conservative allowlist for an upload's remote destination: alnum plus a few
+# path-safe punctuation chars. Deliberately excludes whitespace and every shell
+# metacharacter (`;|&$()<>` backtick quotes), so an older scp that shell-expands
+# the target cannot be steered. Tilde stays in for the default `~/<basename>`.
+_REMOTE_DEST_RE = re.compile(r"^[A-Za-z0-9._/~@,=+-]+$")
+
+
+def validate_upload_source(local: Path) -> None:
+    """Refuse a problematic upload source fail-closed (footgun-prevention).
+
+    Checks in order, *without following a symlink* (``lstat``), so a symlink's
+    target is never read or shipped:
+
+    1. missing → "does not exist";
+    2. the final component is a symlink → "is a symlink";
+    3. any component in the resolved chain is a symlink
+       (``realpath`` != ``abspath``) → "path contains a symlink component";
+    4. not a regular file (dir, FIFO, socket, device) → "is not a regular file";
+    5. not readable → "is not readable".
+
+    Raises :class:`UploadError` on the first failing check; returns ``None`` when
+    the source is a plain, readable, non-symlinked regular file.
+    """
+    try:
+        info = os.lstat(local)
+    except FileNotFoundError as exc:
+        raise UploadError(f"upload source {local} does not exist") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise UploadError(f"upload source {local} is a symlink (refused — its target is not read or shipped)")
+    if os.path.realpath(local) != os.path.abspath(local):
+        raise UploadError(f"upload source {local} path contains a symlink component (refused)")
+    if not stat.S_ISREG(info.st_mode):
+        raise UploadError(f"upload source {local} is not a regular file")
+    if not os.access(local, os.R_OK):
+        raise UploadError(f"upload source {local} is not readable")
+
+
+def validate_remote_dest(remote: str) -> None:
+    """Refuse a problematic upload remote destination fail-closed.
+
+    Refuses: an empty string; any ``/``-split segment equal to ``..`` (path
+    traversal); a leading ``-`` (scp option-injection); any character outside a
+    conservative allowlist (no spaces, no shell metacharacters). Raises
+    :class:`UploadError` on the first failing check.
+    """
+    if not remote:
+        raise UploadError("upload remote destination is empty")
+    if remote.startswith("-"):
+        raise UploadError(f"upload remote destination {remote!r} begins with '-' (refused — scp option injection)")
+    if any(seg == ".." for seg in remote.split("/")):
+        raise UploadError(f"upload remote destination {remote!r} contains a '..' path segment (refused)")
+    if not _REMOTE_DEST_RE.match(remote):
+        raise UploadError(
+            f"upload remote destination {remote!r} contains a disallowed character "
+            f"(allowed: letters, digits, and ._/~@,=+-)"
+        )
 
 
 def make_run_id(token: str) -> str:

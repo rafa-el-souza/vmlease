@@ -95,3 +95,46 @@ out-of-band-configured provider context.
 - **WHEN** any provider operation runs
 - **THEN** the harness does not read or emit the provider token
 
+### Requirement: Upload sources and destinations are validated fail-closed before any provisioning
+
+The system SHALL validate every upload source and remote destination **before any provider call** and
+SHALL refuse the run fail-closed when an input is problematic, so a bad upload aborts before spend rather
+than on a half-built billable host. The `plan` dry-run (which makes zero provider calls) SHALL perform
+the same validation. Validation is host-independent and SHALL be performed once per run.
+
+An upload **source** SHALL be refused when it: does not exist; is a symlink (the final component **or**
+any symlink in its resolved path chain); is not a regular file (a directory, FIFO, socket, or device);
+or is not readable. The source SHALL be inspected without following a symlink, so a symlink's target is
+never read or shipped.
+
+An upload **remote destination** SHALL be refused when it: is empty; contains a `..` path segment;
+begins with `-` (option injection); or contains any character outside a conservative allowlist (no
+spaces and no shell-unsafe metacharacters).
+
+#### Scenario: A symlink source is refused
+
+- **WHEN** an upload source is a symlink, or resolves through a symlinked path component
+- **THEN** the run is refused with an error naming the symlink, and nothing is provisioned (the symlink's
+  target is never read or shipped)
+
+#### Scenario: A non-regular-file source is refused
+
+- **WHEN** an upload source is a directory (or other non-regular file such as a FIFO, socket, or device)
+- **THEN** the run is refused with an error stating it is not a regular file, and nothing is provisioned
+
+#### Scenario: A missing or unreadable source is refused
+
+- **WHEN** an upload source does not exist or is not readable
+- **THEN** the run is refused with an error describing the problem, and nothing is provisioned
+
+#### Scenario: A traversing or unsafe remote destination is refused
+
+- **WHEN** an upload remote destination contains a `..` segment, begins with `-`, is empty, or contains a
+  shell-unsafe character
+- **THEN** the run is refused with an error describing the problem, and nothing is provisioned
+
+#### Scenario: plan rejects a bad upload before any provider call
+
+- **WHEN** `plan` is invoked with a problematic upload source or destination
+- **THEN** `plan` raises the upload-validation refusal and makes zero provider calls
+

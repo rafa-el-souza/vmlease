@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING
 from vmlease.cloudinit import render_cloudinit
 from vmlease.distro import get_profile
 from vmlease.model import HostRun, HostSpec, PlanItem, ProbeResult
-from vmlease.safety import CostGuard, make_run_id, run_label
+from vmlease.safety import CostGuard, make_run_id, run_label, validate_remote_dest, validate_upload_source
 
 if TYPE_CHECKING:
     from vmlease.distro import DistroProfile
     from vmlease.keypair import Keypair
-    from vmlease.model import Battery, Host
+    from vmlease.model import Battery, Host, UploadSpec
     from vmlease.providers import Provider
     from vmlease.ssh import SshRunner
 
@@ -38,6 +38,8 @@ class Matrix:
             caller supplies — NOT read from the clock here).
         firewall: Optional provider firewall name attached to every host
             (``""`` = none).
+        uploads: Files scp'd onto every host after readiness, before the battery
+            (``()`` = none). Validated host-independently before any spend.
     """
 
     battery: Battery
@@ -45,6 +47,7 @@ class Matrix:
     server_type: str
     run_token: str
     firewall: str = ""
+    uploads: tuple[UploadSpec, ...] = ()
 
 
 def build_host_specs(matrix: Matrix) -> list[HostSpec]:
@@ -73,14 +76,30 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
     return specs
 
 
+def validate_uploads(matrix: Matrix) -> None:
+    """Validate every upload's source + remote dest, fail-closed, before spend.
+
+    Host-independent (the local file and remote path are the same for every
+    host), so the run's uploads are validated **once**. Raises
+    :class:`~vmlease.safety.UploadError` on the first problematic spec — called
+    at the top of both ``plan`` (zero provider calls) and ``execute`` (before the
+    provision loop), so a bad ``--upload`` aborts before any host is created.
+    """
+    for spec in matrix.uploads:
+        validate_upload_source(spec.local)
+        validate_remote_dest(spec.remote)
+
+
 def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
     """Render the dry-run plan. Makes **zero** provider calls.
 
-    Builds the host specs (the same ones a real run would provision), runs them
-    through the cost guard (so ``plan`` surfaces a guard refusal *before* any
-    spend), and returns one :class:`PlanItem` per host. The CLI prints these +
-    a confirm-before-create prompt; nothing is provisioned here.
+    Builds the host specs (the same ones a real run would provision), validates
+    the uploads + runs the specs through the cost guard (so ``plan`` surfaces a
+    refusal *before* any spend), and returns one :class:`PlanItem` per host. The
+    CLI prints these + a confirm-before-create prompt; nothing is provisioned
+    here.
     """
+    validate_uploads(matrix)
     specs = build_host_specs(matrix)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
@@ -156,12 +175,15 @@ def execute(
     concurrently also sidesteps Hetzner's recycled-IP-into-the-next-host behavior
     (hosts overlap, so an IP is not freed mid-run).
     """
+    validate_uploads(matrix)
     specs = build_host_specs(matrix)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
 
     def _one(spec: HostSpec) -> HostRun:
-        return _run_one_host(spec, matrix.battery, provider, ssh_factory, keypair, operator, rescue_writer)
+        return _run_one_host(
+            spec, matrix.battery, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads
+        )
 
     try:
         if max_parallel <= 1 or len(specs) <= 1:
@@ -183,6 +205,7 @@ def _run_one_host(
     keypair: Keypair,
     operator: str,
     rescue_writer: RescueWriter | None,
+    uploads: tuple[UploadSpec, ...] = (),
 ) -> HostRun:
     """Create, (rescue-write,) probe, and ALWAYS destroy a single host.
 
@@ -214,7 +237,7 @@ def _run_one_host(
                     f"rescue_writer was provided to execute()"
                 )
             rescue_writer(host, profile)
-        run = _probe_one_host(spec, host, battery, ssh_factory(operator, keypair))
+        run = _probe_one_host(spec, host, battery, ssh_factory(operator, keypair), uploads)
     except Exception as exc:  # provider / rescue / transport failure → record, don't abort
         run = HostRun(host_spec=spec, detail=f"ERROR: {type(exc).__name__}: {exc}", results=())
 
@@ -238,13 +261,25 @@ def _best_effort_destroy(provider: Provider, host: Host) -> str:
         return f"WARNING: teardown of {host.name} ({host.id}) failed — reap it: {exc}"
 
 
-def _probe_one_host(spec: HostSpec, host: Host, battery: Battery, ssh: SshRunner) -> HostRun:
-    """Wait for readiness, snapshot host detail, run the battery in tag order."""
+def _probe_one_host(
+    spec: HostSpec, host: Host, battery: Battery, ssh: SshRunner, uploads: tuple[UploadSpec, ...] = ()
+) -> HostRun:
+    """Wait for readiness, upload files, snapshot host detail, run the battery.
+
+    The uploads land **after** the readiness gate and **before** the host-detail
+    snapshot, so an uploaded file is present for the first probe. An upload that
+    fails raises :class:`~vmlease.ssh.SshError`, caught by the caller's per-host
+    ``try/finally`` as a transport failure (an error ``HostRun``, still torn
+    down) — distinct from a probe's own non-zero exit.
+    """
     from vmlease.model import Probe, ProbeTag
     from vmlease.ssh import OpenSshRunner
 
     if isinstance(ssh, OpenSshRunner):
         ssh.wait_until_ready(host)
+
+    for upload in uploads:
+        ssh.upload(host, upload.local, upload.remote)
 
     detail_probe = Probe(id="_detail", title="host detail", command=HostDetailProbe().command, tag=ProbeTag.READ_ONLY)
     detail = ssh.run_probe(host, detail_probe).stdout
