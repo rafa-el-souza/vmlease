@@ -35,6 +35,7 @@ from vmlease import (
     safety,
     ssh,
     templating,
+    workload,
 )
 from vmlease import battery as battery_mod
 from vmlease.model import Host, HostSpec, Probe, ProbeResult, ProbeTag
@@ -105,6 +106,16 @@ class FakeSshRunner:
         self.uploads.append((local, remote))
         if self._raise_upload:
             raise ssh.SshError(f"upload of {local} failed")
+
+    def wait_until_ready(self, host: Host) -> None:
+        # no-op: the fake host is always "ready" (no readiness logged, so the
+        # call log stays upload-then-detail like the live readiness gate).
+        return None
+
+
+def _demo_workload() -> workload.ProbeWorkload:
+    """The probe battery as a workload — the injected default for runner tests."""
+    return workload.ProbeWorkload(battery_mod.parse_battery(_BATTERY_JSON))
 
 
 def _fake_keypair(tmp: Path) -> keypair.Keypair:
@@ -431,7 +442,7 @@ class TestDistro(unittest.TestCase):
 class TestRunner(unittest.TestCase):
     def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.Matrix:
         return runner.Matrix(
-            battery=battery_mod.parse_battery(_BATTERY_JSON),
+            workload=_demo_workload(),
             distro_keys=tuple(distros),
             server_type="cpx22",
             run_token="run-xyz",
@@ -446,7 +457,7 @@ class TestRunner(unittest.TestCase):
             self.assertEqual(s.firewall, "")  # no firewall by default
 
     def test_build_host_specs_threads_firewall(self) -> None:
-        m = runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-fw", firewall="my-firewall")
+        m = runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-fw", firewall="my-firewall")
         specs = runner.build_host_specs(m)
         self.assertEqual(specs[0].firewall, "my-firewall")
 
@@ -459,7 +470,7 @@ class TestRunner(unittest.TestCase):
         # plan only needs the matrix; a provider is never constructed or passed.
         items = runner.plan(self._matrix())
         self.assertEqual(len(items), 2)
-        self.assertEqual(items[0].probe_count, 3)
+        self.assertEqual(items[0].workload_summary, "probes=3")
 
     def test_plan_surfaces_cost_guard(self) -> None:
         m = self._matrix(distros=("ubuntu", "debian", "fedora"))
@@ -467,7 +478,7 @@ class TestRunner(unittest.TestCase):
             runner.plan(m, cost_guard=safety.CostGuard(max_hosts=2))
 
     def test_plan_unknown_distro(self) -> None:
-        m = runner.Matrix(battery=battery_mod.parse_battery(_BATTERY_JSON), distro_keys=("nope",), server_type="cpx22", run_token="t-okay")
+        m = runner.Matrix(workload=_demo_workload(), distro_keys=("nope",), server_type="cpx22", run_token="t-okay")
         with self.assertRaises(distro.UnknownDistroError):
             runner.plan(m)
 
@@ -476,7 +487,7 @@ class TestRunner(unittest.TestCase):
             local = Path(d) / "w.whl"
             local.write_bytes(b"WHEEL")
             m = runner.Matrix(
-                battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+                _demo_workload(), ("ubuntu",), "cpx22", "run-up",
                 uploads=(model.UploadSpec(local=local, remote="~/w.whl"),),
             )
             items = runner.plan(m)
@@ -485,7 +496,7 @@ class TestRunner(unittest.TestCase):
     def test_plan_rejects_bad_upload_source(self) -> None:
         # fail-closed: a bad upload aborts plan (zero provider calls) before spend
         m = runner.Matrix(
-            battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+            _demo_workload(), ("ubuntu",), "cpx22", "run-up",
             uploads=(model.UploadSpec(local=Path("/no/such/file.whl"), remote="~/f.whl"),),
         )
         with self.assertRaises(safety.UploadError):
@@ -496,7 +507,7 @@ class TestRunner(unittest.TestCase):
             local = Path(d) / "w.whl"
             local.write_bytes(b"WHEEL")
             m = runner.Matrix(
-                battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+                _demo_workload(), ("ubuntu",), "cpx22", "run-up",
                 uploads=(model.UploadSpec(local=local, remote="~/../etc/x"),),
             )
             with self.assertRaises(safety.UploadError):
@@ -559,7 +570,7 @@ class TestCli(unittest.TestCase):
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
                 "--upload", "/a/x.whl", "--upload", "/b/y.bin:~/dest/y.bin",
             ])
-            m = cli._matrix_from_args(ns)
+            m = cli._matrix_from_args(ns, _demo_workload())
             self.assertEqual(len(m.uploads), 2)
             self.assertEqual(m.uploads[0].remote, "~/x.whl")
             self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
@@ -886,7 +897,7 @@ class TestResults(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestExecute(unittest.TestCase):
     def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.Matrix:
-        return runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), distros, "cpx22", "run-xyz")
+        return runner.Matrix(_demo_workload(), distros, "cpx22", "run-xyz")
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -908,7 +919,7 @@ class TestExecute(unittest.TestCase):
         local = tmp / "w.whl"
         local.write_bytes(b"WHEEL")
         m = runner.Matrix(
-            battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-up",
+            _demo_workload(), ("ubuntu",), "cpx22", "run-up",
             uploads=(model.UploadSpec(local=local, remote=remote),),
         )
         return m, local
@@ -972,6 +983,9 @@ class TestExecute(unittest.TestCase):
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
 
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(self._matrix(("ubuntu", "debian")), prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe")
         self.assertEqual(len(runs), 2)  # BOTH recorded
@@ -998,7 +1012,7 @@ class TestExecute(unittest.TestCase):
 
     def test_parallel_preserves_order_and_tears_down_all(self) -> None:
         prov = FakeProvider()
-        m = runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu", "debian", "fedora"), "cpx22", "run-par")
+        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-par")
         # a fresh FakeSshRunner per host (thread-safe-ish; each host independent)
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe", max_parallel=3)
@@ -1034,7 +1048,10 @@ class TestExecute(unittest.TestCase):
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
 
-        m = runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu", "debian"), "cpx22", "run-par2")
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
+        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian"), "cpx22", "run-par2")
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe", max_parallel=2)
         self.assertEqual(len(runs), 2)
@@ -1042,6 +1059,74 @@ class TestExecute(unittest.TestCase):
         by_distro = {r.host_spec.distro_key: r for r in runs}
         self.assertTrue(by_distro["ubuntu"].results)  # preserved
         self.assertTrue(by_distro["debian"].detail.startswith("ERROR:"))
+
+
+# --------------------------------------------------------------------------- #
+# workload seam — the injected Workload Protocol (D9.1)
+# --------------------------------------------------------------------------- #
+class _RecordingWorkload:
+    """A Workload that records each host it runs on — for seam/ordering tests."""
+
+    plan_summary = "recording"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def run(self, spec: HostSpec, host: Host, conn: ssh.SshRunner) -> model.HostRun:
+        self.calls.append(host.name)
+        return model.HostRun(host_spec=spec, detail="recorded", results=())
+
+
+class TestWorkloadSeam(unittest.TestCase):
+    def test_probe_workload_satisfies_protocol(self) -> None:
+        self.assertIsInstance(_demo_workload(), workload.Workload)
+
+    def test_a_non_probe_workload_satisfies_protocol(self) -> None:
+        # the seam admits other workloads — a fake conforms structurally
+        self.assertIsInstance(_RecordingWorkload(), workload.Workload)
+
+    def test_injected_workload_runs_once_per_host_in_matrix_order(self) -> None:
+        prov = FakeProvider()
+        rec = _RecordingWorkload()
+        m = runner.Matrix(rec, ("ubuntu", "debian"), "cpx22", "run-inj")
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe")
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])  # matrix order
+        self.assertEqual(len(rec.calls), 2)  # exactly one run() per host
+        self.assertEqual([n.rsplit("-", 1)[-1] for n in rec.calls], ["ubuntu", "debian"])
+
+    def test_runner_gates_readiness_before_invoking_workload(self) -> None:
+        # the runner owns readiness: wait_until_ready fires BEFORE workload.run
+        prov = FakeProvider()
+        order: list[str] = []
+
+        class _ReadyRecordingSsh:
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                return ProbeResult(probe.id, probe.tag, 0, "", "")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+            def wait_until_ready(self, host: Host) -> None:
+                order.append("ready")
+
+        class _OrderWorkload:
+            plan_summary = "order"
+
+            def run(self, spec: HostSpec, host: Host, conn: ssh.SshRunner) -> model.HostRun:
+                order.append("run")
+                return model.HostRun(host_spec=spec, detail="", results=())
+
+        m = runner.Matrix(_OrderWorkload(), ("ubuntu",), "cpx22", "run-ready")
+        with tempfile.TemporaryDirectory() as d:
+            runner.execute(m, prov, lambda _o, _k: _ReadyRecordingSsh(), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(order, ["ready", "run"])
+
+    def test_plan_renders_the_workload_summary(self) -> None:
+        wl = _demo_workload()
+        items = runner.plan(runner.Matrix(wl, ("ubuntu",), "cpx22", "run-ps"))
+        self.assertEqual(items[0].workload_summary, "probes=3")
+        self.assertEqual(items[0].workload_summary, wl.plan_summary)
 
 
 # --------------------------------------------------------------------------- #
@@ -1274,7 +1359,7 @@ class TestArchImage(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestRunnerRescueWrite(unittest.TestCase):
     def _arch_matrix(self) -> runner.Matrix:
-        return runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("arch",), "cpx22", "run-rw")
+        return runner.Matrix(_demo_workload(), ("arch",), "cpx22", "run-rw")
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -1295,7 +1380,7 @@ class TestRunnerRescueWrite(unittest.TestCase):
     def test_native_distro_does_not_invoke_writer(self) -> None:
         prov = FakeProvider()
         calls: list[str] = []
-        m = runner.Matrix(battery_mod.parse_battery(_BATTERY_JSON), ("ubuntu",), "cpx22", "run-nat")
+        m = runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-nat")
         with tempfile.TemporaryDirectory() as d:
             runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe",
                            rescue_writer=lambda h, p: calls.append(h.name))

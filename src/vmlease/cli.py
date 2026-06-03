@@ -37,6 +37,7 @@ from vmlease.results import write_results
 from vmlease.runner import Matrix, RescueWriter, execute, plan
 from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, UploadError, make_run_id, reap
 from vmlease.ssh import OpenSshRunner
+from vmlease.workload import ProbeWorkload, Workload
 
 
 def _matrix_has_rescue_write(matrix: Matrix) -> bool:
@@ -77,12 +78,11 @@ def _parse_upload(value: str) -> UploadSpec:
     return UploadSpec(local=local, remote=remote)
 
 
-def _matrix_from_args(args: argparse.Namespace) -> Matrix:
-    battery = load_battery(Path(args.battery))
+def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
     distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
     uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
     return Matrix(
-        battery=battery,
+        workload=workload,
         distro_keys=distro_keys,
         server_type=args.server_type,
         run_token=args.run_token,
@@ -93,15 +93,16 @@ def _matrix_from_args(args: argparse.Namespace) -> Matrix:
 
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
-        matrix = _matrix_from_args(args)
+        battery = load_battery(Path(args.battery))
+        matrix = _matrix_from_args(args, ProbeWorkload(battery))
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(f"battery: {matrix.battery.name}  ({len(matrix.battery.probes)} probes)")
+    print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  probes={it.probe_count}")
+        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}")
     return 0
 
 
@@ -115,13 +116,14 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
 
 def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
     try:
-        matrix = _matrix_from_args(args)
+        battery = load_battery(Path(args.battery))
+        matrix = _matrix_from_args(args, ProbeWorkload(battery))
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    print(f"battery: {matrix.battery.name}  ({len(matrix.battery.probes)} probes)")
+    print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
         print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}")

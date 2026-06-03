@@ -46,6 +46,15 @@ class SshRunner(Protocol):
         """Copy local file ``local`` to ``remote`` on ``host`` over SSH."""
         ...
 
+    def wait_until_ready(self, host: Host) -> None:
+        """Block until ``host`` is reachable/ready, or raise :class:`SshError`.
+
+        The runner calls this before invoking any workload, so a workload only
+        ever runs against a ready host. Impls that need no readiness poll (a
+        test fake) satisfy it as a no-op.
+        """
+        ...
+
 
 def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: str) -> list[str]:
     """Build the ``ssh`` argv for ``command`` on ``host`` as ``operator``.

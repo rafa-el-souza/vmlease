@@ -151,14 +151,16 @@ class HostRun:
 
 @dataclass(frozen=True)
 class PlanItem:
-    """One line of the ``plan`` dry-run: what WOULD be provisioned + probed.
+    """One line of the ``plan`` dry-run: what WOULD be provisioned + run.
 
     A plan makes zero provider calls; it renders the matrix the runner would
     execute so an operator can review (and cost-check) before any real spend.
+    ``workload_summary`` is the injected workload's one-line self-description
+    (e.g. ``probes=3`` for the probe battery) — the plan does not assume probes.
     """
 
     host_name: str
     image: str
     server_type: str
     distro_key: str
-    probe_count: int
+    workload_summary: str

@@ -15,34 +15,37 @@ from typing import TYPE_CHECKING
 
 from vmlease.cloudinit import render_cloudinit
 from vmlease.distro import get_profile
-from vmlease.model import HostRun, HostSpec, PlanItem, ProbeResult
+from vmlease.model import HostRun, HostSpec, PlanItem
 from vmlease.safety import CostGuard, make_run_id, run_label, validate_remote_dest, validate_upload_source
 
 if TYPE_CHECKING:
     from vmlease.distro import DistroProfile
     from vmlease.keypair import Keypair
-    from vmlease.model import Battery, Host, UploadSpec
+    from vmlease.model import Host, UploadSpec
     from vmlease.providers import Provider
     from vmlease.ssh import SshRunner
+    from vmlease.workload import Workload
 
 
 @dataclass(frozen=True)
 class Matrix:
-    """A run request: one battery across N distros on one server type.
+    """A run request: one workload across N distros on one server type.
 
     Attributes:
-        battery: The loaded :class:`Battery` to run on every host.
+        workload: The injected :class:`~vmlease.workload.Workload` to run on every
+            host (e.g. ``ProbeWorkload`` for the probe battery). The runner never
+            names a concrete impl — the caller constructs and injects it.
         distro_keys: Which :mod:`vmlease.distro` profiles to provision.
         server_type: The (cheap, allowlisted) instance size for every host.
         run_token: The determinism seam for the run-id (a slug/timestamp the
             caller supplies — NOT read from the clock here).
         firewall: Optional provider firewall name attached to every host
             (``""`` = none).
-        uploads: Files scp'd onto every host after readiness, before the battery
+        uploads: Files scp'd onto every host after readiness, before the workload
             (``()`` = none). Validated host-independently before any spend.
     """
 
-    battery: Battery
+    workload: Workload
     distro_keys: tuple[str, ...]
     server_type: str
     run_token: str
@@ -103,31 +106,17 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
     specs = build_host_specs(matrix)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
-    probe_count = len(matrix.battery.probes)
+    workload_summary = matrix.workload.plan_summary
     return [
         PlanItem(
             host_name=s.name,
             image=s.image,
             server_type=s.server_type,
             distro_key=s.distro_key,
-            probe_count=probe_count,
+            workload_summary=workload_summary,
         )
         for s in specs
     ]
-
-
-@dataclass(frozen=True)
-class HostDetailProbe:
-    """The fixed host-detail snapshot command (self-describing results header)."""
-
-    command: str = (
-        "{ echo '## os-release'; cat /etc/os-release; echo '## uname'; uname -a; "
-        "echo '## systemd'; systemctl --version | head -1; "
-        "echo '## cgroup'; stat -fc %T /sys/fs/cgroup; "
-        "echo '## id'; id; "
-        "echo '## tools'; command -v docker dockerd-rootless-setuptool.sh "
-        "rootlesskit slirp4netns fuse-overlayfs newuidmap runsc 2>/dev/null; } 2>&1 || true"
-    )
 
 
 # A rescue-writer transforms a just-created BASE host into the target distro by
@@ -149,16 +138,17 @@ def execute(
     rescue_writer: RescueWriter | None = None,
     max_parallel: int = 1,
 ) -> list[HostRun]:
-    """Per host: provision -> (rescue-write) -> probe -> **tear down immediately**.
+    """Per host: provision -> (rescue-write) -> run workload -> **tear down immediately**.
 
-    Each host is **isolated**: it is created, transformed/probed, and destroyed in
+    Each host is **isolated**: it is created, transformed, run, and destroyed in
     its own ``try/finally`` BEFORE the next host starts — so a host dies seconds
-    after its probe (lower cost / shorter exposure) and, crucially, **one host's
+    after its workload (lower cost / shorter exposure) and, crucially, **one host's
     failure never discards another's results**. A host that fails to provision /
     rescue-write / become reachable is recorded as a ``HostRun`` with an error
-    detail and zero probe results (NOT a raise), so :func:`execute` always returns
+    detail and zero results (NOT a raise), so :func:`execute` always returns
     one ``HostRun`` per requested host and the caller always writes a results file.
-    The keypair is cleaned once at the end.
+    The injected ``matrix.workload`` owns what runs on each ready host. The keypair
+    is cleaned once at the end.
 
     ``ssh_factory`` builds an :class:`~vmlease.ssh.SshRunner` for the operator
     + keypair (injected so tests pass a fake). ``rescue_writer`` (injected) is
@@ -182,7 +172,7 @@ def execute(
 
     def _one(spec: HostSpec) -> HostRun:
         return _run_one_host(
-            spec, matrix.battery, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads
+            spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads
         )
 
     try:
@@ -199,7 +189,7 @@ def execute(
 
 def _run_one_host(
     spec: HostSpec,
-    battery: Battery,
+    workload: Workload,
     provider: Provider,
     ssh_factory: Callable[[str, Keypair], SshRunner],
     keypair: Keypair,
@@ -207,16 +197,18 @@ def _run_one_host(
     rescue_writer: RescueWriter | None,
     uploads: tuple[UploadSpec, ...] = (),
 ) -> HostRun:
-    """Create, (rescue-write,) probe, and ALWAYS destroy a single host.
+    """Create, (rescue-write,) run the workload, and ALWAYS destroy a single host.
 
-    Provider/rescue/transport failures are caught and returned as an error
-    ``HostRun`` (so a later host can still run, and the caller writes results);
-    only a probe's own non-zero exit is normal data. The host is destroyed in the
-    ``finally`` regardless.
+    The runner owns the lifecycle around the workload: it waits for the host's
+    readiness gate and stages any uploads (transport-generic, before the workload),
+    then invokes ``workload.run`` against the ready host. Provider/rescue/transport
+    failures are caught and returned as an error ``HostRun`` (so a later host can
+    still run, and the caller writes results); only the workload's own captured
+    outcome is normal data. The host is destroyed in the ``finally`` regardless.
     Teardown is best-effort and NEVER loses results: a failing ``destroy`` (e.g.
     a transient API timeout that the host-side delete actually completes) is
-    appended to the result's detail as a warning, not raised — the probe data is
-    the valuable artifact, and a stubborn server is a reap-able orphan, not a
+    appended to the result's detail as a warning, not raised — the collected data
+    is the valuable artifact, and a stubborn server is a reap-able orphan, not a
     reason to discard everything. (``provider.destroy`` already retries transient
     timeouts; this guard handles the residual case.)
     """
@@ -237,7 +229,15 @@ def _run_one_host(
                     f"rescue_writer was provided to execute()"
                 )
             rescue_writer(host, profile)
-        run = _probe_one_host(spec, host, battery, ssh_factory(operator, keypair), uploads)
+        ssh = ssh_factory(operator, keypair)
+        # Readiness + upload staging are transport-generic and the runner's job —
+        # so the workload only ever runs against a ready host with its files in
+        # place. An upload that fails raises SshError, caught below as a transport
+        # host-failure (distinct from the workload's own captured outcome).
+        ssh.wait_until_ready(host)
+        for upload in uploads:
+            ssh.upload(host, upload.local, upload.remote)
+        run = workload.run(spec, host, ssh)
     except Exception as exc:  # provider / rescue / transport failure → record, don't abort
         run = HostRun(host_spec=spec, detail=f"ERROR: {type(exc).__name__}: {exc}", results=())
 
@@ -259,30 +259,3 @@ def _best_effort_destroy(provider: Provider, host: Host) -> str:
         return ""
     except Exception as exc:
         return f"WARNING: teardown of {host.name} ({host.id}) failed — reap it: {exc}"
-
-
-def _probe_one_host(
-    spec: HostSpec, host: Host, battery: Battery, ssh: SshRunner, uploads: tuple[UploadSpec, ...] = ()
-) -> HostRun:
-    """Wait for readiness, upload files, snapshot host detail, run the battery.
-
-    The uploads land **after** the readiness gate and **before** the host-detail
-    snapshot, so an uploaded file is present for the first probe. An upload that
-    fails raises :class:`~vmlease.ssh.SshError`, caught by the caller's per-host
-    ``try/finally`` as a transport failure (an error ``HostRun``, still torn
-    down) — distinct from a probe's own non-zero exit.
-    """
-    from vmlease.model import Probe, ProbeTag
-    from vmlease.ssh import OpenSshRunner
-
-    if isinstance(ssh, OpenSshRunner):
-        ssh.wait_until_ready(host)
-
-    for upload in uploads:
-        ssh.upload(host, upload.local, upload.remote)
-
-    detail_probe = Probe(id="_detail", title="host detail", command=HostDetailProbe().command, tag=ProbeTag.READ_ONLY)
-    detail = ssh.run_probe(host, detail_probe).stdout
-
-    results: list[ProbeResult] = [ssh.run_probe(host, probe) for probe in battery.ordered()]
-    return HostRun(host_spec=spec, detail=detail, results=tuple(results))
