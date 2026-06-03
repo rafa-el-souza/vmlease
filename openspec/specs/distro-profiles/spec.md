@@ -1,7 +1,7 @@
 # distro-profiles Specification
 
 ## Purpose
-Per-distro provisioning: a read-only profile registry (image + package/repo prep), stdlib `@@name@@` cloud-init rendering, and the rescue-write path for distros with no native provider image (Arch — resolve-latest → SHA256 → pinned-GPG-signature verify → rescue-write the cloudimg onto a cheap base host).
+Per-distro provisioning: a read-only profile registry (image + package/repo prep), stdlib `@@name@@` cloud-init rendering, and the rescue-write path for distros with no native provider image (write a verified disk image onto a cheap base host's disk). A profile carries an injected `RescueImageSpec` for the rescue-write distros; the image's acquisition + trust gate is owned by the `rescue-image` capability.
 ## Requirements
 ### Requirement: A read-only distro profile registry drives per-distro provisioning
 
@@ -50,30 +50,6 @@ for root access into the rescue system, distinct from the throwaway operator key
 - **WHEN** a rescue-write host is transformed
 - **THEN** root access into the rescue system uses the registered key's private half, while operator
   access into the booted host uses the throwaway key
-
-### Requirement: The rescue image is trust-gated before use
-
-The system SHALL, for the rescue-write path, resolve the latest image, verify its SHA256, and verify its
-signature against a pinned GPG key before writing it, treating that verification as a load-bearing trust
-gate.
-
-#### Scenario: An unverified image is not written
-
-- **WHEN** the resolved image fails SHA256 or pinned-GPG-signature verification
-- **THEN** the system refuses to rescue-write it
-
-#### Scenario: A pinned primary key accepts a subkey-signed image
-
-- **WHEN** the image is signed by the pinned key's signing subkey and the operator has pinned the
-  primary-key fingerprint (gpg's VALIDSIG line carries the subkey fingerprint first and the primary last)
-- **THEN** verification matches the pinned fingerprint in either position and accepts the signature
-  (matching only the subkey position would wrongly reject every real signature)
-
-#### Scenario: The trust gate runs before any host mutation
-
-- **WHEN** image verification fails
-- **THEN** it fails before `enable-rescue` or any destructive provider call, so nothing runs against an
-  untrusted image
 
 ### Requirement: Rescue-readiness and post-write-readiness are distinct
 
