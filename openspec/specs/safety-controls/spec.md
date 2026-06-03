@@ -138,3 +138,22 @@ spaces and no shell-unsafe metacharacters).
 - **WHEN** `plan` is invoked with a problematic upload source or destination
 - **THEN** `plan` raises the upload-validation refusal and makes zero provider calls
 
+### Requirement: Directory upload sources are validated fail-closed
+
+The system SHALL validate a directory upload source fail-closed before transferring it, refusing: a
+source that does not exist; a source that is a symlink or is reached through a symlinked path component
+(the directory is never reached **through** a symlink); a source that is not a directory; or an unreadable
+directory. The source SHALL be inspected without following a symlink. Within-tree symlink safety during
+transfer is handled by the recursive directory push (which does not follow out-of-tree symlinks); this
+requirement governs the **entry-point** directory itself.
+
+#### Scenario: A directory reached through a symlink is refused
+
+- **WHEN** a directory upload source is itself a symlink, or is reached through a symlinked path component
+- **THEN** the push is refused with an error naming the symlink, and nothing is transferred
+
+#### Scenario: A non-directory or unreadable source is refused
+
+- **WHEN** a directory upload source does not exist, is not a directory, or is not readable
+- **THEN** the push is refused with an error describing the problem, and nothing is transferred
+
