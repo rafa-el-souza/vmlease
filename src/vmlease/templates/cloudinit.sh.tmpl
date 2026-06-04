@@ -33,9 +33,7 @@ SUDOERS
 @@operator_pubkey@@
 PUBKEY
 
-  # --- readiness sentinel the harness polls for over SSH ------------------
-  touch /var/lib/vmlease-ready
-  echo "vmlease cloud-init complete for $operator (@@distro_key@@)"
+  @@finalize@@
 }
 
 vmlease_cloudinit_main "$@"

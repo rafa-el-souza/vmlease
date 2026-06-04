@@ -54,3 +54,17 @@ itself; the caller (the CLI) constructs it from a loaded battery and injects it.
   produced host-detail snapshot and per-probe results are identical to those produced before the seam
   existed
 
+### Requirement: Readiness asserts a usable kernel module tree
+
+The system's readiness gate SHALL treat a host as ready only if its running kernel has a usable module tree — a present `/lib/modules/$(uname -r)/modules.dep` — in addition to the existing readiness sentinel. When the running kernel has no usable module tree, the readiness gate SHALL fail fast, before any workload runs, with an error that names the running kernel version and identifies the rescue/modules skew. This assertion is generic across distros and is evaluated on the host's final running kernel (after any provisioning reboot).
+
+#### Scenario: Missing module tree fails readiness fast
+
+- **WHEN** the readiness gate runs against a host whose running kernel has no `/lib/modules/$(uname -r)/modules.dep`
+- **THEN** readiness fails with an error naming the running kernel version and the rescue/modules skew, and no workload is invoked on that host
+
+#### Scenario: Healthy host passes readiness
+
+- **WHEN** the readiness gate runs against a host whose readiness sentinel is present and whose running kernel has a populated `/lib/modules/$(uname -r)/` module tree
+- **THEN** the host is treated as ready and the workload proceeds
+

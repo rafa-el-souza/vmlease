@@ -63,3 +63,17 @@ not merely that some SSH answers) as a different readiness criterion from "the r
 - **THEN** it confirms the responding system is the rescue OS, not any SSH endpoint (the base OS also
   answers SSH and must not false-positive)
 
+### Requirement: A rescue-written host runs a kernel matching its installed modules
+
+The system SHALL ensure that, after a rescue-written host's first-boot system upgrade, the booted host runs a kernel whose `/lib/modules/$(uname -r)/` module tree is populated — even when that upgrade replaced the kernel package and orphaned the running kernel's module tree. Because cloud-init user-data runs once per instance (a reboot does not re-run it), the post-upgrade provisioning remainder SHALL be carried across a reboot by a self-contained mechanism that does NOT rely on cloud-init re-running. The reboot SHALL fire at most once, and only when the first-boot upgrade orphaned the running kernel's module tree.
+
+#### Scenario: Kernel upgraded — reboot and resume
+
+- **WHEN** a rescue-written host's first-boot upgrade replaces the running kernel (the running kernel's `/lib/modules/$(uname -r)/modules.dep` is no longer present)
+- **THEN** the system finishes provisioning across exactly one reboot, so the booted host runs the upgraded kernel with a populated `/lib/modules/$(uname -r)/`, and the readiness sentinel is set only after the post-upgrade remainder (operator account, package install, operator key) has completed
+
+#### Scenario: Kernel unchanged — no reboot
+
+- **WHEN** a rescue-written host's first-boot upgrade leaves the running kernel in place (its `/lib/modules/$(uname -r)/modules.dep` is still present)
+- **THEN** provisioning completes on the first boot without rebooting, and the readiness sentinel is set as before
+

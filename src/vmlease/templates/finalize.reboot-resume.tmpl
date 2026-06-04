@@ -1,0 +1,48 @@
+# --- finalize on a rescue-written host (@@distro_key@@) ------------------
+  # The first-boot system upgrade above may have replaced the running kernel:
+  # pacman deletes /lib/modules/$(uname -r) for the old kernel and installs the
+  # new one's, so the still-running kernel has an empty module tree and every
+  # `modprobe` FATALs. The single tell is the running kernel's modules.dep going
+  # missing. If it did, the host must reboot into the upgraded kernel before it
+  # is declared ready — but cloud-init user-data is per-instance and will NOT
+  # re-run after the reboot, so a self-disabling systemd oneshot carries the
+  # readiness sentinel across the reboot instead.
+  vmlease_reboot_guard=/var/lib/vmlease-kernel-reboot.done
+  if ! test -f "/lib/modules/$(uname -r)/modules.dep" && ! test -f "$vmlease_reboot_guard"; then
+    # Mark first so the reboot fires at most once even if a later boot still
+    # somehow re-enters this path.
+    install -d -m 0755 "$(dirname "$vmlease_reboot_guard")"
+    : > "$vmlease_reboot_guard"
+    # Resume on the next boot: touch the sentinel only once the kernel matches
+    # its modules. Order after systemd-modules-load so the nf_tables/ip_tables
+    # drop-in (written by extra_setup) is applied into the new kernel first. The
+    # unit disables + removes itself so it is a strict one-shot.
+    install -m 0644 /dev/stdin /etc/systemd/system/vmlease-ready.service <<'VMLEASE_READY_UNIT'
+[Unit]
+Description=vmlease readiness sentinel (post kernel-upgrade reboot resume)
+After=systemd-modules-load.service network.target
+ConditionPathExists=!/var/lib/vmlease-ready
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/touch /var/lib/vmlease-ready
+ExecStartPost=/usr/bin/systemctl disable vmlease-ready.service
+ExecStartPost=/bin/rm -f /etc/systemd/system/vmlease-ready.service
+
+[Install]
+WantedBy=multi-user.target
+VMLEASE_READY_UNIT
+    # Reload first: some systemd versions warn+exit non-zero when enabling a
+    # unit the running manager hasn't loaded, which under set -Eeuo pipefail
+    # would abort before the reboot below (guard marker set, box never reboots).
+    systemctl daemon-reload
+    systemctl enable vmlease-ready.service
+    echo "vmlease cloud-init: kernel upgraded out from under running kernel; rebooting to resume (@@distro_key@@)"
+    # Do NOT touch /var/lib/vmlease-ready here — the harness must not connect
+    # until the upgraded kernel is running and its modules are loaded.
+    systemctl reboot
+  else
+    # Kernel unchanged, or we already rebooted: finish in place as every distro.
+    touch /var/lib/vmlease-ready
+    echo "vmlease cloud-init complete for $operator (@@distro_key@@)"
+  fi

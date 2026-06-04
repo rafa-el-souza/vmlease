@@ -730,6 +730,98 @@ class TestCloudInit(unittest.TestCase):
         with self.assertRaises(cloudinit.CloudInitError):
             cloudinit.render_install_block(bad)
 
+    # --- finalize fragment: native-image distros set the sentinel in place -- #
+    def test_native_distro_finalize_is_byte_identical_ending(self) -> None:
+        # The default finalize fragment must reproduce the pre-fragment ending
+        # EXACTLY — non-rescue provisioning is unchanged in render, not just
+        # behavior. Capture the expected final-step text and assert equality.
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        expected_ending = (
+            "  # --- readiness sentinel the harness polls for over SSH ------------------\n"
+            "  touch /var/lib/vmlease-ready\n"
+            '  echo "vmlease cloud-init complete for $operator (ubuntu)"\n'
+            "}\n\n"
+            'vmlease_cloudinit_main "$@"\n'
+        )
+        self.assertTrue(
+            out.endswith(expected_ending),
+            msg=f"native finalize ending drifted; got tail:\n{out[-len(expected_ending):]!r}",
+        )
+        # The native path must NOT carry any reboot-resume machinery.
+        self.assertNotIn("systemctl reboot", out)
+        self.assertNotIn("vmlease-ready.service", out)
+
+    def test_native_finalize_fragment_selected_default(self) -> None:
+        self.assertEqual(distro.get_profile("ubuntu").finalize_fragment, distro.FINALIZE_FRAGMENT_DEFAULT)
+        self.assertEqual(distro.get_profile("fedora").finalize_fragment, distro.FINALIZE_FRAGMENT_DEFAULT)
+
+    # --- finalize fragment: rescue-write distros reboot into the new kernel - #
+    def test_rescue_write_finalize_fragment_selected_reboot_resume(self) -> None:
+        # Selection is profile data keyed on needs_rescue_write — arch is the
+        # only rescue-write distro today.
+        arch = distro.get_profile("arch")
+        self.assertTrue(arch.needs_rescue_write)
+        self.assertEqual(arch.finalize_fragment, distro.FINALIZE_FRAGMENT_RESCUE_WRITE)
+
+    def test_arch_finalize_reboots_and_defers_sentinel(self) -> None:
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        # (a) kernel-bump detection via the running kernel's modules.dep going missing
+        self.assertIn('test -f "/lib/modules/$(uname -r)/modules.dep"', out)
+        # (b) once-only reboot guard marker — written AND the reboot branch is
+        # actually GATED on it (the marker is checked, not merely created), so a
+        # later boot that re-enters this path does not reboot a second time.
+        self.assertIn("/var/lib/vmlease-kernel-reboot.done", out)
+        self.assertIn('! test -f "$vmlease_reboot_guard"', out)
+        # (c) self-disabling systemd oneshot that touches the sentinel next boot
+        self.assertIn("/etc/systemd/system/vmlease-ready.service", out)
+        self.assertIn("Type=oneshot", out)
+        self.assertIn("systemctl disable vmlease-ready.service", out)
+        # daemon-reload precedes enable so a not-yet-loaded unit can't make
+        # `enable` exit non-zero and abort before the reboot under pipefail
+        self.assertIn("systemctl daemon-reload", out)
+        self.assertLess(out.index("systemctl daemon-reload"), out.index("systemctl enable vmlease-ready.service"))
+        self.assertIn("rm -f /etc/systemd/system/vmlease-ready.service", out)
+        # ordered after modules are loaded so the nf_tables/ip_tables drop-in lands
+        self.assertIn("After=systemd-modules-load.service", out)
+        # (d) the actual reboot
+        self.assertIn("systemctl reboot", out)
+        # (e) the no-bump / post-reboot branch still touches the sentinel as today
+        self.assertIn("touch /var/lib/vmlease-ready", out)
+
+    def test_arch_does_not_touch_sentinel_before_reboot(self) -> None:
+        # On the bumped-kernel path the sentinel must NOT be touched before the
+        # reboot — the harness must not connect until the upgraded kernel runs.
+        # Assert the reboot precedes the (sole) post-reboot touch in the rendered
+        # script's bumped-kernel branch.
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        reboot_at = out.index("systemctl reboot")
+        # The finalizing sentinel is the bare, indented `touch` command in the
+        # else-branch — distinct from the oneshot unit's `ExecStart=/usr/bin/touch`
+        # (which legitimately precedes the reboot, as the unit must be written
+        # before rebooting). The bare command must come AFTER the reboot.
+        bare_touch_at = out.index("    touch /var/lib/vmlease-ready")
+        self.assertLess(reboot_at, bare_touch_at, "sentinel touched before reboot on the bumped-kernel path")
+
+    def test_finalize_render_seam_strict_for_all_default_distros(self) -> None:
+        # Smoke: the strict render seam holds for arch (reboot-resume) and a
+        # native distro — no unfilled or extra slots.
+        for key in ("ubuntu", "arch"):
+            with self.subTest(distro=key):
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA")
+                self.assertNotIn("@@", out)
+
+    def test_unknown_finalize_fragment_raises(self) -> None:
+        # A profile whose finalize_fragment names a nonexistent template fails
+        # loud at the render seam (mirrors the unknown-install-manager guard).
+        class _BadFinalizeProfile(distro.DistroProfile):
+            @property
+            def finalize_fragment(self) -> str:
+                return "does-not-exist"
+
+        bad = _BadFinalizeProfile(key="x", default_image="img", package_manager="apt", packages=("p",))
+        with self.assertRaises(cloudinit.CloudInitError):
+            cloudinit.render_finalize_block(bad)
+
 
 # --------------------------------------------------------------------------- #
 # keypair — generate via injected runner; cleanup
@@ -822,24 +914,88 @@ class TestSsh(unittest.TestCase):
             r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
 
     def test_wait_until_ready_polls_then_succeeds(self) -> None:
-        # fail twice then succeed; sleeper is a no-op recorder
-        seq = [1, 1, 0]
+        # fail twice, then the sentinel lands, then the module-tree probe passes
+        # (the 4th call): 3 sentinel polls + the in-loop module-tree assertion.
+        seq = [1, 1, 0, 0]
         calls = {"n": 0}
 
         def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
             rc = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
-            return subprocess.CompletedProcess(argv, rc, "", "")
+            return subprocess.CompletedProcess(argv, rc, "6.9.0-arch1\n", "")
 
         slept: list[float] = []
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=slept.append)
         r.wait_until_ready(self._host(), attempts=5)
-        self.assertEqual(calls["n"], 3)
+        self.assertEqual(calls["n"], 4)  # 3 sentinel polls + 1 module-tree assertion
 
     def test_wait_until_ready_times_out(self) -> None:
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1), sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.wait_until_ready(self._host(), attempts=2)
+
+    def test_wait_until_ready_default_budget_spans_a_reboot(self) -> None:
+        # the default attempt budget must comfortably span a Hetzner reboot
+        # (≈4 min): reboot-resume only touches the sentinel post-reboot. At
+        # ≤2s/attempt the budget must clear ~240s.
+        import inspect
+
+        default = inspect.signature(ssh.OpenSshRunner.wait_until_ready).parameters["attempts"].default
+        self.assertGreaterEqual(default, 120)
+        self.assertGreaterEqual(default * 2.0, 240.0)  # 2s backoff cap x budget >= 4 min
+
+    def test_wait_until_ready_rejects_missing_module_tree(self) -> None:
+        # sentinel present (exit 0), but the module-tree assertion exits non-zero
+        # with the running kernel on stdout: readiness must fail with the skew.
+        seen_commands: list[str] = []
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            command = argv[-1]
+            seen_commands.append(command)
+            if command == "test -f /var/lib/vmlease-ready":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            # the module-tree probe: stdout carries the version, exit != 0 = skew
+            return subprocess.CompletedProcess(argv, 1, "6.9.0-arch1\n", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        with self.assertRaises(ssh.SshError) as ctx:
+            r.wait_until_ready(self._host())
+        msg = str(ctx.exception)
+        self.assertIn("6.9.0-arch1", msg)  # names the running kernel version
+        self.assertIn("rescue/modules skew", msg)  # identifies the skew
+        # the module-tree assertion actually ran (not just the sentinel)
+        self.assertTrue(any("modules.dep" in c for c in seen_commands))
+
+    def test_wait_until_ready_healthy_host_passes(self) -> None:
+        # sentinel present AND module-tree probe exits 0 → ready, returns normally.
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 0, "6.9.0-arch1\n", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        r.wait_until_ready(self._host())  # no raise == ready
+
+    def test_wait_until_ready_retries_module_probe_transport_blip(self) -> None:
+        # Right after the post-reboot oneshot touches the sentinel the host is
+        # fresh from a reboot: the module probe can hit a transient SSH transport
+        # failure (exit 255, EMPTY stdout — the remote command never ran). That
+        # must NOT be misread as a skew; the loop retries and succeeds once a
+        # later module probe returns exit 0 with a version.
+        seq: list[tuple[int, str]] = [
+            (0, ""),  # sentinel present
+            (255, ""),  # module probe: transport blip, empty stdout → retry
+            (0, ""),  # sentinel present
+            (0, "6.9.0-arch1\n"),  # module probe: real success → ready
+        ]
+        calls = {"n": 0}
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            rc, out = seq[min(calls["n"], len(seq) - 1)]
+            calls["n"] += 1
+            return subprocess.CompletedProcess(argv, rc, out, "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        r.wait_until_ready(self._host(), attempts=5)  # no raise == retried past the blip
+        self.assertEqual(calls["n"], 4)  # blip retried, did not raise skew
 
     def test_ssh_runner_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeSshRunner(), ssh.SshRunner)
