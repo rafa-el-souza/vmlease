@@ -273,12 +273,18 @@ class OpenSshRunner:
             )
 
     def wait_until_ready(self, host: Host, *, attempts: int = 120) -> None:
-        """Poll until the cloud-init readiness sentinel exists, then assert a
-        usable kernel module tree, or raise :class:`SshError`.
+        """Poll until the cloud-init readiness sentinel exists AND the running
+        kernel has a usable module tree, or raise :class:`SshError`.
 
-        Runs a cheap ``test -f /var/lib/vmlease-ready`` over SSH in a bounded
-        loop. Raises :class:`SshError` if the host never becomes ready — the
-        transport-failure signal (distinct from a probe's non-zero exit).
+        Each attempt runs a cheap ``test -f /var/lib/vmlease-ready`` over SSH;
+        once the sentinel lands, the SAME loop runs the module-tree probe. The
+        module check lives INSIDE the readiness loop on purpose: the sentinel is
+        touched by the post-reboot oneshot, so the very next probe hits a host
+        fresh from a reboot whose sshd may still be flapping — a transient SSH
+        transport failure (``ssh`` exits 255, ``run_probe`` returns exit 255
+        WITHOUT raising) must retry within the attempt budget, NOT be misread as
+        a permanent rescue/modules skew. Only a GENUINE skew (the remote ``test``
+        actually ran and failed) raises immediately.
 
         ``attempts`` defaults wide (120 x <=2s ~= 4 min) because reboot-resume
         provisioning (arch rescue/modules fix) only touches the sentinel in the
@@ -286,44 +292,36 @@ class OpenSshRunner:
         full Hetzner reboot, not just first-boot cloud-init. Same backoff shape;
         only the budget widened.
 
-        Once the sentinel lands, asserts the FINAL running kernel has a usable
-        module tree (``/lib/modules/$(uname -r)/modules.dep`` present). This is
-        the generic backstop for the rescue/modules skew: if a kernel upgrade
-        orphaned the running kernel's modules and the reboot/resume failed to
-        land a consistent kernel, the host fails loud HERE, before any workload.
+        The module-tree check is the generic backstop for the rescue/modules
+        skew: if a kernel upgrade orphaned the running kernel's modules and the
+        reboot/resume failed to land a consistent kernel, the host fails loud
+        HERE (with the running kernel version named), before any workload.
         """
         from vmlease.model import Probe as _Probe
         from vmlease.model import ProbeTag as _Tag
 
         check = _Probe(id="_ready", title="readiness", command="test -f /var/lib/vmlease-ready", tag=_Tag.READ_ONLY)
-        for attempt in range(attempts):
-            if self.run_probe(host, check).exit_code == 0:
-                self._assert_module_tree(host)
-                return
-            self._sleep(min(2.0, 1.0 + attempt * 0.1))
-        raise SshError(f"host {host.name} ({host.ipv4}) not ready after {attempts} attempts")
-
-    def _assert_module_tree(self, host: Host) -> None:
-        """Fail-fast if the running kernel has no loadable module tree.
-
-        One read-only probe prints the running kernel version then tests for its
-        ``modules.dep`` — so stdout carries the version even when the assertion
-        (the exit code) fails. ``modules.dep`` is the single tell that "this
-        kernel can load modules"; its absence is the rescue/modules skew.
-        """
-        from vmlease.model import Probe as _Probe
-        from vmlease.model import ProbeTag as _Tag
-
-        probe = _Probe(
+        modules = _Probe(
             id="_module_tree",
             title="module-tree assertion",
             command='uname -r; test -f "/lib/modules/$(uname -r)/modules.dep"',
             tag=_Tag.READ_ONLY,
         )
-        result = self.run_probe(host, probe)
-        if result.exit_code != 0:
-            kernel = result.stdout.splitlines()[0].strip() if result.stdout.strip() else "unknown"
-            raise SshError(f"host kernel {kernel} has no /lib/modules tree (rescue/modules skew)")
+        for attempt in range(attempts):
+            if self.run_probe(host, check).exit_code == 0:
+                result = self.run_probe(host, modules)
+                if result.exit_code == 0:
+                    return  # sentinel + usable module tree → ready
+                if result.stdout.strip():
+                    # ``uname -r`` printed a version → the remote command ran and
+                    # the trailing ``test`` is what failed: a genuine skew that
+                    # will NOT self-heal. Fail loud with the running kernel.
+                    kernel = result.stdout.splitlines()[0].strip()
+                    raise SshError(f"host kernel {kernel} has no /lib/modules tree (rescue/modules skew)")
+                # empty stdout → the probe never ran on the remote (transport
+                # blip / host mid-reboot). Treat as not-ready-yet and retry.
+            self._sleep(min(2.0, 1.0 + attempt * 0.1))
+        raise SshError(f"host {host.name} ({host.ipv4}) not ready after {attempts} attempts")
 
 
 def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:

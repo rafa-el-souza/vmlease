@@ -767,12 +767,19 @@ class TestCloudInit(unittest.TestCase):
         out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
         # (a) kernel-bump detection via the running kernel's modules.dep going missing
         self.assertIn('test -f "/lib/modules/$(uname -r)/modules.dep"', out)
-        # (b) once-only reboot guard marker
+        # (b) once-only reboot guard marker — written AND the reboot branch is
+        # actually GATED on it (the marker is checked, not merely created), so a
+        # later boot that re-enters this path does not reboot a second time.
         self.assertIn("/var/lib/vmlease-kernel-reboot.done", out)
+        self.assertIn('! test -f "$vmlease_reboot_guard"', out)
         # (c) self-disabling systemd oneshot that touches the sentinel next boot
         self.assertIn("/etc/systemd/system/vmlease-ready.service", out)
         self.assertIn("Type=oneshot", out)
         self.assertIn("systemctl disable vmlease-ready.service", out)
+        # daemon-reload precedes enable so a not-yet-loaded unit can't make
+        # `enable` exit non-zero and abort before the reboot under pipefail
+        self.assertIn("systemctl daemon-reload", out)
+        self.assertLess(out.index("systemctl daemon-reload"), out.index("systemctl enable vmlease-ready.service"))
         self.assertIn("rm -f /etc/systemd/system/vmlease-ready.service", out)
         # ordered after modules are loaded so the nf_tables/ip_tables drop-in lands
         self.assertIn("After=systemd-modules-load.service", out)
@@ -908,7 +915,7 @@ class TestSsh(unittest.TestCase):
 
     def test_wait_until_ready_polls_then_succeeds(self) -> None:
         # fail twice, then the sentinel lands, then the module-tree probe passes
-        # (the 4th call): the sentinel poll + the trailing module-tree assertion.
+        # (the 4th call): 3 sentinel polls + the in-loop module-tree assertion.
         seq = [1, 1, 0, 0]
         calls = {"n": 0}
 
@@ -966,6 +973,29 @@ class TestSsh(unittest.TestCase):
 
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
         r.wait_until_ready(self._host())  # no raise == ready
+
+    def test_wait_until_ready_retries_module_probe_transport_blip(self) -> None:
+        # Right after the post-reboot oneshot touches the sentinel the host is
+        # fresh from a reboot: the module probe can hit a transient SSH transport
+        # failure (exit 255, EMPTY stdout — the remote command never ran). That
+        # must NOT be misread as a skew; the loop retries and succeeds once a
+        # later module probe returns exit 0 with a version.
+        seq: list[tuple[int, str]] = [
+            (0, ""),  # sentinel present
+            (255, ""),  # module probe: transport blip, empty stdout → retry
+            (0, ""),  # sentinel present
+            (0, "6.9.0-arch1\n"),  # module probe: real success → ready
+        ]
+        calls = {"n": 0}
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            rc, out = seq[min(calls["n"], len(seq) - 1)]
+            calls["n"] += 1
+            return subprocess.CompletedProcess(argv, rc, out, "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        r.wait_until_ready(self._host(), attempts=5)  # no raise == retried past the blip
+        self.assertEqual(calls["n"], 4)  # blip retried, did not raise skew
 
     def test_ssh_runner_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeSshRunner(), ssh.SshRunner)

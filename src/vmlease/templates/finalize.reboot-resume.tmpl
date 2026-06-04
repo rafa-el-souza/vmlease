@@ -32,6 +32,10 @@ ExecStartPost=/bin/rm -f /etc/systemd/system/vmlease-ready.service
 [Install]
 WantedBy=multi-user.target
 VMLEASE_READY_UNIT
+    # Reload first: some systemd versions warn+exit non-zero when enabling a
+    # unit the running manager hasn't loaded, which under set -Eeuo pipefail
+    # would abort before the reboot below (guard marker set, box never reboots).
+    systemctl daemon-reload
     systemctl enable vmlease-ready.service
     echo "vmlease cloud-init: kernel upgraded out from under running kernel; rebooting to resume (@@distro_key@@)"
     # Do NOT touch /var/lib/vmlease-ready here — the harness must not connect
