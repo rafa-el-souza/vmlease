@@ -730,6 +730,91 @@ class TestCloudInit(unittest.TestCase):
         with self.assertRaises(cloudinit.CloudInitError):
             cloudinit.render_install_block(bad)
 
+    # --- finalize fragment: native-image distros set the sentinel in place -- #
+    def test_native_distro_finalize_is_byte_identical_ending(self) -> None:
+        # The default finalize fragment must reproduce the pre-fragment ending
+        # EXACTLY — non-rescue provisioning is unchanged in render, not just
+        # behavior. Capture the expected final-step text and assert equality.
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        expected_ending = (
+            "  # --- readiness sentinel the harness polls for over SSH ------------------\n"
+            "  touch /var/lib/vmlease-ready\n"
+            '  echo "vmlease cloud-init complete for $operator (ubuntu)"\n'
+            "}\n\n"
+            'vmlease_cloudinit_main "$@"\n'
+        )
+        self.assertTrue(
+            out.endswith(expected_ending),
+            msg=f"native finalize ending drifted; got tail:\n{out[-len(expected_ending):]!r}",
+        )
+        # The native path must NOT carry any reboot-resume machinery.
+        self.assertNotIn("systemctl reboot", out)
+        self.assertNotIn("vmlease-ready.service", out)
+
+    def test_native_finalize_fragment_selected_default(self) -> None:
+        self.assertEqual(distro.get_profile("ubuntu").finalize_fragment, distro.FINALIZE_FRAGMENT_DEFAULT)
+        self.assertEqual(distro.get_profile("fedora").finalize_fragment, distro.FINALIZE_FRAGMENT_DEFAULT)
+
+    # --- finalize fragment: rescue-write distros reboot into the new kernel - #
+    def test_rescue_write_finalize_fragment_selected_reboot_resume(self) -> None:
+        # Selection is profile data keyed on needs_rescue_write — arch is the
+        # only rescue-write distro today.
+        arch = distro.get_profile("arch")
+        self.assertTrue(arch.needs_rescue_write)
+        self.assertEqual(arch.finalize_fragment, distro.FINALIZE_FRAGMENT_RESCUE_WRITE)
+
+    def test_arch_finalize_reboots_and_defers_sentinel(self) -> None:
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        # (a) kernel-bump detection via the running kernel's modules.dep going missing
+        self.assertIn('test -f "/lib/modules/$(uname -r)/modules.dep"', out)
+        # (b) once-only reboot guard marker
+        self.assertIn("/var/lib/vmlease-kernel-reboot.done", out)
+        # (c) self-disabling systemd oneshot that touches the sentinel next boot
+        self.assertIn("/etc/systemd/system/vmlease-ready.service", out)
+        self.assertIn("Type=oneshot", out)
+        self.assertIn("systemctl disable vmlease-ready.service", out)
+        self.assertIn("rm -f /etc/systemd/system/vmlease-ready.service", out)
+        # ordered after modules are loaded so the nf_tables/ip_tables drop-in lands
+        self.assertIn("After=systemd-modules-load.service", out)
+        # (d) the actual reboot
+        self.assertIn("systemctl reboot", out)
+        # (e) the no-bump / post-reboot branch still touches the sentinel as today
+        self.assertIn("touch /var/lib/vmlease-ready", out)
+
+    def test_arch_does_not_touch_sentinel_before_reboot(self) -> None:
+        # On the bumped-kernel path the sentinel must NOT be touched before the
+        # reboot — the harness must not connect until the upgraded kernel runs.
+        # Assert the reboot precedes the (sole) post-reboot touch in the rendered
+        # script's bumped-kernel branch.
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        reboot_at = out.index("systemctl reboot")
+        # The finalizing sentinel is the bare, indented `touch` command in the
+        # else-branch — distinct from the oneshot unit's `ExecStart=/usr/bin/touch`
+        # (which legitimately precedes the reboot, as the unit must be written
+        # before rebooting). The bare command must come AFTER the reboot.
+        bare_touch_at = out.index("    touch /var/lib/vmlease-ready")
+        self.assertLess(reboot_at, bare_touch_at, "sentinel touched before reboot on the bumped-kernel path")
+
+    def test_finalize_render_seam_strict_for_all_default_distros(self) -> None:
+        # Smoke: the strict render seam holds for arch (reboot-resume) and a
+        # native distro — no unfilled or extra slots.
+        for key in ("ubuntu", "arch"):
+            with self.subTest(distro=key):
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA")
+                self.assertNotIn("@@", out)
+
+    def test_unknown_finalize_fragment_raises(self) -> None:
+        # A profile whose finalize_fragment names a nonexistent template fails
+        # loud at the render seam (mirrors the unknown-install-manager guard).
+        class _BadFinalizeProfile(distro.DistroProfile):
+            @property
+            def finalize_fragment(self) -> str:
+                return "does-not-exist"
+
+        bad = _BadFinalizeProfile(key="x", default_image="img", package_manager="apt", packages=("p",))
+        with self.assertRaises(cloudinit.CloudInitError):
+            cloudinit.render_finalize_block(bad)
+
 
 # --------------------------------------------------------------------------- #
 # keypair — generate via injected runner; cleanup

@@ -19,6 +19,11 @@ from types import MappingProxyType
 from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
 from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
 
+# Finalize-fragment slugs (the ``finalize.<slug>.tmpl`` family — the readiness
+# sentinel step, selected per profile by :attr:`DistroProfile.finalize_fragment`).
+FINALIZE_FRAGMENT_DEFAULT = "default"
+FINALIZE_FRAGMENT_RESCUE_WRITE = "reboot-resume"
+
 
 @dataclass(frozen=True)
 class DistroProfile:
@@ -71,6 +76,26 @@ class DistroProfile:
     def needs_rescue_write(self) -> bool:
         """``True`` iff this distro is provisioned via a rescue-write transform."""
         return self.rescue_image is not None
+
+    @property
+    def finalize_fragment(self) -> str:
+        """The cloud-init finalize fragment slug for this distro.
+
+        The readiness sentinel is set by a profile-selected fragment (mirroring
+        ``install.<mgr>.tmpl``), keyed on whether the distro is rescue-written:
+
+        - native-image distros (the common case) → ``"default"``: set the
+          sentinel in place, byte-identical to the pre-fragment ending;
+        - rescue-write distros → ``"reboot-resume"``: the first-boot upgrade can
+          replace the running kernel and orphan its ``/lib/modules`` tree, so the
+          fragment reboots into the upgraded kernel (once) and defers the
+          sentinel to a self-disabling oneshot on the next boot.
+
+        Selection is profile data keyed on ``needs_rescue_write`` — NOT an
+        ``if key == "arch"`` in the renderer, and NOT a branch inside a template
+        (templating stays logic-free).
+        """
+        return FINALIZE_FRAGMENT_RESCUE_WRITE if self.needs_rescue_write else FINALIZE_FRAGMENT_DEFAULT
 
 
 # Package sets validated on real hosts — the rootless-docker prerequisites a probe

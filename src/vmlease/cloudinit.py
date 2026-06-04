@@ -75,6 +75,35 @@ def render_install_block(profile: DistroProfile) -> str:
     return _render_subset(template_text, candidates)
 
 
+def render_finalize_block(profile: DistroProfile) -> str:
+    """Render the readiness-sentinel finalize fragment for ``profile``.
+
+    Mirrors :func:`render_install_block`: the fragment file is chosen by the
+    profile (``finalize.<slug>.tmpl``, slug from
+    :attr:`~vmlease.distro.DistroProfile.finalize_fragment`), and only the slots
+    it references are filled — native-image distros render the default
+    (set-sentinel-in-place) fragment; rescue-write distros render the
+    reboot-resume fragment. The selection is profile data, never a renderer
+    ``if key == ...``.
+    """
+    template_name = f"finalize.{profile.finalize_fragment}.tmpl"
+    try:
+        template_text = _read_template(template_name)
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        raise CloudInitError(
+            f"no finalize template {template_name!r} for finalize fragment "
+            f"{profile.finalize_fragment!r} (distro {profile.key!r})"
+        ) from exc
+    candidates = {"distro_key": profile.key}
+    missing = find_slots(template_text) - set(candidates)
+    if missing:
+        raise CloudInitError(
+            f"finalize template {template_name!r} references slot(s) {sorted(missing)} "
+            f"with no profile data"
+        )
+    return _render_subset(template_text, candidates)
+
+
 def render_cloudinit(profile: DistroProfile, operator: str, operator_pubkey: str) -> str:
     """Render the full cloud-init script for ``profile``.
 
@@ -82,11 +111,13 @@ def render_cloudinit(profile: DistroProfile, operator: str, operator_pubkey: str
     is the throwaway probe public key authorized for it.
     """
     install_block = render_install_block(profile)
+    finalize = render_finalize_block(profile)
     base = _read_template(_BASE_TEMPLATE)
     candidates = {
         "operator": operator,
         "operator_pubkey": operator_pubkey.strip(),
         "install_block": install_block,
+        "finalize": finalize,
         "system_update": system_update_command(profile),
         "distro_key": profile.key,
         "package_manager": profile.package_manager,
