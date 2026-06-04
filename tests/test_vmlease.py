@@ -822,24 +822,65 @@ class TestSsh(unittest.TestCase):
             r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
 
     def test_wait_until_ready_polls_then_succeeds(self) -> None:
-        # fail twice then succeed; sleeper is a no-op recorder
-        seq = [1, 1, 0]
+        # fail twice, then the sentinel lands, then the module-tree probe passes
+        # (the 4th call): the sentinel poll + the trailing module-tree assertion.
+        seq = [1, 1, 0, 0]
         calls = {"n": 0}
 
         def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
             rc = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
-            return subprocess.CompletedProcess(argv, rc, "", "")
+            return subprocess.CompletedProcess(argv, rc, "6.9.0-arch1\n", "")
 
         slept: list[float] = []
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=slept.append)
         r.wait_until_ready(self._host(), attempts=5)
-        self.assertEqual(calls["n"], 3)
+        self.assertEqual(calls["n"], 4)  # 3 sentinel polls + 1 module-tree assertion
 
     def test_wait_until_ready_times_out(self) -> None:
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1), sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.wait_until_ready(self._host(), attempts=2)
+
+    def test_wait_until_ready_default_budget_spans_a_reboot(self) -> None:
+        # the default attempt budget must comfortably span a Hetzner reboot
+        # (≈4 min): reboot-resume only touches the sentinel post-reboot. At
+        # ≤2s/attempt the budget must clear ~240s.
+        import inspect
+
+        default = inspect.signature(ssh.OpenSshRunner.wait_until_ready).parameters["attempts"].default
+        self.assertGreaterEqual(default, 120)
+        self.assertGreaterEqual(default * 2.0, 240.0)  # 2s backoff cap x budget >= 4 min
+
+    def test_wait_until_ready_rejects_missing_module_tree(self) -> None:
+        # sentinel present (exit 0), but the module-tree assertion exits non-zero
+        # with the running kernel on stdout: readiness must fail with the skew.
+        seen_commands: list[str] = []
+
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            command = argv[-1]
+            seen_commands.append(command)
+            if command == "test -f /var/lib/vmlease-ready":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            # the module-tree probe: stdout carries the version, exit != 0 = skew
+            return subprocess.CompletedProcess(argv, 1, "6.9.0-arch1\n", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        with self.assertRaises(ssh.SshError) as ctx:
+            r.wait_until_ready(self._host())
+        msg = str(ctx.exception)
+        self.assertIn("6.9.0-arch1", msg)  # names the running kernel version
+        self.assertIn("rescue/modules skew", msg)  # identifies the skew
+        # the module-tree assertion actually ran (not just the sentinel)
+        self.assertTrue(any("modules.dep" in c for c in seen_commands))
+
+    def test_wait_until_ready_healthy_host_passes(self) -> None:
+        # sentinel present AND module-tree probe exits 0 → ready, returns normally.
+        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 0, "6.9.0-arch1\n", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
+        r.wait_until_ready(self._host())  # no raise == ready
 
     def test_ssh_runner_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeSshRunner(), ssh.SshRunner)
