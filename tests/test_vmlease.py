@@ -2048,6 +2048,66 @@ class TestCliRun(unittest.TestCase):
             # the run label was reaped even though the interrupt propagated.
             self.assertEqual(prov.list_labeled(safety.make_run_id("cli-run")), [])
 
+    def test_run_teardown_failure_and_backstop_reap_also_fails(self) -> None:
+        # teardown fails (host stays live) AND the backstop reap ALSO raises
+        # ProviderError: _cmd_run must still return non-zero (no traceback) and
+        # print the actionable `vmlease reap --run-token` manual-cleanup hint.
+        from unittest import mock
+
+        class _DestroyAlwaysFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                # In-run teardown fails (host stays live), and the backstop
+                # reap's destroy fails too — the host can't be reaped.
+                raise providers.ProviderError("request timeout")
+
+        prov = _DestroyAlwaysFails()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 redirect_stderr(buf):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 1)  # non-zero, NOT a traceback
+            self.assertIn("backstop reap ALSO failed", buf.getvalue())
+            self.assertIn("vmlease reap --run-token cli-run", buf.getvalue())
+
+    def test_run_abort_and_backstop_reap_also_fails_reraises_interrupt(self) -> None:
+        # an operator interrupt mid-run AND the backstop reap ALSO raises
+        # ProviderError: the ORIGINAL KeyboardInterrupt (not ProviderError) must
+        # propagate, and the actionable manual-reap hint must be printed.
+        from unittest import mock
+
+        class _Interrupting(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+        class _ReapFails(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("request timeout")
+
+        prov = _ReapFails()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _Interrupting()), \
+                 redirect_stderr(buf), \
+                 self.assertRaises(KeyboardInterrupt):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertIn("backstop reap ALSO failed", buf.getvalue())
+            self.assertIn("vmlease reap --run-token cli-run", buf.getvalue())
+
     def test_reap_lists_destroyed(self) -> None:
         from unittest import mock
 

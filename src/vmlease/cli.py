@@ -184,9 +184,19 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         # Aborted mid-run: the per-host hosts that finished are already on disk
         # (writer.add ran for each). Reap the run label so no billable host is
         # left orphaned, note where the partial results are, then RE-RAISE so the
-        # process still exits on the interrupt.
-        reaped = reap(provider, run_id)
-        print(f"aborted — reaped {len(reaped)} host(s) labelled vmlease={run_id}", file=sys.stderr)
+        # process still exits on the interrupt. The backstop reap is itself a
+        # provider call that MAY fail; if it does, surface an actionable manual
+        # reap hint but never let the ProviderError mask the original interrupt.
+        try:
+            reaped = reap(provider, run_id)
+            print(f"aborted — reaped {len(reaped)} host(s) labelled vmlease={run_id}", file=sys.stderr)
+        except ProviderError as exc:
+            print(
+                f"aborted — backstop reap ALSO failed ({exc}); host(s) labelled "
+                f"vmlease={run_id} may still be LIVE — run "
+                f"`vmlease reap --run-token {args.run_token}` to clean up",
+                file=sys.stderr,
+            )
         print(f"partial results: {writer.path}", file=sys.stderr)
         raise
     except (ProviderError, CostGuardError, ArchBuildError) as exc:
@@ -197,13 +207,24 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     if teardown_failures:
         # A teardown failed: a billable host may still be live. Reap the run label
         # as a backstop and surface the failure prominently — non-zero exit so a
-        # caller (CI) cannot mistake a leaked host for a clean run.
-        reaped = reap(provider, run_id)
-        print(
-            f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
-            f"reaped {len(reaped)} host(s) labelled vmlease={run_id}",
-            file=sys.stderr,
-        )
+        # caller (CI) cannot mistake a leaked host for a clean run. The backstop
+        # reap is itself a provider call that MAY fail; if it does, surface an
+        # actionable manual reap hint — but still exit non-zero (never a traceback).
+        try:
+            reaped = reap(provider, run_id)
+            print(
+                f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
+                f"reaped {len(reaped)} host(s) labelled vmlease={run_id}",
+                file=sys.stderr,
+            )
+        except ProviderError as exc:
+            print(
+                f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
+                f"backstop reap ALSO failed ({exc}); host(s) labelled "
+                f"vmlease={run_id} may still be LIVE — run "
+                f"`vmlease reap --run-token {args.run_token}` to clean up",
+                file=sys.stderr,
+            )
         for hr in teardown_failures:
             print(f"  - {hr.host_spec.name}: {hr.detail}", file=sys.stderr)
         print(f"results: {writer.path}", file=sys.stderr)
