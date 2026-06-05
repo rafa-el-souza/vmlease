@@ -1942,6 +1942,112 @@ class TestCliRun(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue((rdir / "vmlease-cli-run-20260601T000000Z.json").exists())
 
+    def test_run_probe_timeout_reaches_ssh_runner(self) -> None:
+        # --probe-timeout (run-only) must be threaded into OpenSshRunner via the
+        # factory as probe_timeout_default; capture the kwarg the factory passes.
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        def _capture(*_a: object, **k: object) -> FakeSshRunner:
+            captured.update(k)
+            return FakeSshRunner()
+
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", _capture):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes", "--probe-timeout", "42.5",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured.get("probe_timeout_default"), 42.5)
+
+    def test_run_writes_results_incrementally_per_host(self) -> None:
+        # the per-host sink rewrites the results file as each host lands; after a
+        # clean run the deterministic path holds every host and rc is 0.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu,debian",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            written = json.loads((rdir / "vmlease-cli-run-20260601T000000Z.json").read_text())
+            self.assertEqual(len(written["hosts"]), 2)
+
+    def test_run_teardown_failure_returns_nonzero_and_reaps(self) -> None:
+        # a destroy that raises (host stays live) → HostRun.detail carries the
+        # teardown warning → _cmd_run reaps the run label and returns non-zero.
+        from unittest import mock
+
+        class _DestroyFailsOnce(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.destroy_calls = 0
+
+            def destroy(self, host: Host) -> None:
+                # First teardown (in-run) fails, leaving the host live; the reap
+                # backstop's destroy then succeeds (a transient provider blip).
+                self.destroy_calls += 1
+                if self.destroy_calls == 1:
+                    raise providers.ProviderError("request timeout")
+                super().destroy(host)
+
+        prov = _DestroyFailsOnce()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 redirect_stderr(buf):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 1)
+            self.assertIn("teardown failed", buf.getvalue())
+            # reap was attempted: list_labeled then destroy on the still-live host.
+            self.assertTrue(prov.list_labeled(safety.make_run_id("cli-run")) == [])
+
+    def test_run_abort_reaps_and_reraises(self) -> None:
+        # an operator interrupt mid-run: the host that finished is on disk, the
+        # run label is reaped, and the KeyboardInterrupt keeps propagating.
+        from unittest import mock
+
+        class _Interrupting(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _Interrupting()), \
+                 redirect_stderr(buf), \
+                 self.assertRaises(KeyboardInterrupt):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertIn("aborted", buf.getvalue())
+            # the run label was reaped even though the interrupt propagated.
+            self.assertEqual(prov.list_labeled(safety.make_run_id("cli-run")), [])
+
     def test_reap_lists_destroyed(self) -> None:
         from unittest import mock
 

@@ -31,10 +31,10 @@ from vmlease.archbuild import (
 from vmlease.battery import BatteryError, lint_battery, load_battery
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
-from vmlease.model import Battery, UploadSpec
+from vmlease.model import Battery, HostRun, UploadSpec
 from vmlease.providers import HetznerProvider, ProviderError
-from vmlease.results import write_results
-from vmlease.runner import Matrix, RescueWriter, execute, plan
+from vmlease.results import IncrementalResultsWriter
+from vmlease.runner import TEARDOWN_WARNING_PREFIX, Matrix, RescueWriter, execute, plan
 from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, UploadError, make_run_id, reap
 from vmlease.ssh import OpenSshRunner
 from vmlease.workload import ProbeWorkload, Workload
@@ -149,7 +149,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     provider = HetznerProvider()
 
     def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
-        return OpenSshRunner(operator, keypair.private_key_path)
+        return OpenSshRunner(operator, keypair.private_key_path, probe_timeout_default=args.probe_timeout)
 
     # A rescue-writer is only built when the matrix contains a needs_rescue_write
     # distro (e.g. arch); it transforms the base host into the target distro
@@ -168,17 +168,48 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             return 2
         rescue_writer = _build_rescue_writer(keypair, args.ssh_key, args.ssh_key_path)
 
+    writer = IncrementalResultsWriter(Path(args.results_dir), run_id, args.timestamp)
+
+    def _persist(host_run: HostRun) -> None:
+        # Adapt the writer's path-returning add() to the None-returning sink hook.
+        writer.add(host_run)
+
     try:
         host_runs = execute(
             matrix, provider, _ssh_factory, keypair, args.operator,
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
-            max_parallel=args.parallel,
+            max_parallel=args.parallel, on_host_complete=_persist,
         )
+    except (KeyboardInterrupt, SystemExit):
+        # Aborted mid-run: the per-host hosts that finished are already on disk
+        # (writer.add ran for each). Reap the run label so no billable host is
+        # left orphaned, note where the partial results are, then RE-RAISE so the
+        # process still exits on the interrupt.
+        reaped = reap(provider, run_id)
+        print(f"aborted — reaped {len(reaped)} host(s) labelled vmlease={run_id}", file=sys.stderr)
+        print(f"partial results: {writer.path}", file=sys.stderr)
+        raise
     except (ProviderError, CostGuardError, ArchBuildError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    path = write_results(Path(args.results_dir), run_id, args.timestamp, host_runs)
-    print(f"results: {path}")
+
+    teardown_failures = [hr for hr in host_runs if TEARDOWN_WARNING_PREFIX in hr.detail]
+    if teardown_failures:
+        # A teardown failed: a billable host may still be live. Reap the run label
+        # as a backstop and surface the failure prominently — non-zero exit so a
+        # caller (CI) cannot mistake a leaked host for a clean run.
+        reaped = reap(provider, run_id)
+        print(
+            f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
+            f"reaped {len(reaped)} host(s) labelled vmlease={run_id}",
+            file=sys.stderr,
+        )
+        for hr in teardown_failures:
+            print(f"  - {hr.host_spec.name}: {hr.detail}", file=sys.stderr)
+        print(f"results: {writer.path}", file=sys.stderr)
+        return 1
+
+    print(f"results: {writer.path}")
     return 0
 
 
@@ -247,6 +278,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "--parallel", type=int, default=1,
         help="run up to N hosts concurrently (default 1 = serial); same cost, ~Nx faster wall-clock",
+    )
+    run_p.add_argument(
+        "--probe-timeout", type=float, default=600.0,
+        help="default per-probe ssh timeout in seconds (a probe's own timeout overrides; default 600)",
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
     run_p.set_defaults(func=_cmd_run)
