@@ -52,3 +52,27 @@ other SSH transports.
 - **WHEN** the pushed tree contains a symlink whose target is outside the tree
 - **THEN** that target is not shipped — the out-of-tree file does not leave the source host
 
+### Requirement: A probe command is bounded by a hard timeout that records a timed-out result
+
+The system SHALL bound every probe command with a wall-clock timeout. On expiry it SHALL terminate the
+local SSH client and capture the probe's outcome as a **timed-out result** — the partial output read so
+far, a sentinel exit code, and a marker distinguishing a timeout from a command that merely exited
+non-zero — rather than raising a transport error or hanging. A probe that never returns (for example one
+that allocates an interactive PTY session and blocks) therefore can neither stall the per-host lifecycle
+nor discard the host's already-collected results: control returns to the battery with a recorded outcome.
+The remote process is not separately killed — the host is torn down shortly afterward, so any orphaned
+remote command dies with the VM.
+
+#### Scenario: A probe exceeding its timeout is killed and recorded as timed out
+
+- **WHEN** a probe command runs longer than its timeout
+- **THEN** the local SSH client is terminated and the probe's outcome is recorded as a timed-out result
+  (partial output, sentinel exit, timed-out marker) — not raised — so the battery can continue and the
+  host can still be torn down
+
+#### Scenario: A probe within its timeout returns its captured outcome normally
+
+- **WHEN** a probe command completes before its timeout
+- **THEN** its exit code, stdout, and stderr are captured and returned exactly as before, with no timeout
+  marker set
+

@@ -35,7 +35,15 @@ group are respected.
 The system SHALL run each probe's command over SSH as the non-root operator and capture its exit code,
 stdout, and stderr, marking a probe ok exactly when it exits zero (interpretation of a non-zero exit is
 per-probe — an expected fail is still recorded data, not a run error). A probe SHALL escalate via sudo
-only when its tag is host-root.
+only when its tag is host-root. Each probe SHALL be bounded by a timeout: a probe MAY declare an optional
+per-probe `timeout`, and absent one it SHALL inherit a run-wide default supplied by the caller, so no
+single probe can block the battery — and thus the host's teardown — without bound. The battery JSON
+SHALL remain back-compatible: a probe without a `timeout` is valid and uses the run-wide default. A probe
+that exceeds its timeout SHALL be recorded as a timed-out result (marked distinctly from a non-zero exit)
+and SHALL NOT abort the battery — the remaining probes still run, exactly as for a non-zero exit. To bound
+the cost of a wedged host, after a configurable number of **consecutive** timed-out probes (default 2) the
+system SHALL stop running the rest of that host's battery and record why, rather than spending a full
+timeout on every remaining probe.
 
 #### Scenario: Probe outcome is captured
 
@@ -46,6 +54,28 @@ only when its tag is host-root.
 
 - **WHEN** a probe exits non-zero
 - **THEN** its result is recorded and the remaining probes still run
+
+#### Scenario: A probe without a declared timeout uses the run-wide default
+
+- **WHEN** a battery probe declares no `timeout`
+- **THEN** it is run bounded by the run-wide default timeout, and the battery loads without error
+
+#### Scenario: A probe's declared timeout overrides the run-wide default
+
+- **WHEN** a battery probe declares its own `timeout`
+- **THEN** that probe is bounded by its declared value rather than the run-wide default
+
+#### Scenario: A single timed-out probe is recorded and the battery continues
+
+- **WHEN** one probe times out but the following probes do not
+- **THEN** the timeout is recorded as a timed-out result and every subsequent probe still runs, so the
+  host's collected results are preserved rather than discarded
+
+#### Scenario: Consecutive timeouts stop the battery for a wedged host
+
+- **WHEN** the configured number of consecutive probes (default 2) all time out
+- **THEN** the system stops running the rest of that host's battery, records that it stopped and why, and
+  the host still tears down — bounding wasted time at roughly K×timeout rather than N×timeout
 
 ### Requirement: A host-detail snapshot heads each host's results
 
@@ -60,12 +90,22 @@ tool inventory) before the battery, as the results header.
 ### Requirement: Results are written as timestamped JSON with an injected timestamp
 
 The system SHALL write each run's results to a timestamped JSON file whose timestamp is supplied by the
-caller (not read from the clock), keeping the output deterministic and testable.
+caller (not read from the clock), keeping the output deterministic and testable. Results SHALL be
+persisted **incrementally, as each host completes**, so that a run aborted partway through (for example by
+an operator `KeyboardInterrupt`) still leaves a results file containing every host that finished — only an
+in-flight host is absent. The document shape is unchanged; it is simply rewritten with the
+completed-so-far set each time a host finishes.
 
 #### Scenario: The results timestamp is caller-supplied
 
 - **WHEN** results are written
 - **THEN** the filename and content use the injected timestamp, with no wall-clock read in the library
+
+#### Scenario: A completed host's result survives an abort
+
+- **WHEN** at least one host has completed and the run is then aborted before the remaining hosts finish
+- **THEN** the results file already on disk contains the completed host(s), and only the in-flight host is
+  missing
 
 ### Requirement: Caller-specified files are uploaded to each host before the battery
 
