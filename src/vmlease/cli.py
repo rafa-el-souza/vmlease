@@ -190,6 +190,8 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         try:
             reaped = reap(provider, run_id)
             print(f"aborted — reaped {len(reaped)} host(s) labelled vmlease={run_id}", file=sys.stderr)
+            for h in reaped:
+                print(f"  - reaped {h.name} ({h.id})", file=sys.stderr)
         except ProviderError as exc:
             print(
                 f"aborted — backstop reap ALSO failed ({exc}); host(s) labelled "
@@ -217,6 +219,8 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
                 f"reaped {len(reaped)} host(s) labelled vmlease={run_id}",
                 file=sys.stderr,
             )
+            for h in reaped:
+                print(f"  - reaped {h.name} ({h.id})", file=sys.stderr)
         except ProviderError as exc:
             print(
                 f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
