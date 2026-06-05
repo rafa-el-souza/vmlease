@@ -1753,7 +1753,11 @@ class TestExecute(unittest.TestCase):
                 m, prov, lambda _o, _k: _OrchestratedAbort(), _fake_keypair(Path(d)), "probe",
                 max_parallel=3, on_host_complete=sink,
             )
-        self.assertIn("fedora", seen)  # completed-but-unyielded host persisted by the drain
+        # Exactly ubuntu (normal loop, after unpark) then fedora (abort-time drain);
+        # debian raised, so it is NOT persisted. Without the drain `seen` would be just
+        # ["ubuntu"] — so this equality distinguishes drain-path persistence, not merely
+        # that fedora appears somehow.
+        self.assertEqual(seen, ["ubuntu", "fedora"])
 
     def test_on_host_complete_called_per_host_in_completion_order(self) -> None:
         # the incremental sink fires once per host as it completes (serial path)
