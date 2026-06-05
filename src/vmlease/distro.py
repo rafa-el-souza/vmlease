@@ -136,6 +136,11 @@ _PROFILES: dict[str, DistroProfile] = {
             "systemd-container", "acl", "rsync", "slirp4netns",
             "fuse-overlayfs", "e2fsprogs", "procps-ng", "shadow-utils", "curl",
             "dnf-plugins-core",
+            # `script(1)` (PTY-allocating test tool, used by probe batteries that
+            # drive interactive sessions) is split into its own subpackage on
+            # Fedora 40+; the minimal cloud image ships without it. ubuntu/debian
+            # (util-linux) and arch (util-linux) already include it.
+            "util-linux-script",
         ),
         extra_setup=(
             # the rootless setuptool's iptables preflight needs the legacy
