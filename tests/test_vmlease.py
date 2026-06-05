@@ -84,6 +84,17 @@ def _fake_subprocess(
     return _run
 
 
+def _fake_provider_runner(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> providers.SubprocessRunner:
+    """A 2-arg provider subprocess seam (argv, timeout) -> CompletedProcess."""
+
+    def _run(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    return _run
+
+
 class FakeSshRunner:
     """Scripted SshRunner: returns exit 0 by default, or raises/fails per config."""
 
@@ -303,21 +314,21 @@ class TestHetznerProviderImpl(unittest.TestCase):
 
     def test_create_success(self) -> None:
         out = "Server 5 created\nIPv4: 1.1.1.1\n"
-        prov = providers.HetznerProvider(runner=_fake_subprocess(0, out))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
         host = prov.create_with_cloudinit(self._spec(), "#!/bin/bash\necho hi")
         self.assertEqual((host.id, host.ipv4), ("5", "1.1.1.1"))
 
     def test_create_failure_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "boom"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
         with self.assertRaises(providers.ProviderError):
             prov.create_with_cloudinit(self._spec(), "#!/bin/bash")
 
     def test_destroy_idempotent_on_not_found(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "server not found"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "server not found"))
         prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)  # no raise
 
     def test_destroy_non_transient_error_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "forbidden"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
 
@@ -325,7 +336,7 @@ class TestHetznerProviderImpl(unittest.TestCase):
         # first call times out (transient), second succeeds → no raise, 2 calls
         calls = {"n": 0}
 
-        def flaky(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def flaky(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
             calls["n"] += 1
             if calls["n"] == 1:
                 return subprocess.CompletedProcess(argv, 1, "", "request timeout, please retry")
@@ -336,17 +347,55 @@ class TestHetznerProviderImpl(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
 
     def test_destroy_persistent_timeout_eventually_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "request timeout, please retry"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "request timeout, please retry"))
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=3, sleep=lambda _s: None)
 
+    def test_destroy_passes_delete_timeout_to_seam(self) -> None:
+        # the delete subprocess is bounded — the ctor's delete_timeout reaches the seam
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
+        self.assertEqual(seen, [37.5])
+
+    def test_destroy_default_delete_timeout_is_the_module_default(self) -> None:
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        providers.HetznerProvider(runner=capture).destroy(
+            model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None
+        )
+        self.assertEqual(seen, [providers.DEFAULT_DELETE_TIMEOUT])
+
+    def test_destroy_wedged_subprocess_killed_surfaces_as_provider_error(self) -> None:
+        # a delete that never returns (TimeoutExpired) is killed and surfaces as a
+        # ProviderError (reap-able teardown failure), NOT a hang, and is NOT retried.
+        calls = {"n": 0}
+
+        def wedged(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(argv, timeout or 0.0)
+
+        prov = providers.HetznerProvider(runner=wedged)
+        with self.assertRaises(providers.ProviderError):
+            prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=4, sleep=lambda _s: None)
+        self.assertEqual(calls["n"], 1)  # timeout is fail-fast, not retried
+
     def test_list_labeled(self) -> None:
         out = json.dumps([{"id": 1, "name": "a", "labels": {"vmlease": "r1"}}])
-        prov = providers.HetznerProvider(runner=_fake_subprocess(0, out))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
         self.assertEqual(len(prov.list_labeled("r1")), 1)
 
     def test_list_labeled_failure_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "boom"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
         with self.assertRaises(providers.ProviderError):
             prov.list_labeled("r1")
 
@@ -1403,6 +1452,27 @@ class TestResults(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(path.name, "vmlease-r1-20260601T000000Z.json")
 
+    def _run_named(self, name: str) -> model.HostRun:
+        spec = HostSpec(name=name, image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        return model.HostRun(host_spec=spec, detail="ok", results=())
+
+    def test_incremental_writer_path_known_before_first_write(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            w = results.IncrementalResultsWriter(Path(d) / "out", "r1", "20260601T000000Z")
+            self.assertEqual(w.path.name, "vmlease-r1-20260601T000000Z.json")
+            self.assertFalse(w.path.exists())  # deterministic, but nothing written yet
+
+    def test_incremental_writer_accumulates_each_host(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            w = results.IncrementalResultsWriter(Path(d) / "out", "r1", "20260601T000000Z")
+            path = w.add(self._run_named("host-a"))
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([h["name"] for h in doc["hosts"]], ["host-a"])  # first host present
+            path2 = w.add(self._run_named("host-b"))
+            self.assertEqual(path2, w.path)  # same deterministic file
+            doc2 = json.loads(path2.read_text(encoding="utf-8"))
+            self.assertEqual([h["name"] for h in doc2["hosts"]], ["host-a", "host-b"])  # both now
+
 
 # --------------------------------------------------------------------------- #
 # runner.execute — the teardown-ALWAYS guarantee
@@ -1552,7 +1622,69 @@ class TestExecute(unittest.TestCase):
             runs = runner.execute(self._matrix(("ubuntu",)), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertEqual(len(runs), 1)
         self.assertTrue(runs[0].results)  # probe data preserved
-        self.assertIn("WARNING: teardown", runs[0].detail)  # failure noted, not raised
+        self.assertIn(runner.TEARDOWN_WARNING_PREFIX, runs[0].detail)  # failure noted, not raised
+
+    def test_teardown_fires_on_base_exception_then_it_propagates(self) -> None:
+        # T2: a workload raising a BaseException (KeyboardInterrupt) AFTER the host
+        # is created → the host is STILL destroyed by the finally, and the
+        # BaseException keeps propagating (the run aborts).
+        prov = FakeProvider()
+
+        class _Interrupting:
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(KeyboardInterrupt):
+            runner.execute(self._matrix(("ubuntu",)), prov, lambda _o, _k: _Interrupting(), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(len(prov.created), 1)
+        self.assertEqual(len(prov.destroyed), 1)  # torn down despite the BaseException
+
+    def test_on_host_complete_called_per_host_in_completion_order(self) -> None:
+        # the incremental sink fires once per host as it completes (serial path)
+        prov = FakeProvider()
+        seen: list[str] = []
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                self._matrix(("ubuntu", "debian")), prov, self._factory(FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe",
+                on_host_complete=lambda hr: seen.append(hr.host_spec.distro_key),
+            )
+        self.assertEqual(seen, ["ubuntu", "debian"])  # one call per host
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])
+
+    def test_parallel_on_host_complete_called_once_per_host_main_thread(self) -> None:
+        # parallel path: sink fires once per host from the MAIN thread; aggregate
+        # stays matrix-ordered regardless of completion order.
+        prov = FakeProvider()
+        seen: list[str] = []
+        main_thread = threading.current_thread()
+        threads_seen: list[bool] = []
+
+        def sink(hr: model.HostRun) -> None:
+            threads_seen.append(threading.current_thread() is main_thread)
+            seen.append(hr.host_spec.distro_key)
+
+        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-sink")
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe",
+                max_parallel=3, on_host_complete=sink,
+            )
+        self.assertEqual(sorted(seen), ["debian", "fedora", "ubuntu"])  # each host once
+        self.assertTrue(all(threads_seen))  # all sink calls on the main thread
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian", "fedora"])
 
     def test_parallel_one_failure_does_not_discard_others(self) -> None:
         prov = FakeProvider()

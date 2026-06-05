@@ -9,11 +9,10 @@ runs stay reproducible and tests pin the filename).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from vmlease.model import HostRun
 
 
@@ -63,3 +62,33 @@ def write_results(
     path = results_dir / results_filename(run_id, timestamp)
     path.write_text(serialize_run(run_id, timestamp, host_runs), encoding="utf-8")
     return path
+
+
+class IncrementalResultsWriter:
+    """A per-host results sink: rewrites the full results file as each host lands.
+
+    Stateful I/O sink for the runner's ``on_host_complete`` hook (D6). Its target
+    :attr:`path` is deterministic and available *before* any write, so the caller
+    can announce it up front. Each :meth:`add` appends the host to an internal
+    accumulator and rewrites the **whole** file via the existing
+    :func:`serialize_run` / :func:`write_results` path — so an aborted run leaves
+    a file holding every host that finished before the abort, in the order they
+    completed. The accumulator grows over the run; the :class:`HostRun` values it
+    holds stay frozen.
+    """
+
+    def __init__(self, results_dir: Path, run_id: str, timestamp: str) -> None:
+        self._results_dir = results_dir
+        self._run_id = run_id
+        self._timestamp = timestamp
+        self._host_runs: list[HostRun] = []
+
+    @property
+    def path(self) -> Path:
+        """The deterministic results path — known before the first :meth:`add`."""
+        return self._results_dir / results_filename(self._run_id, self._timestamp)
+
+    def add(self, host_run: HostRun) -> Path:
+        """Record ``host_run`` and rewrite the full results file; return its path."""
+        self._host_runs.append(host_run)
+        return write_results(self._results_dir, self._run_id, self._timestamp, self._host_runs)
