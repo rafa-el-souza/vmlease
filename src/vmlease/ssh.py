@@ -253,10 +253,19 @@ class OpenSshRunner:
         Runs the ``scp`` argv through the same injected ``runner`` seam
         ``run_probe`` uses (so no test opens a socket). A non-zero return is a
         transport failure — raised as :class:`SshError`, the same contract as
-        :meth:`wait_until_ready` — distinct from a probe's own non-zero exit.
+        :meth:`wait_until_ready` — distinct from a probe's own non-zero exit. The
+        probe-default timeout also bounds the transfer, so a hung scp cannot hang
+        the run; a timeout is converted to :class:`SshError` (same contract as the
+        non-zero exit), not surfaced as a raw :class:`subprocess.TimeoutExpired`.
         """
         argv = build_scp_argv(host, self._operator, self._key, local, remote)
-        proc = self._run(argv, self._probe_timeout_default)
+        try:
+            proc = self._run(argv, self._probe_timeout_default)
+        except subprocess.TimeoutExpired as exc:
+            raise SshError(
+                f"upload of {local} to {self._operator}@{host.ipv4}:{remote} timed out "
+                f"after {self._probe_timeout_default}s"
+            ) from exc
         if proc.returncode != 0:
             raise SshError(
                 f"upload of {local} to {self._operator}@{host.ipv4}:{remote} failed "
@@ -284,11 +293,20 @@ class OpenSshRunner:
         pushes the tree with ``rsync --safe-links`` (out-of-tree symlinks are NOT
         followed). Runs through the same injected ``runner`` seam ``upload`` uses.
         A non-zero rsync exit is a transport failure raised as :class:`SshError`.
+        The probe-default timeout also bounds the transfer, so a hung rsync cannot
+        hang the run; a timeout is converted to :class:`SshError` (same contract as
+        the non-zero exit), not surfaced as a raw :class:`subprocess.TimeoutExpired`.
         """
         validate_upload_dir_source(local)
         validate_remote_dest(remote)
         argv = build_rsync_argv(host, self._operator, self._key, local, remote)
-        proc = self._run(argv, self._probe_timeout_default)
+        try:
+            proc = self._run(argv, self._probe_timeout_default)
+        except subprocess.TimeoutExpired as exc:
+            raise SshError(
+                f"directory upload of {local} to {self._operator}@{host.ipv4}:{remote} timed out "
+                f"after {self._probe_timeout_default}s"
+            ) from exc
         if proc.returncode != 0:
             raise SshError(
                 f"directory upload of {local} to {self._operator}@{host.ipv4}:{remote} failed "

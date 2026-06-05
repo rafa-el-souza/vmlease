@@ -208,11 +208,29 @@ def execute(
             # finishes (the workers never touch on_host_complete).
             futures = {pool.submit(_one, spec): idx for idx, spec in enumerate(specs)}
             ordered: list[HostRun | None] = [None] * len(specs)
-            for future in as_completed(futures):
-                idx = futures[future]
-                host_run = future.result()
-                ordered[idx] = host_run
-                _notify(host_run)
+            try:
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    host_run = future.result()
+                    ordered[idx] = host_run
+                    _notify(host_run)
+            except BaseException:
+                # Abort-time best-effort drain that RE-RAISES (not a swallow): a
+                # propagating BaseException (e.g. a worker's KeyboardInterrupt) would
+                # otherwise drop hosts that already finished cleanly but whose
+                # as_completed turn hadn't arrived. Fire on_host_complete for each
+                # done, non-cancelled, not-yet-recorded future (in matrix order) so
+                # their results persist like the serial path, then re-raise.
+                for future, idx in sorted(futures.items(), key=lambda kv: kv[1]):
+                    if ordered[idx] is not None or future.cancelled() or not future.done():
+                        continue
+                    try:
+                        host_run = future.result()
+                    except BaseException:  # this worker itself raised — skip it
+                        continue
+                    ordered[idx] = host_run
+                    _notify(host_run)
+                raise
             return [hr for hr in ordered if hr is not None]
     finally:
         keypair.cleanup()

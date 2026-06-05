@@ -99,12 +99,13 @@ class ProbeWorkload:
         detail = ssh.run_probe(host, detail_probe).stdout
         results: list[ProbeResult] = []
         consecutive_timeouts = 0
-        for probe in self._battery.ordered():
+        ordered_probes = self._battery.ordered()
+        for probe in ordered_probes:
             result = ssh.run_probe(host, probe)
             results.append(result)
             consecutive_timeouts = consecutive_timeouts + 1 if result.timed_out else 0
             if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-                not_run = [p.id for p in self._battery.ordered()[len(results) :]]
+                not_run = [p.id for p in ordered_probes[len(results) :]]
                 detail = (
                     f"{detail}\nbattery stopped: host wedged after {consecutive_timeouts} "
                     f"consecutive probe timeouts; probes {not_run} not run"
