@@ -47,7 +47,11 @@ making **no** provider calls and running the cost guard so a guard refusal surfa
 The system SHALL create, transform, run the workload on, and tear down each host inside its own
 try/finally before the next host starts, so that a failure to provision, transform, or reach one host is
 recorded as an error result for that host (not a propagating exception) and every other host still
-produces a result.
+produces a result. Teardown SHALL run in a `finally` that fires even when a `BaseException` (for example
+a `KeyboardInterrupt` from operator Ctrl-C, or a `SystemExit`) propagates through the host's workload — a
+caught `Exception` is not the only path that must still tear the host down. Each host's result SHALL be
+surfaced to the caller **as that host completes** (not only in the aggregate returned at the end), so a
+caller can persist results incrementally; the aggregate return is preserved in matrix order.
 
 #### Scenario: One host's provisioning failure does not abort the run
 
@@ -60,6 +64,19 @@ produces a result.
 - **WHEN** a host's workload has completed (or errored)
 - **THEN** the host is destroyed in a finally block; if the destroy itself fails, the failure is appended
   to the result as a reap-it warning rather than discarding the collected results
+
+#### Scenario: Teardown runs even when the workload raises a BaseException
+
+- **WHEN** a host's workload raises a `BaseException` (such as `KeyboardInterrupt` or `SystemExit`) after
+  the host has been created
+- **THEN** the host is still destroyed by the `finally` before the exception propagates, so an aborted run
+  leaves no billable host behind that path
+
+#### Scenario: Each host's result is surfaced as it completes
+
+- **WHEN** a host finishes (its workload completed or errored and it has been torn down)
+- **THEN** its result is handed to the caller's completion sink at that point, before later hosts finish,
+  while the final aggregate is still returned in matrix order
 
 ### Requirement: Optional parallelism preserves matrix order
 
@@ -77,7 +94,10 @@ in matrix order regardless of completion order, with each host fully self-contai
 The system SHALL drive VMs through a `Provider` abstraction (create-with-cloud-init, destroy,
 list-by-label) and SHALL remain correct against real provider behavior: connections must survive a
 provider recycling a just-freed IP address onto the next host, and provider commands that do not support
-JSON output must be parsed from their plain-text output.
+JSON output must be parsed from their plain-text output. A `destroy` SHALL bound its own provider
+subprocess with a wall-clock timeout so a wedged provider CLI cannot itself stall teardown indefinitely;
+on expiry the subprocess is killed and the destroy is treated as a failed (reap-able) teardown rather than
+hanging the run.
 
 #### Scenario: SSH survives a recycled IP
 
@@ -89,4 +109,10 @@ JSON output must be parsed from their plain-text output.
 
 - **WHEN** a provider create / enable-rescue command returns plain text (no JSON mode)
 - **THEN** the system parses the host details from that text rather than requiring JSON
+
+#### Scenario: A wedged delete subprocess does not hang teardown
+
+- **WHEN** the provider's delete subprocess does not return within its timeout
+- **THEN** the subprocess is killed and the destroy surfaces as a failed teardown (reap-able), rather than
+  blocking the host's `finally` forever
 

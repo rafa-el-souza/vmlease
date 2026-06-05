@@ -26,10 +26,16 @@ from vmlease.model import Host
 if TYPE_CHECKING:
     from vmlease.model import HostSpec
 
-# A subprocess runner: argv -> completed process. The injection seam that lets
-# tests drive the Hetzner impl with a fake subprocess (a parameter, not module
-# state).
-SubprocessRunner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
+# A subprocess runner: (argv, timeout) -> completed process (``timeout=None`` =
+# unbounded). The injection seam that lets tests drive the Hetzner impl with a
+# fake subprocess (a parameter, not module state). The timeout arg lets ``destroy``
+# bound its delete so a wedged ``hcloud`` CLI cannot stall teardown forever.
+SubprocessRunner = Callable[[list[str], "float | None"], "subprocess.CompletedProcess[str]"]
+
+# Default wall-clock bound (seconds) on the delete subprocess: generous enough
+# for a real ``hcloud server delete`` round-trip, short enough that a wedged CLI
+# becomes a reap-able teardown failure rather than an indefinite hang.
+DEFAULT_DELETE_TIMEOUT = 120.0
 
 
 class ProviderError(RuntimeError):
@@ -176,14 +182,17 @@ class HetznerProvider:
     def __init__(
         self,
         runner: SubprocessRunner | None = None,
+        *,
+        delete_timeout: float = DEFAULT_DELETE_TIMEOUT,
     ) -> None:
         self._run: SubprocessRunner = runner or _default_runner
+        self._delete_timeout = delete_timeout
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         with tempfile.NamedTemporaryFile("w", suffix=".cloudinit", delete=True) as fh:
             fh.write(cloud_init)
             fh.flush()
-            proc = self._run(build_create_argv(spec, fh.name))
+            proc = self._run(build_create_argv(spec, fh.name), None)
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server create failed ({proc.returncode}): {proc.stderr}")
         return parse_create_text(proc.stdout, spec.name, dict(spec.labels))
@@ -195,12 +204,25 @@ class HetznerProvider:
         timeout" / "please retry" is transient — the deletion usually completes
         server-side anyway — so retry with a short backoff rather than fail the
         run. Only a persistent non-timeout error raises :class:`ProviderError`.
+
+        The delete subprocess is wall-clock-bounded (``delete_timeout``): a wedged
+        ``hcloud`` CLI that never returns is killed and surfaced as a
+        :class:`ProviderError` (a failed, reap-able teardown) so it can never stall
+        the per-host ``finally`` forever. A *subprocess* timeout is NOT the same as
+        the transient API "please retry" — the process is hung, not the API — so it
+        is not retried; it fails fast and the orphan is reaped.
         """
         import time
 
         _sleep = sleep if sleep is not None else time.sleep
         for attempt in range(attempts):
-            proc = self._run(build_delete_argv(host))
+            try:
+                proc = self._run(build_delete_argv(host), self._delete_timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError(
+                    f"hcloud server delete timed out after {self._delete_timeout}s "
+                    f"(killed): {host.name} ({host.id})"
+                ) from exc
             err = (proc.stderr or "").lower()
             if proc.returncode == 0 or "not found" in err:
                 return
@@ -210,12 +232,18 @@ class HetznerProvider:
             _sleep(min(8.0, 2.0 * (attempt + 1)))
 
     def list_labeled(self, run_id: str) -> list[Host]:
-        proc = self._run(build_list_argv(run_id))
+        proc = self._run(build_list_argv(run_id), None)
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server list failed ({proc.returncode}): {proc.stderr}")
         return parse_list_output(proc.stdout)
 
 
-def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    """Sterile subprocess wrapper: capture text, never raise on non-zero."""
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+def _default_runner(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Sterile subprocess wrapper: capture text, never raise on non-zero.
+
+    ``timeout=None`` (the default for create/list) is unbounded. When a bound is
+    given (``destroy``), ``subprocess.run`` kills the child and re-raises
+    :class:`subprocess.TimeoutExpired` on expiry — the caller turns that into a
+    reap-able teardown failure.
+    """
+    return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)

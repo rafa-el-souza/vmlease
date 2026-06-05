@@ -26,6 +26,11 @@ if TYPE_CHECKING:
     from vmlease.ssh import SshRunner
     from vmlease.workload import Workload
 
+# The single marker a failed teardown leaves in a host's detail, shared between
+# the producer here (:func:`_best_effort_destroy`) and the CLI consumer that
+# greps for it to exit non-zero (D3). Pinned verbatim — imported elsewhere.
+TEARDOWN_WARNING_PREFIX = "WARNING: teardown of"
+
 
 @dataclass(frozen=True)
 class Matrix:
@@ -137,6 +142,7 @@ def execute(
     cost_guard: CostGuard | None = None,
     rescue_writer: RescueWriter | None = None,
     max_parallel: int = 1,
+    on_host_complete: Callable[[HostRun], None] | None = None,
 ) -> list[HostRun]:
     """Per host: provision -> (rescue-write) -> run workload -> **tear down immediately**.
 
@@ -164,6 +170,13 @@ def execute(
     returned in **matrix order** regardless of completion order. Running hosts
     concurrently also sidesteps Hetzner's recycled-IP-into-the-next-host behavior
     (hosts overlap, so an IP is not freed mid-run).
+
+    ``on_host_complete`` (injected, optional) is invoked with each host's
+    ``HostRun`` as it finishes, from the **main thread** — serially in the loop,
+    or via ``as_completed`` in parallel mode (NOT from a worker thread, so a sink
+    that does I/O sees no concurrent calls). It lets the caller persist results
+    incrementally (so an abort still leaves the finished hosts on disk) without
+    changing the matrix-ordered aggregate return.
     """
     validate_uploads(matrix)
     specs = build_host_specs(matrix)
@@ -175,14 +188,50 @@ def execute(
             spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads
         )
 
+    def _notify(host_run: HostRun) -> None:
+        if on_host_complete is not None:
+            on_host_complete(host_run)
+
     try:
         if max_parallel <= 1 or len(specs) <= 1:
-            return [_one(spec) for spec in specs]
-        from concurrent.futures import ThreadPoolExecutor
+            runs: list[HostRun] = []
+            for spec in specs:
+                host_run = _one(spec)
+                _notify(host_run)
+                runs.append(host_run)
+            return runs
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(max_workers=min(max_parallel, len(specs))) as pool:
-            # map preserves input order, so results align with the matrix.
-            return list(pool.map(_one, specs))
+            # Submit keeps a future->index map so the aggregate stays in matrix
+            # order; as_completed lets the main thread call the sink as each host
+            # finishes (the workers never touch on_host_complete).
+            futures = {pool.submit(_one, spec): idx for idx, spec in enumerate(specs)}
+            ordered: list[HostRun | None] = [None] * len(specs)
+            try:
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    host_run = future.result()
+                    ordered[idx] = host_run
+                    _notify(host_run)
+            except BaseException:
+                # Abort-time best-effort drain that RE-RAISES (not a swallow): a
+                # propagating BaseException (e.g. a worker's KeyboardInterrupt) would
+                # otherwise drop hosts that already finished cleanly but whose
+                # as_completed turn hadn't arrived. Fire on_host_complete for each
+                # done, non-cancelled, not-yet-recorded future (in matrix order) so
+                # their results persist like the serial path, then re-raise.
+                for future, idx in sorted(futures.items(), key=lambda kv: kv[1]):
+                    if ordered[idx] is not None or future.cancelled() or not future.done():
+                        continue
+                    try:
+                        host_run = future.result()
+                    except BaseException:  # this worker itself raised — skip it
+                        continue
+                    ordered[idx] = host_run
+                    _notify(host_run)
+                raise
+            return [hr for hr in ordered if hr is not None]
     finally:
         keypair.cleanup()
 
@@ -204,18 +253,25 @@ def _run_one_host(
     then invokes ``workload.run`` against the ready host. Provider/rescue/transport
     failures are caught and returned as an error ``HostRun`` (so a later host can
     still run, and the caller writes results); only the workload's own captured
-    outcome is normal data. The host is destroyed in the ``finally`` regardless.
-    Teardown is best-effort and NEVER loses results: a failing ``destroy`` (e.g.
-    a transient API timeout that the host-side delete actually completes) is
-    appended to the result's detail as a warning, not raised — the collected data
-    is the valuable artifact, and a stubborn server is a reap-able orphan, not a
-    reason to discard everything. (``provider.destroy`` already retries transient
-    timeouts; this guard handles the residual case.)
+    outcome is normal data. The host is destroyed in a real ``finally`` regardless
+    of how the body left — a normal return, a caught ``Exception``, OR a
+    ``BaseException`` (Ctrl-C / ``SystemExit``): teardown fires first, THEN the
+    ``BaseException`` keeps propagating so an aborted run still exits. Teardown is
+    best-effort and NEVER loses results: a failing ``destroy`` (e.g. a transient
+    API timeout that the host-side delete actually completes) is appended to the
+    result's detail as a warning, not raised — the collected data is the valuable
+    artifact, and a stubborn server is a reap-able orphan, not a reason to discard
+    everything. (``provider.destroy`` already retries transient timeouts; this
+    guard handles the residual case.)
     """
     from vmlease.model import HostRun
 
     profile = get_profile(spec.distro_key)
     host: Host | None = None
+    # Seed an error result so the ``finally`` always has a HostRun to attach a
+    # teardown note to, even if a BaseException unwound the body before ``run``
+    # was assigned a real outcome (the BaseException re-propagates afterwards).
+    run = HostRun(host_spec=spec, detail="ERROR: run interrupted before completion", results=())
     try:
         # cloud-init is rendered (+ validated) before create — a template defect
         # fails before spend. A rescue-write distro's base host gets the SAME
@@ -240,11 +296,18 @@ def _run_one_host(
         run = workload.run(spec, host, ssh)
     except Exception as exc:  # provider / rescue / transport failure → record, don't abort
         run = HostRun(host_spec=spec, detail=f"ERROR: {type(exc).__name__}: {exc}", results=())
-
-    if host is not None:
-        teardown_note = _best_effort_destroy(provider, host)
-        if teardown_note:
-            run = HostRun(host_spec=run.host_spec, detail=f"{run.detail}\n{teardown_note}", results=run.results)
+    finally:
+        # A real finally: fires on return, on the caught Exception above, AND when
+        # a BaseException propagates through it (teardown happens, then the
+        # BaseException keeps unwinding).
+        if host is not None:
+            teardown_note = _best_effort_destroy(provider, host)
+            if teardown_note:
+                run = HostRun(
+                    host_spec=run.host_spec,
+                    detail=f"{run.detail}\n{teardown_note}",
+                    results=run.results,
+                )
     return run
 
 
@@ -258,4 +321,4 @@ def _best_effort_destroy(provider: Provider, host: Host) -> str:
         provider.destroy(host)
         return ""
     except Exception as exc:
-        return f"WARNING: teardown of {host.name} ({host.id}) failed — reap it: {exc}"
+        return f"{TEARDOWN_WARNING_PREFIX} {host.name} ({host.id}) failed — reap it: {exc}"

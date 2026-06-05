@@ -37,6 +37,11 @@ class Probe:
         tag: What the probe touches (:class:`ProbeTag`).
         classifies: The design action this probe classifies (free text, for the
             results report — e.g. "L2 subuid append").
+        timeout: Optional per-probe wall-clock bound (seconds) for the bounded
+            probe transport. ``None`` (the default, back-compatible) means "use
+            the runner's run-wide default" — the SSH layer resolves the effective
+            value and enforces it, recording a timed-out :class:`ProbeResult`
+            rather than hanging.
     """
 
     id: str
@@ -44,6 +49,7 @@ class Probe:
     command: str
     tag: ProbeTag
     classifies: str = ""
+    timeout: float | None = None
 
 
 @dataclass(frozen=True)
@@ -125,13 +131,23 @@ class Host:
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """The captured outcome of one probe on one host."""
+    """The captured outcome of one probe on one host.
+
+    ``timed_out`` (default ``False``, back-compatible) marks a result the bounded
+    probe transport produced because the command outlived its effective timeout:
+    the SSH layer killed the local process and recorded this result (sentinel exit
+    ``124``, best-effort partial output) instead of raising — a timeout is *data
+    about the probe*, treated like a non-zero exit, and the consecutive-timeout
+    breaker counts on this flag (not on the ``124`` exit a real command could
+    coincidentally return).
+    """
 
     probe_id: str
     tag: ProbeTag
     exit_code: int
     stdout: str
     stderr: str
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:

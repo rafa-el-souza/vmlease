@@ -84,6 +84,17 @@ def _fake_subprocess(
     return _run
 
 
+def _fake_provider_runner(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> providers.SubprocessRunner:
+    """A 2-arg provider subprocess seam (argv, timeout) -> CompletedProcess."""
+
+    def _run(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    return _run
+
+
 class FakeSshRunner:
     """Scripted SshRunner: returns exit 0 by default, or raises/fails per config."""
 
@@ -156,6 +167,14 @@ class TestModel(unittest.TestCase):
         bad = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "", "err")
         self.assertTrue(ok.ok)
         self.assertFalse(bad.ok)
+
+    def test_probe_result_timed_out_defaults_false(self) -> None:
+        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        self.assertFalse(res.timed_out)
+
+    def test_probe_timeout_defaults_none(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertIsNone(p.timeout)
 
     def test_battery_ordered_groups_by_tag(self) -> None:
         b = battery_mod.parse_battery(_BATTERY_JSON)
@@ -295,21 +314,21 @@ class TestHetznerProviderImpl(unittest.TestCase):
 
     def test_create_success(self) -> None:
         out = "Server 5 created\nIPv4: 1.1.1.1\n"
-        prov = providers.HetznerProvider(runner=_fake_subprocess(0, out))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
         host = prov.create_with_cloudinit(self._spec(), "#!/bin/bash\necho hi")
         self.assertEqual((host.id, host.ipv4), ("5", "1.1.1.1"))
 
     def test_create_failure_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "boom"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
         with self.assertRaises(providers.ProviderError):
             prov.create_with_cloudinit(self._spec(), "#!/bin/bash")
 
     def test_destroy_idempotent_on_not_found(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "server not found"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "server not found"))
         prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)  # no raise
 
     def test_destroy_non_transient_error_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "forbidden"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
 
@@ -317,7 +336,7 @@ class TestHetznerProviderImpl(unittest.TestCase):
         # first call times out (transient), second succeeds → no raise, 2 calls
         calls = {"n": 0}
 
-        def flaky(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def flaky(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
             calls["n"] += 1
             if calls["n"] == 1:
                 return subprocess.CompletedProcess(argv, 1, "", "request timeout, please retry")
@@ -328,17 +347,55 @@ class TestHetznerProviderImpl(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
 
     def test_destroy_persistent_timeout_eventually_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "request timeout, please retry"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "request timeout, please retry"))
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=3, sleep=lambda _s: None)
 
+    def test_destroy_passes_delete_timeout_to_seam(self) -> None:
+        # the delete subprocess is bounded — the ctor's delete_timeout reaches the seam
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
+        self.assertEqual(seen, [37.5])
+
+    def test_destroy_default_delete_timeout_is_the_module_default(self) -> None:
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        providers.HetznerProvider(runner=capture).destroy(
+            model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None
+        )
+        self.assertEqual(seen, [providers.DEFAULT_DELETE_TIMEOUT])
+
+    def test_destroy_wedged_subprocess_killed_surfaces_as_provider_error(self) -> None:
+        # a delete that never returns (TimeoutExpired) is killed and surfaces as a
+        # ProviderError (reap-able teardown failure), NOT a hang, and is NOT retried.
+        calls = {"n": 0}
+
+        def wedged(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(argv, timeout or 0.0)
+
+        prov = providers.HetznerProvider(runner=wedged)
+        with self.assertRaises(providers.ProviderError):
+            prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=4, sleep=lambda _s: None)
+        self.assertEqual(calls["n"], 1)  # timeout is fail-fast, not retried
+
     def test_list_labeled(self) -> None:
         out = json.dumps([{"id": 1, "name": "a", "labels": {"vmlease": "r1"}}])
-        prov = providers.HetznerProvider(runner=_fake_subprocess(0, out))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
         self.assertEqual(len(prov.list_labeled("r1")), 1)
 
     def test_list_labeled_failure_raises(self) -> None:
-        prov = providers.HetznerProvider(runner=_fake_subprocess(1, "", "boom"))
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
         with self.assertRaises(providers.ProviderError):
             prov.list_labeled("r1")
 
@@ -388,6 +445,40 @@ class TestBattery(unittest.TestCase):
         doc = {"name": "x", "probes": [
             {"id": "P", "title": "t", "command": "c", "tag": "read-only"},
             {"id": "P", "title": "t2", "command": "c2", "tag": "read-only"},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_absent_is_none(self) -> None:
+        # back-compat: a battery without per-probe timeout loads, timeout None.
+        b = battery_mod.parse_battery(_BATTERY_JSON)
+        self.assertIsNone(b.probes[0].timeout)
+
+    def test_parse_timeout_value_carried(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 42},
+        ]}
+        b = battery_mod.parse_battery(json.dumps(doc))
+        self.assertEqual(b.probes[0].timeout, 42.0)
+
+    def test_parse_timeout_non_positive_raises(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 0},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_non_numeric_raises(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": "soon"},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_bool_rejected(self) -> None:
+        # bool is an int subclass; ``true`` must not be silently read as ``1``.
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": True},
         ]}
         with self.assertRaises(battery_mod.BatteryError):
             battery_mod.parse_battery(json.dumps(doc))
@@ -878,10 +969,74 @@ class TestSsh(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=accept-new", argv)
 
     def test_run_probe_captures_exit(self) -> None:
-        r = OpenSshRunnerForTest(_fake_subprocess(7, "out", "err"))
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(7, "out", "err"))
         probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
         res = r.run_probe(self._host(), probe)
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
+        self.assertFalse(res.timed_out)  # a within-timeout probe is not a timeout
+
+    def test_run_probe_blocking_seam_records_timed_out_result(self) -> None:
+        # T1: a slow/blocking transport that raises TimeoutExpired is RECORDED as a
+        # timed-out result (exit 124, timed_out=True, partial output), not raised
+        # and not a hang.
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout, output="partial-out", stderr="partial-err")
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.exit_code, 124)
+        self.assertFalse(res.ok)
+        self.assertIn("partial-out", res.stdout)  # best-effort partial preserved
+        self.assertIn("partial-err", res.stderr)
+        self.assertIn("timed out after", res.stderr)  # the note is appended
+
+    def test_run_probe_timeout_empty_partial_is_fine(self) -> None:
+        # a platform that doesn't populate partial output → empty, still recorded.
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.stdout, "")
+        self.assertIn("timed out after", res.stderr)
+
+    def test_run_probe_resolves_per_probe_timeout(self) -> None:
+        # the probe's own timeout wins over the runner default and reaches the seam.
+        seen: list[float] = []
+
+        def capture(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner(
+            "probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None, probe_timeout_default=600.0
+        )
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY, timeout=12.5)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(seen, [12.5])
+
+    def test_run_probe_uses_runner_default_when_probe_has_none(self) -> None:
+        seen: list[float] = []
+
+        def capture(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner(
+            "probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None, probe_timeout_default=77.0
+        )
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(seen, [77.0])
+
+    def test_build_ssh_argv_has_no_tt(self) -> None:
+        # the probe argv must NOT force a PTY (-tt) — that would merge stdout/stderr.
+        argv = ssh.build_ssh_argv(self._host(), "probe", Path("/tmp/k"), "id")
+        self.assertNotIn("-tt", argv)
 
     def test_build_scp_argv(self) -> None:
         argv = ssh.build_scp_argv(self._host(), "probe", Path("/tmp/k"), Path("/src/w.whl"), "~/w.whl")
@@ -898,7 +1053,7 @@ class TestSsh(unittest.TestCase):
     def test_upload_runs_scp_via_seam(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -909,7 +1064,17 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(seen[0][-1], "probe@9.9.9.9:~/w.whl")
 
     def test_upload_raises_ssh_error_on_nonzero(self) -> None:
-        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1, "", "no route"), sleeper=lambda _x: None)
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(1, "", "no route"), sleeper=lambda _x: None)
+        with self.assertRaises(ssh.SshError):
+            r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
+
+    def test_upload_timeout_raises_ssh_error_not_timeout_expired(self) -> None:
+        # a hung transfer (seam raises TimeoutExpired) becomes SshError, not a raw
+        # TimeoutExpired — the transport contract the caller catches.
+        def runner_fn(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
 
@@ -919,7 +1084,7 @@ class TestSsh(unittest.TestCase):
         seq = [1, 1, 0, 0]
         calls = {"n": 0}
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             rc = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
             return subprocess.CompletedProcess(argv, rc, "6.9.0-arch1\n", "")
@@ -930,7 +1095,7 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(calls["n"], 4)  # 3 sentinel polls + 1 module-tree assertion
 
     def test_wait_until_ready_times_out(self) -> None:
-        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1), sleeper=lambda _x: None)
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(1), sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.wait_until_ready(self._host(), attempts=2)
 
@@ -949,7 +1114,7 @@ class TestSsh(unittest.TestCase):
         # with the running kernel on stdout: readiness must fail with the skew.
         seen_commands: list[str] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             command = argv[-1]
             seen_commands.append(command)
             if command == "test -f /var/lib/vmlease-ready":
@@ -968,7 +1133,7 @@ class TestSsh(unittest.TestCase):
 
     def test_wait_until_ready_healthy_host_passes(self) -> None:
         # sentinel present AND module-tree probe exits 0 → ready, returns normally.
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(argv, 0, "6.9.0-arch1\n", "")
 
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
@@ -988,7 +1153,7 @@ class TestSsh(unittest.TestCase):
         ]
         calls = {"n": 0}
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             rc, out = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
             return subprocess.CompletedProcess(argv, rc, out, "")
@@ -1075,7 +1240,7 @@ class TestSsh(unittest.TestCase):
     def test_upload_dir_runs_rsync_via_seam(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1087,14 +1252,24 @@ class TestSsh(unittest.TestCase):
 
     def test_upload_dir_raises_ssh_error_on_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(23, "", "rsync failed"))
+            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(23, "", "rsync failed"))
+            with self.assertRaises(ssh.SshError):
+                r.upload_dir(self._host(), Path(d), "~/dest")
+
+    def test_upload_dir_timeout_raises_ssh_error_not_timeout_expired(self) -> None:
+        # a hung directory push (seam raises TimeoutExpired) becomes SshError.
+        def runner_fn(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        with tempfile.TemporaryDirectory() as d:
+            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn)
             with self.assertRaises(ssh.SshError):
                 r.upload_dir(self._host(), Path(d), "~/dest")
 
     def test_upload_dir_validates_source_before_transfer(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1104,7 +1279,20 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(seen, [])  # validated fail-closed before any rsync
 
 
-def OpenSshRunnerForTest(runner_fn: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> ssh.OpenSshRunner:
+def _fake_ssh_subprocess(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> Callable[[list[str], float], subprocess.CompletedProcess[str]]:
+    """A 2-arg (argv, timeout) ssh subprocess seam returning a fixed result."""
+
+    def _run(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    return _run
+
+
+def OpenSshRunnerForTest(
+    runner_fn: Callable[[list[str], float], subprocess.CompletedProcess[str]],
+) -> ssh.OpenSshRunner:
     return ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
 
 
@@ -1284,6 +1472,27 @@ class TestResults(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(path.name, "vmlease-r1-20260601T000000Z.json")
 
+    def _run_named(self, name: str) -> model.HostRun:
+        spec = HostSpec(name=name, image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        return model.HostRun(host_spec=spec, detail="ok", results=())
+
+    def test_incremental_writer_path_known_before_first_write(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            w = results.IncrementalResultsWriter(Path(d) / "out", "r1", "20260601T000000Z")
+            self.assertEqual(w.path.name, "vmlease-r1-20260601T000000Z.json")
+            self.assertFalse(w.path.exists())  # deterministic, but nothing written yet
+
+    def test_incremental_writer_accumulates_each_host(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            w = results.IncrementalResultsWriter(Path(d) / "out", "r1", "20260601T000000Z")
+            path = w.add(self._run_named("host-a"))
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([h["name"] for h in doc["hosts"]], ["host-a"])  # first host present
+            path2 = w.add(self._run_named("host-b"))
+            self.assertEqual(path2, w.path)  # same deterministic file
+            doc2 = json.loads(path2.read_text(encoding="utf-8"))
+            self.assertEqual([h["name"] for h in doc2["hosts"]], ["host-a", "host-b"])  # both now
+
 
 # --------------------------------------------------------------------------- #
 # runner.execute — the teardown-ALWAYS guarantee
@@ -1433,7 +1642,157 @@ class TestExecute(unittest.TestCase):
             runs = runner.execute(self._matrix(("ubuntu",)), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertEqual(len(runs), 1)
         self.assertTrue(runs[0].results)  # probe data preserved
-        self.assertIn("WARNING: teardown", runs[0].detail)  # failure noted, not raised
+        self.assertIn(runner.TEARDOWN_WARNING_PREFIX, runs[0].detail)  # failure noted, not raised
+
+    def test_teardown_fires_on_base_exception_then_it_propagates(self) -> None:
+        # T2: a workload raising a BaseException (KeyboardInterrupt) AFTER the host
+        # is created → the host is STILL destroyed by the finally, and the
+        # BaseException keeps propagating (the run aborts).
+        prov = FakeProvider()
+
+        class _Interrupting:
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(KeyboardInterrupt):
+            runner.execute(self._matrix(("ubuntu",)), prov, lambda _o, _k: _Interrupting(), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(len(prov.created), 1)
+        self.assertEqual(len(prov.destroyed), 1)  # torn down despite the BaseException
+
+    def test_create_failure_records_error_and_skips_teardown(self) -> None:
+        # F3: a failure BEFORE create_with_cloudinit succeeds → no host exists, so
+        # the finally's host-is-None arm attempts NO teardown; the seeded error is
+        # recorded as the HostRun (zero results) and the run is NOT aborted.
+        class _CreateFails(FakeProvider):
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                raise providers.ProviderError("create rejected")
+
+        prov = _CreateFails()
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(self._matrix(("ubuntu",)), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].detail.startswith("ERROR:"))  # create failure recorded
+        self.assertEqual(runs[0].results, ())  # no probes ran
+        self.assertEqual(len(prov.destroyed), 0)  # host never created → no teardown
+
+    def test_parallel_abort_persists_already_completed_host(self) -> None:
+        # F4: in the parallel path, a host (fedora) finishes cleanly but its
+        # as_completed turn hasn't arrived when another host (debian) raises
+        # KeyboardInterrupt. The abort-time drain must STILL fire on_host_complete
+        # for the already-done fedora (so its result persists like the serial path)
+        # before the KeyboardInterrupt propagates.
+        #
+        # Determinism — the construction pins the completion order to A, debian,
+        # fedora and parks the main consumer until ALL three are done:
+        #   * ubuntu (A) completes first; its on_host_complete PARKS the consumer
+        #     until ``fedora_done`` so the loop accumulates the other two while held.
+        #   * debian raises KeyboardInterrupt and signals ``debian_done`` — it
+        #     COMPLETES (and is queued by as_completed) BEFORE fedora.
+        #   * fedora waits for ``debian_done`` then completes — so it is done-but-
+        #     not-yet-yielded when, on unpark, the loop reaches debian's turn and
+        #     the KeyboardInterrupt unwinds. Only the drain can persist fedora.
+        prov = FakeProvider()
+        ubuntu_done = threading.Event()
+        debian_done = threading.Event()
+        fedora_done = threading.Event()
+        seen: list[str] = []
+        seen_lock = threading.Lock()
+
+        class _OrchestratedAbort:
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                if "debian" in host.name:
+                    ubuntu_done.wait(timeout=5.0)  # raise strictly after ubuntu is done
+                    debian_done.set()
+                    raise KeyboardInterrupt("operator hit Ctrl-C")
+                if "fedora" in host.name:
+                    debian_done.wait(timeout=5.0)  # complete strictly after debian
+                    fedora_done.set()
+                    return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                # ubuntu: completes first and fastest (no waits), parking the sink.
+                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+        def sink(hr: model.HostRun) -> None:
+            # ubuntu is the first future done, so it is yielded first. Mark it done
+            # (releasing debian's raise) and PARK the consumer until BOTH debian and
+            # fedora are done — so debian's raise and fedora's clean completion both
+            # land while the consumer is held, making fedora the done-but-unyielded
+            # host that ONLY the abort-time drain can persist.
+            if hr.host_spec.distro_key == "ubuntu":
+                ubuntu_done.set()
+                fedora_done.wait(timeout=5.0)
+            with seen_lock:
+                seen.append(hr.host_spec.distro_key)
+
+        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-abort")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(KeyboardInterrupt):
+            runner.execute(
+                m, prov, lambda _o, _k: _OrchestratedAbort(), _fake_keypair(Path(d)), "probe",
+                max_parallel=3, on_host_complete=sink,
+            )
+        # Exactly ubuntu (normal loop, after unpark) then fedora (abort-time drain);
+        # debian raised, so it is NOT persisted. Without the drain `seen` would be just
+        # ["ubuntu"] — so this equality distinguishes drain-path persistence, not merely
+        # that fedora appears somehow.
+        self.assertEqual(seen, ["ubuntu", "fedora"])
+
+    def test_on_host_complete_called_per_host_in_completion_order(self) -> None:
+        # the incremental sink fires once per host as it completes (serial path)
+        prov = FakeProvider()
+        seen: list[str] = []
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                self._matrix(("ubuntu", "debian")), prov, self._factory(FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe",
+                on_host_complete=lambda hr: seen.append(hr.host_spec.distro_key),
+            )
+        self.assertEqual(seen, ["ubuntu", "debian"])  # one call per host
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])
+
+    def test_parallel_on_host_complete_called_once_per_host_main_thread(self) -> None:
+        # parallel path: sink fires once per host from the MAIN thread; aggregate
+        # stays matrix-ordered regardless of completion order.
+        prov = FakeProvider()
+        seen: list[str] = []
+        main_thread = threading.current_thread()
+        threads_seen: list[bool] = []
+
+        def sink(hr: model.HostRun) -> None:
+            threads_seen.append(threading.current_thread() is main_thread)
+            seen.append(hr.host_spec.distro_key)
+
+        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-sink")
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe",
+                max_parallel=3, on_host_complete=sink,
+            )
+        self.assertEqual(sorted(seen), ["debian", "fedora", "ubuntu"])  # each host once
+        self.assertTrue(all(threads_seen))  # all sink calls on the main thread
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian", "fedora"])
 
     def test_parallel_one_failure_does_not_discard_others(self) -> None:
         prov = FakeProvider()
@@ -1540,6 +1899,91 @@ class TestWorkloadSeam(unittest.TestCase):
         self.assertEqual(items[0].workload_summary, wl.plan_summary)
 
 
+class _ScriptedTimeoutSsh:
+    """An SshRunner whose ``run_probe`` returns timed-out results for named probes.
+
+    ``timeout_ids`` is the set of probe ids that come back ``timed_out`` (exit 124);
+    everything else (including the ``_detail`` snapshot) returns a normal exit-0
+    result. For exercising the consecutive-timeout breaker without a real socket.
+    """
+
+    def __init__(self, timeout_ids: set[str]) -> None:
+        self._timeout_ids = timeout_ids
+        self.ran: list[str] = []
+
+    def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+        self.ran.append(probe.id)
+        if probe.id in self._timeout_ids:
+            return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
+        return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+    def wait_until_ready(self, host: Host) -> None:
+        return None
+
+    def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+        return 0
+
+    def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+
+class TestProbeWorkloadBreaker(unittest.TestCase):
+    """T1b: timeout does not abort the battery; K consecutive timeouts stop it."""
+
+    def _battery(self) -> model.Battery:
+        # four probes, all read-only so ordered() == authoring order (stable rank).
+        doc = {"name": "b", "probes": [
+            {"id": "Q1", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q2", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q3", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q4", "title": "t", "command": "c", "tag": "read-only"},
+        ]}
+        return battery_mod.parse_battery(json.dumps(doc))
+
+    def _spec(self) -> model.HostSpec:
+        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu")
+
+    def _host(self) -> Host:
+        return Host(id="1", name="n", ipv4="9.9.9.9")
+
+    def test_isolated_timeout_continues_battery(self) -> None:
+        # one timeout in the middle, the next probe NOT a timeout → battery runs on,
+        # every later probe's result is present.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q2"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([r.probe_id for r in run.results], ["Q1", "Q2", "Q3", "Q4"])
+        self.assertTrue(run.results[1].timed_out)  # the isolated timeout is recorded
+        self.assertFalse(run.results[3].timed_out)  # later probes still ran
+        self.assertNotIn("battery stopped", run.detail)
+
+    def test_k_consecutive_timeouts_stop_battery(self) -> None:
+        # Q2 and Q3 both time out (K=2) → battery stops; Q4 is NOT run; prior
+        # results (Q1, Q2, Q3) are preserved and the detail carries the note.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q2", "Q3"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([r.probe_id for r in run.results], ["Q1", "Q2", "Q3"])  # Q4 not run
+        self.assertNotIn("Q4", ssh_fake.ran)  # the breaker really stopped the loop
+        self.assertIn("battery stopped", run.detail)
+        self.assertIn("2 consecutive probe timeouts", run.detail)
+        self.assertIn("'Q4'", run.detail)  # names the probe(s) not run
+
+    def test_non_consecutive_timeouts_do_not_trip(self) -> None:
+        # Q1 and Q3 time out but Q2 resets the counter → never K-in-a-row, full run.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q1", "Q3"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(len(run.results), 4)  # all four ran
+        self.assertNotIn("battery stopped", run.detail)
+
+    def test_breaker_constant_default_is_two(self) -> None:
+        self.assertEqual(workload.MAX_CONSECUTIVE_TIMEOUTS, 2)
+
+
 # --------------------------------------------------------------------------- #
 # cli — run (confirm gate) / reap / status, with provider + ssh stubbed
 # --------------------------------------------------------------------------- #
@@ -1605,6 +2049,233 @@ class TestCliRun(unittest.TestCase):
                 ])
             self.assertEqual(rc, 0)
             self.assertTrue((rdir / "vmlease-cli-run-20260601T000000Z.json").exists())
+
+    def test_run_probe_timeout_reaches_ssh_runner(self) -> None:
+        # --probe-timeout (run-only) must be threaded into OpenSshRunner via the
+        # factory as probe_timeout_default; capture the kwarg the factory passes.
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        def _capture(*_a: object, **k: object) -> FakeSshRunner:
+            captured.update(k)
+            return FakeSshRunner()
+
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", _capture):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes", "--probe-timeout", "42.5",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured.get("probe_timeout_default"), 42.5)
+
+    def test_run_writes_results_incrementally_per_host(self) -> None:
+        # the per-host sink rewrites the results file as each host lands; after a
+        # clean run the deterministic path holds every host and rc is 0.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu,debian",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            written = json.loads((rdir / "vmlease-cli-run-20260601T000000Z.json").read_text())
+            self.assertEqual(len(written["hosts"]), 2)
+
+    def test_run_end_to_end_smoke_ties_the_lifecycle_together(self) -> None:
+        # F5: one realistic, fully-mocked `vmlease run` over TWO distros that ties
+        # the whole lifecycle together — the unit tests cover each behavior in
+        # isolation; this asserts they compose. The live billable smoke (real
+        # machinectl/VM) stays deferred; nothing here opens a socket.
+        #
+        # Asserts in ONE run: clean rc; results file holds BOTH hosts (incremental
+        # persistence end-to-end); a timed-out probe is recorded (exit 124) and did
+        # NOT abort the battery (every probe present); destroy fired for BOTH hosts
+        # (per-host finally teardown); and --probe-timeout reached OpenSshRunner.
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        class _TimeoutOneProbeSsh(FakeSshRunner):
+            # normal results for every probe EXCEPT P6, which times out (exit 124,
+            # timed_out=True) — a SINGLE timeout, below the K=2 breaker, so the
+            # battery runs to completion and the timeout is just recorded.
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                self.ran.append(probe.id)
+                if probe.id == "P6":
+                    return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 42.5s", timed_out=True)
+                return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+
+        def _capture(*_a: object, **k: object) -> _TimeoutOneProbeSsh:
+            captured.update(k)
+            return _TimeoutOneProbeSsh()
+
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", _capture):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu,fedora",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes", "--probe-timeout", "42.5",
+                ])
+            self.assertEqual(rc, 0)  # clean run
+            # --probe-timeout reached the ssh runner factory.
+            self.assertEqual(captured.get("probe_timeout_default"), 42.5)
+            # destroy fired for BOTH hosts (per-host finally teardown).
+            self.assertEqual(len(prov.destroyed), 2)
+            # results file exists and holds BOTH hosts (incremental persistence).
+            path = rdir / "vmlease-cli-run-20260601T000000Z.json"
+            self.assertTrue(path.exists())
+            written = json.loads(path.read_text())
+            self.assertEqual(len(written["hosts"]), 2)
+            self.assertEqual(
+                sorted(h["distro"] for h in written["hosts"]), ["fedora", "ubuntu"]
+            )
+            # the timed-out P6 is recorded (exit 124) and the battery did NOT abort:
+            # every battery probe is present on each host.
+            for host in written["hosts"]:
+                ids = [p["id"] for p in host["probes"]]
+                self.assertEqual(ids, ["P1", "P6", "P12"])  # full battery, none dropped
+                p6 = next(p for p in host["probes"] if p["id"] == "P6")
+                self.assertEqual(p6["exit_code"], 124)  # the timeout is recorded
+                self.assertFalse(p6["ok"])
+
+    def test_run_teardown_failure_returns_nonzero_and_reaps(self) -> None:
+        # a destroy that raises (host stays live) → HostRun.detail carries the
+        # teardown warning → _cmd_run reaps the run label and returns non-zero.
+        from unittest import mock
+
+        class _DestroyFailsOnce(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.destroy_calls = 0
+
+            def destroy(self, host: Host) -> None:
+                # First teardown (in-run) fails, leaving the host live; the reap
+                # backstop's destroy then succeeds (a transient provider blip).
+                self.destroy_calls += 1
+                if self.destroy_calls == 1:
+                    raise providers.ProviderError("request timeout")
+                super().destroy(host)
+
+        prov = _DestroyFailsOnce()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 redirect_stderr(buf):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 1)
+            self.assertIn("teardown failed", buf.getvalue())
+            # reap was attempted: list_labeled then destroy on the still-live host.
+            self.assertTrue(prov.list_labeled(safety.make_run_id("cli-run")) == [])
+
+    def test_run_abort_reaps_and_reraises(self) -> None:
+        # an operator interrupt mid-run: the host that finished is on disk, the
+        # run label is reaped, and the KeyboardInterrupt keeps propagating.
+        from unittest import mock
+
+        class _Interrupting(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _Interrupting()), \
+                 redirect_stderr(buf), \
+                 self.assertRaises(KeyboardInterrupt):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertIn("aborted", buf.getvalue())
+            # the run label was reaped even though the interrupt propagated.
+            self.assertEqual(prov.list_labeled(safety.make_run_id("cli-run")), [])
+
+    def test_run_teardown_failure_and_backstop_reap_also_fails(self) -> None:
+        # teardown fails (host stays live) AND the backstop reap ALSO raises
+        # ProviderError: _cmd_run must still return non-zero (no traceback) and
+        # print the actionable `vmlease reap --run-token` manual-cleanup hint.
+        from unittest import mock
+
+        class _DestroyAlwaysFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                # In-run teardown fails (host stays live), and the backstop
+                # reap's destroy fails too — the host can't be reaped.
+                raise providers.ProviderError("request timeout")
+
+        prov = _DestroyAlwaysFails()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 redirect_stderr(buf):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 1)  # non-zero, NOT a traceback
+            self.assertIn("backstop reap ALSO failed", buf.getvalue())
+            self.assertIn("vmlease reap --run-token cli-run", buf.getvalue())
+
+    def test_run_abort_and_backstop_reap_also_fails_reraises_interrupt(self) -> None:
+        # an operator interrupt mid-run AND the backstop reap ALSO raises
+        # ProviderError: the ORIGINAL KeyboardInterrupt (not ProviderError) must
+        # propagate, and the actionable manual-reap hint must be printed.
+        from unittest import mock
+
+        class _Interrupting(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+        class _ReapFails(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("request timeout")
+
+        prov = _ReapFails()
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "r"
+            buf = io.StringIO()
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _Interrupting()), \
+                 redirect_stderr(buf), \
+                 self.assertRaises(KeyboardInterrupt):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(rdir), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertIn("backstop reap ALSO failed", buf.getvalue())
+            self.assertIn("vmlease reap --run-token cli-run", buf.getvalue())
 
     def test_reap_lists_destroyed(self) -> None:
         from unittest import mock

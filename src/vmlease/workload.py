@@ -55,6 +55,13 @@ _HOST_DETAIL_COMMAND = (
     "rootlesskit slirp4netns fuse-overlayfs newuidmap runsc 2>/dev/null; } 2>&1 || true"
 )
 
+# How many CONSECUTIVE timed-out probes mark a host as wedged. A single isolated
+# timeout (e.g. one slow ``machinectl`` probe) is recorded and the battery
+# continues; a RUN of timeouts is the signal that the host — not one command — is
+# the problem, so the battery stops to cap wasted wall-time at ~K*timeout instead
+# of N*timeout. K=2 (not 1) so one slow probe never ends an otherwise-fine battery.
+MAX_CONSECUTIVE_TIMEOUTS = 2
+
 
 class ProbeWorkload:
     """The probe battery as a :class:`Workload`: host-detail snapshot + battery.
@@ -75,9 +82,33 @@ class ProbeWorkload:
         return f"probes={len(self._battery.probes)}"
 
     def run(self, spec: HostSpec, host: Host, ssh: SshRunner, /) -> HostRun:
+        """Capture the host-detail snapshot, then run the battery with a breaker.
+
+        Every probe (the host-detail snapshot included) goes through the same
+        bounded ``run_probe``; the runner holds the run-wide default and resolves
+        each probe's effective timeout, so a hung command is recorded as a
+        timed-out result rather than hanging the battery. An isolated timeout is
+        recorded and the loop continues; after :data:`MAX_CONSECUTIVE_TIMEOUTS`
+        consecutive timed-out results the host is judged wedged — the loop stops,
+        a note lands in ``detail``, and every probe captured before the wedge is
+        preserved. This caps wasted wall-time at ~K*timeout while losing no data.
+        """
         detail_probe = Probe(
             id="_detail", title="host detail", command=_HOST_DETAIL_COMMAND, tag=ProbeTag.READ_ONLY
         )
         detail = ssh.run_probe(host, detail_probe).stdout
-        results: list[ProbeResult] = [ssh.run_probe(host, probe) for probe in self._battery.ordered()]
+        results: list[ProbeResult] = []
+        consecutive_timeouts = 0
+        ordered_probes = self._battery.ordered()
+        for probe in ordered_probes:
+            result = ssh.run_probe(host, probe)
+            results.append(result)
+            consecutive_timeouts = consecutive_timeouts + 1 if result.timed_out else 0
+            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                not_run = [p.id for p in ordered_probes[len(results) :]]
+                detail = (
+                    f"{detail}\nbattery stopped: host wedged after {consecutive_timeouts} "
+                    f"consecutive probe timeouts; probes {not_run} not run"
+                )
+                break
         return HostRun(host_spec=spec, detail=detail, results=tuple(results))
