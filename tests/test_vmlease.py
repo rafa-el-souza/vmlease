@@ -1453,7 +1453,10 @@ class TestUploadValidation(unittest.TestCase):
 class TestResults(unittest.TestCase):
     def _run(self) -> model.HostRun:
         spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
-        res = (ProbeResult("P1", ProbeTag.READ_ONLY, 0, "ok", ""),)
+        res = (
+            ProbeResult("P1", ProbeTag.READ_ONLY, 0, "ok", ""),
+            ProbeResult("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
+        )
         return model.HostRun(host_spec=spec, detail="## os-release\nID=ubuntu", results=res)
 
     def test_filename_deterministic(self) -> None:
@@ -1465,6 +1468,9 @@ class TestResults(unittest.TestCase):
         self.assertEqual(doc["run_id"], "r1")
         self.assertEqual(doc["hosts"][0]["probes"][0]["id"], "P1")
         self.assertTrue(doc["hosts"][0]["probes"][0]["ok"])
+        self.assertFalse(doc["hosts"][0]["probes"][0]["timed_out"])  # normal probe
+        self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
+        self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
 
     def test_write_results_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -2187,6 +2193,8 @@ class TestCliRun(unittest.TestCase):
                 ])
             self.assertEqual(rc, 1)
             self.assertIn("teardown failed", buf.getvalue())
+            # the backstop reap names the host(s) it cleaned up (like `vmlease reap`)
+            self.assertIn("reaped vmlease-cli-run-ubuntu", buf.getvalue())
             # reap was attempted: list_labeled then destroy on the still-live host.
             self.assertTrue(prov.list_labeled(safety.make_run_id("cli-run")) == [])
 
