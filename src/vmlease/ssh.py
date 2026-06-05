@@ -29,8 +29,13 @@ if TYPE_CHECKING:
 
     from vmlease.model import Host, Probe
 
-SshSubprocessRunner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
+SshSubprocessRunner = Callable[[list[str], float], "subprocess.CompletedProcess[str]"]
 Sleeper = Callable[[float], None]
+
+# The run-wide default probe timeout (seconds) when a probe carries no per-probe
+# ``timeout``. Generous enough for the slowest legitimate probe; the per-probe
+# override (carried in the battery) is the escape hatch for known-slow commands.
+DEFAULT_PROBE_TIMEOUT = 600.0
 # A streaming runner: run ``argv``, deliver output to the callback as it arrives,
 # kill the process and raise :class:`SshError` if it outlives ``timeout`` seconds,
 # and return the exit code on normal completion. Injected so tests never open a
@@ -206,16 +211,34 @@ class OpenSshRunner:
         runner: SshSubprocessRunner | None = None,
         sleeper: Sleeper | None = None,
         stream_runner: StreamSubprocessRunner | None = None,
+        probe_timeout_default: float = DEFAULT_PROBE_TIMEOUT,
     ) -> None:
         self._operator = operator
         self._key = private_key_path
         self._run: SshSubprocessRunner = runner or _default_runner
         self._sleep: Sleeper = sleeper or time.sleep
         self._stream: StreamSubprocessRunner = stream_runner or _default_stream_runner
+        self._probe_timeout_default = probe_timeout_default
 
     def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+        """Run ``probe.command`` on ``host``, bounded by the effective timeout.
+
+        The effective timeout is the probe's own ``timeout`` when set, else the
+        runner's run-wide default. On :class:`subprocess.TimeoutExpired` the
+        bounded transport seam kills the local process; ``run_probe`` RECORDS a
+        timed-out :class:`ProbeResult` (sentinel exit ``124``, best-effort partial
+        output off the exception, ``timed_out=True``) rather than raising — a
+        timeout is data about the probe (treated like a non-zero exit, battery
+        continues), not a dead transport. The remote command is orphaned but dies
+        with the host that is destroyed seconds later (so no ``-tt`` is needed on
+        ``build_ssh_argv``).
+        """
+        timeout = probe.timeout if probe.timeout is not None else self._probe_timeout_default
         argv = build_ssh_argv(host, self._operator, self._key, probe.command)
-        proc = self._run(argv)
+        try:
+            proc = self._run(argv, timeout)
+        except subprocess.TimeoutExpired as exc:
+            return _timed_out_result(probe, timeout, exc)
         return ProbeResult(
             probe_id=probe.id,
             tag=probe.tag,
@@ -233,7 +256,7 @@ class OpenSshRunner:
         :meth:`wait_until_ready` — distinct from a probe's own non-zero exit.
         """
         argv = build_scp_argv(host, self._operator, self._key, local, remote)
-        proc = self._run(argv)
+        proc = self._run(argv, self._probe_timeout_default)
         if proc.returncode != 0:
             raise SshError(
                 f"upload of {local} to {self._operator}@{host.ipv4}:{remote} failed "
@@ -265,7 +288,7 @@ class OpenSshRunner:
         validate_upload_dir_source(local)
         validate_remote_dest(remote)
         argv = build_rsync_argv(host, self._operator, self._key, local, remote)
-        proc = self._run(argv)
+        proc = self._run(argv, self._probe_timeout_default)
         if proc.returncode != 0:
             raise SshError(
                 f"directory upload of {local} to {self._operator}@{host.ipv4}:{remote} failed "
@@ -324,8 +347,48 @@ class OpenSshRunner:
         raise SshError(f"host {host.name} ({host.ipv4}) not ready after {attempts} attempts")
 
 
-def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+def _default_runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` to completion, bounded by ``timeout`` seconds.
+
+    ``subprocess.run(timeout=…)`` drains both pipes concurrently (no full-pipe
+    deadlock) and, on expiry, kills the local process and raises
+    :class:`subprocess.TimeoutExpired` carrying whatever partial output was read.
+    The caller (:meth:`OpenSshRunner.run_probe`) turns that into a recorded
+    timed-out result rather than letting it propagate.
+    """
+    return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
+
+
+def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpired) -> ProbeResult:
+    """Build the recorded :class:`ProbeResult` for a probe that outlived ``timeout``.
+
+    Partial output is read best-effort off the exception (``str`` when the run was
+    text-mode, ``bytes`` decoded leniently, ``None``/absent → empty on a platform
+    that does not populate it); a sentinel exit ``124`` and ``timed_out=True`` mark
+    it. A "timed out after Ts" note is appended to stderr so the timeout is visible
+    in the results without having to read the flag.
+    """
+    note = f"probe timed out after {timeout}s"
+    stdout = _decode_partial(exc.stdout)
+    stderr = _decode_partial(exc.stderr)
+    stderr = f"{stderr}\n{note}" if stderr else note
+    return ProbeResult(
+        probe_id=probe.id,
+        tag=probe.tag,
+        exit_code=124,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=True,
+    )
+
+
+def _decode_partial(raw: str | bytes | None) -> str:
+    """Best-effort partial output off a :class:`subprocess.TimeoutExpired`."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return raw
 
 
 def _default_stream_runner(argv: list[str], on_output: Callable[[str], None], timeout: float) -> int:

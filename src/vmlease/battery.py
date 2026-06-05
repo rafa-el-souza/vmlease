@@ -72,13 +72,34 @@ def _parse_probe(index: int, raw: object) -> Probe:
     except ValueError as exc:
         valid = [t.value for t in ProbeTag]
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
+    timeout = _parse_timeout(index, raw)
     return Probe(
         id=str(raw["id"]),
         title=str(raw["title"]),
         command=str(raw["command"]),
         tag=tag,
         classifies=str(raw.get("classifies", "")),
+        timeout=timeout,
     )
+
+
+def _parse_timeout(index: int, raw: dict[object, object]) -> float | None:
+    """Parse the optional per-probe ``timeout`` (seconds).
+
+    Absent means ``None`` (use the runner's run-wide default — back-compatible).
+    A present value must be a positive number; a bool, a non-number, or a
+    non-positive value is a malformed battery and raises :class:`BatteryError`.
+    """
+    if "timeout" not in raw:
+        return None
+    value = raw["timeout"]
+    # ``bool`` is an ``int`` subclass — reject it explicitly so ``true``/``false``
+    # is not silently read as ``1``/``0``.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BatteryError(f"probe #{index} 'timeout' must be a positive number, got {value!r}")
+    if value <= 0:
+        raise BatteryError(f"probe #{index} 'timeout' must be positive, got {value!r}")
+    return float(value)
 
 
 def _assert_unique_ids(probes: tuple[Probe, ...]) -> None:

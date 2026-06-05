@@ -157,6 +157,14 @@ class TestModel(unittest.TestCase):
         self.assertTrue(ok.ok)
         self.assertFalse(bad.ok)
 
+    def test_probe_result_timed_out_defaults_false(self) -> None:
+        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        self.assertFalse(res.timed_out)
+
+    def test_probe_timeout_defaults_none(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertIsNone(p.timeout)
+
     def test_battery_ordered_groups_by_tag(self) -> None:
         b = battery_mod.parse_battery(_BATTERY_JSON)
         order = [p.tag for p in b.ordered()]
@@ -388,6 +396,40 @@ class TestBattery(unittest.TestCase):
         doc = {"name": "x", "probes": [
             {"id": "P", "title": "t", "command": "c", "tag": "read-only"},
             {"id": "P", "title": "t2", "command": "c2", "tag": "read-only"},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_absent_is_none(self) -> None:
+        # back-compat: a battery without per-probe timeout loads, timeout None.
+        b = battery_mod.parse_battery(_BATTERY_JSON)
+        self.assertIsNone(b.probes[0].timeout)
+
+    def test_parse_timeout_value_carried(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 42},
+        ]}
+        b = battery_mod.parse_battery(json.dumps(doc))
+        self.assertEqual(b.probes[0].timeout, 42.0)
+
+    def test_parse_timeout_non_positive_raises(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 0},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_non_numeric_raises(self) -> None:
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": "soon"},
+        ]}
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(json.dumps(doc))
+
+    def test_parse_timeout_bool_rejected(self) -> None:
+        # bool is an int subclass; ``true`` must not be silently read as ``1``.
+        doc = {"name": "x", "probes": [
+            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": True},
         ]}
         with self.assertRaises(battery_mod.BatteryError):
             battery_mod.parse_battery(json.dumps(doc))
@@ -878,10 +920,74 @@ class TestSsh(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking=accept-new", argv)
 
     def test_run_probe_captures_exit(self) -> None:
-        r = OpenSshRunnerForTest(_fake_subprocess(7, "out", "err"))
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(7, "out", "err"))
         probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
         res = r.run_probe(self._host(), probe)
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
+        self.assertFalse(res.timed_out)  # a within-timeout probe is not a timeout
+
+    def test_run_probe_blocking_seam_records_timed_out_result(self) -> None:
+        # T1: a slow/blocking transport that raises TimeoutExpired is RECORDED as a
+        # timed-out result (exit 124, timed_out=True, partial output), not raised
+        # and not a hang.
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout, output="partial-out", stderr="partial-err")
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.exit_code, 124)
+        self.assertFalse(res.ok)
+        self.assertIn("partial-out", res.stdout)  # best-effort partial preserved
+        self.assertIn("partial-err", res.stderr)
+        self.assertIn("timed out after", res.stderr)  # the note is appended
+
+    def test_run_probe_timeout_empty_partial_is_fine(self) -> None:
+        # a platform that doesn't populate partial output → empty, still recorded.
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.stdout, "")
+        self.assertIn("timed out after", res.stderr)
+
+    def test_run_probe_resolves_per_probe_timeout(self) -> None:
+        # the probe's own timeout wins over the runner default and reaches the seam.
+        seen: list[float] = []
+
+        def capture(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner(
+            "probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None, probe_timeout_default=600.0
+        )
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY, timeout=12.5)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(seen, [12.5])
+
+    def test_run_probe_uses_runner_default_when_probe_has_none(self) -> None:
+        seen: list[float] = []
+
+        def capture(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner(
+            "probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None, probe_timeout_default=77.0
+        )
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(seen, [77.0])
+
+    def test_build_ssh_argv_has_no_tt(self) -> None:
+        # the probe argv must NOT force a PTY (-tt) — that would merge stdout/stderr.
+        argv = ssh.build_ssh_argv(self._host(), "probe", Path("/tmp/k"), "id")
+        self.assertNotIn("-tt", argv)
 
     def test_build_scp_argv(self) -> None:
         argv = ssh.build_scp_argv(self._host(), "probe", Path("/tmp/k"), Path("/src/w.whl"), "~/w.whl")
@@ -898,7 +1004,7 @@ class TestSsh(unittest.TestCase):
     def test_upload_runs_scp_via_seam(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -909,7 +1015,7 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(seen[0][-1], "probe@9.9.9.9:~/w.whl")
 
     def test_upload_raises_ssh_error_on_nonzero(self) -> None:
-        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1, "", "no route"), sleeper=lambda _x: None)
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(1, "", "no route"), sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.upload(self._host(), Path("/src/w.whl"), "~/w.whl")
 
@@ -919,7 +1025,7 @@ class TestSsh(unittest.TestCase):
         seq = [1, 1, 0, 0]
         calls = {"n": 0}
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             rc = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
             return subprocess.CompletedProcess(argv, rc, "6.9.0-arch1\n", "")
@@ -930,7 +1036,7 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(calls["n"], 4)  # 3 sentinel polls + 1 module-tree assertion
 
     def test_wait_until_ready_times_out(self) -> None:
-        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(1), sleeper=lambda _x: None)
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(1), sleeper=lambda _x: None)
         with self.assertRaises(ssh.SshError):
             r.wait_until_ready(self._host(), attempts=2)
 
@@ -949,7 +1055,7 @@ class TestSsh(unittest.TestCase):
         # with the running kernel on stdout: readiness must fail with the skew.
         seen_commands: list[str] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             command = argv[-1]
             seen_commands.append(command)
             if command == "test -f /var/lib/vmlease-ready":
@@ -968,7 +1074,7 @@ class TestSsh(unittest.TestCase):
 
     def test_wait_until_ready_healthy_host_passes(self) -> None:
         # sentinel present AND module-tree probe exits 0 → ready, returns normally.
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(argv, 0, "6.9.0-arch1\n", "")
 
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
@@ -988,7 +1094,7 @@ class TestSsh(unittest.TestCase):
         ]
         calls = {"n": 0}
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             rc, out = seq[min(calls["n"], len(seq) - 1)]
             calls["n"] += 1
             return subprocess.CompletedProcess(argv, rc, out, "")
@@ -1075,7 +1181,7 @@ class TestSsh(unittest.TestCase):
     def test_upload_dir_runs_rsync_via_seam(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1087,14 +1193,14 @@ class TestSsh(unittest.TestCase):
 
     def test_upload_dir_raises_ssh_error_on_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_subprocess(23, "", "rsync failed"))
+            r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=_fake_ssh_subprocess(23, "", "rsync failed"))
             with self.assertRaises(ssh.SshError):
                 r.upload_dir(self._host(), Path(d), "~/dest")
 
     def test_upload_dir_validates_source_before_transfer(self) -> None:
         seen: list[list[str]] = []
 
-        def runner_fn(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        def runner_fn(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
             seen.append(argv)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1104,7 +1210,20 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(seen, [])  # validated fail-closed before any rsync
 
 
-def OpenSshRunnerForTest(runner_fn: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> ssh.OpenSshRunner:
+def _fake_ssh_subprocess(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> Callable[[list[str], float], subprocess.CompletedProcess[str]]:
+    """A 2-arg (argv, timeout) ssh subprocess seam returning a fixed result."""
+
+    def _run(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    return _run
+
+
+def OpenSshRunnerForTest(
+    runner_fn: Callable[[list[str], float], subprocess.CompletedProcess[str]],
+) -> ssh.OpenSshRunner:
     return ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
 
 
@@ -1538,6 +1657,91 @@ class TestWorkloadSeam(unittest.TestCase):
         items = runner.plan(runner.Matrix(wl, ("ubuntu",), "cpx22", "run-ps"))
         self.assertEqual(items[0].workload_summary, "probes=3")
         self.assertEqual(items[0].workload_summary, wl.plan_summary)
+
+
+class _ScriptedTimeoutSsh:
+    """An SshRunner whose ``run_probe`` returns timed-out results for named probes.
+
+    ``timeout_ids`` is the set of probe ids that come back ``timed_out`` (exit 124);
+    everything else (including the ``_detail`` snapshot) returns a normal exit-0
+    result. For exercising the consecutive-timeout breaker without a real socket.
+    """
+
+    def __init__(self, timeout_ids: set[str]) -> None:
+        self._timeout_ids = timeout_ids
+        self.ran: list[str] = []
+
+    def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+        self.ran.append(probe.id)
+        if probe.id in self._timeout_ids:
+            return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
+        return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+    def wait_until_ready(self, host: Host) -> None:
+        return None
+
+    def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+        return 0
+
+    def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+
+class TestProbeWorkloadBreaker(unittest.TestCase):
+    """T1b: timeout does not abort the battery; K consecutive timeouts stop it."""
+
+    def _battery(self) -> model.Battery:
+        # four probes, all read-only so ordered() == authoring order (stable rank).
+        doc = {"name": "b", "probes": [
+            {"id": "Q1", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q2", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q3", "title": "t", "command": "c", "tag": "read-only"},
+            {"id": "Q4", "title": "t", "command": "c", "tag": "read-only"},
+        ]}
+        return battery_mod.parse_battery(json.dumps(doc))
+
+    def _spec(self) -> model.HostSpec:
+        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu")
+
+    def _host(self) -> Host:
+        return Host(id="1", name="n", ipv4="9.9.9.9")
+
+    def test_isolated_timeout_continues_battery(self) -> None:
+        # one timeout in the middle, the next probe NOT a timeout → battery runs on,
+        # every later probe's result is present.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q2"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([r.probe_id for r in run.results], ["Q1", "Q2", "Q3", "Q4"])
+        self.assertTrue(run.results[1].timed_out)  # the isolated timeout is recorded
+        self.assertFalse(run.results[3].timed_out)  # later probes still ran
+        self.assertNotIn("battery stopped", run.detail)
+
+    def test_k_consecutive_timeouts_stop_battery(self) -> None:
+        # Q2 and Q3 both time out (K=2) → battery stops; Q4 is NOT run; prior
+        # results (Q1, Q2, Q3) are preserved and the detail carries the note.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q2", "Q3"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([r.probe_id for r in run.results], ["Q1", "Q2", "Q3"])  # Q4 not run
+        self.assertNotIn("Q4", ssh_fake.ran)  # the breaker really stopped the loop
+        self.assertIn("battery stopped", run.detail)
+        self.assertIn("2 consecutive probe timeouts", run.detail)
+        self.assertIn("'Q4'", run.detail)  # names the probe(s) not run
+
+    def test_non_consecutive_timeouts_do_not_trip(self) -> None:
+        # Q1 and Q3 time out but Q2 resets the counter → never K-in-a-row, full run.
+        wl = workload.ProbeWorkload(self._battery())
+        ssh_fake = _ScriptedTimeoutSsh({"Q1", "Q3"})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(len(run.results), 4)  # all four ran
+        self.assertNotIn("battery stopped", run.detail)
+
+    def test_breaker_constant_default_is_two(self) -> None:
+        self.assertEqual(workload.MAX_CONSECUTIVE_TIMEOUTS, 2)
 
 
 # --------------------------------------------------------------------------- #
