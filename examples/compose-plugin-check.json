@@ -1,0 +1,12 @@
+{
+  "name": "vmlease-compose-plugin-check",
+  "probes": [
+    {
+      "id": "COMPOSE",
+      "title": "Prove the vmlease docker-compose-plugin fix: a freshly-provisioned host has a working `docker compose` (incl. the exact `docker compose -f` that failed on debian-13)",
+      "command": "rc=0; . /etc/os-release; echo \"distro: $PRETTY_NAME\"; echo \"docker client: $(docker version --format '{{.Client.Version}}' 2>&1)\"; echo '== docker compose version (the plugin must be installed) =='; docker compose version > /tmp/cv.out 2>&1; CV=$?; cat /tmp/cv.out; ( [ \"$CV\" -eq 0 ] && echo COMPOSE_PLUGIN_PRESENT_OK || { echo COMPOSE_PLUGIN_MISSING_FAIL; rc=1; } ); echo '== compose plugin on disk =='; ls -la \"$HOME/.docker/cli-plugins/\" /usr/libexec/docker/cli-plugins/ /usr/lib/docker/cli-plugins/ /usr/local/lib/docker/cli-plugins/ 2>/dev/null | grep -i compose || echo 'none in standard dirs (plugin may be vendored in the docker pkg)'; echo '== the EXACT previously-failing invocation: docker compose -f <file> config =='; printf 'services:\\n  hello:\\n    image: busybox:latest\\n    command: [\"true\"]\\n' > /tmp/dc.yml; docker compose -f /tmp/dc.yml config > /tmp/cfg.out 2>&1; CFG=$?; echo \"docker compose -f ... config exit: $CFG\"; head -8 /tmp/cfg.out; ( [ \"$CFG\" -eq 0 ] && echo COMPOSE_DASH_F_OK || { echo COMPOSE_DASH_F_FAIL; rc=1; } ); echo '== regression guard: the pre-fix error must be ABSENT =='; if grep -qiE \"unknown shorthand flag: 'f'|unknown command: docker compose\" /tmp/cfg.out /tmp/cv.out; then echo COMPOSE_PREFIX_ERROR_PRESENT_FAIL; rc=1; else echo COMPOSE_NO_PREFIX_ERROR_OK; fi; echo '== docker buildx plugin (needed for compose --build; debian-13 lacked it) =='; docker buildx version > /tmp/bx.out 2>&1; ( [ \"$?\" -eq 0 ] && echo BUILDX_PLUGIN_PRESENT_OK || { echo BUILDX_PLUGIN_MISSING_FAIL; rc=1; cat /tmp/bx.out; } ); echo '== script(1) test tool (fedora splits it into util-linux-script) =='; command -v script >/dev/null 2>&1 && { script --version 2>&1 | head -1; echo SCRIPT_TOOL_PRESENT_OK; } || { echo SCRIPT_TOOL_MISSING_FAIL; rc=1; }; exit $rc",
+      "tag": "read-only",
+      "classifies": "Proves vmlease's install-template fix (docker-compose-plugin added to apt/dnf; docker-compose for arch): a freshly-provisioned host has a working compose-v2 plugin. `docker compose version` exit 0; `docker compose -f <file> config` exit 0 (the exact form that died with 'unknown shorthand flag: f' on debian-13 pre-fix); and the pre-fix error strings are absent. read-only (no host mutation beyond /tmp)."
+    }
+  ]
+}
