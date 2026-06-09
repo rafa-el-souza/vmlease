@@ -19,6 +19,7 @@ operator's already-active ``hcloud`` context; the token is never read here.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -37,6 +38,7 @@ from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import TEARDOWN_WARNING_PREFIX, Matrix, RescueWriter, execute, plan
 from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, UploadError, make_run_id, reap
 from vmlease.ssh import OpenSshRunner
+from vmlease.summary import overall_exit_code, summarize_results, summary_filename, write_summary
 from vmlease.workload import ProbeWorkload, Workload
 
 
@@ -238,6 +240,45 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     return 0
 
 
+def _cmd_summarize(args: argparse.Namespace) -> int:
+    """Read a raw results file, write a versioned summary companion, gate on exit.
+
+    Default output is ``<stem>.summary.json`` beside the raw file (``--out`` overrides).
+    Missing/malformed raw input (or a bad ``--battery``) is an error to stderr with
+    exit 2 and no summary written; otherwise the exit code is the overall verdict.
+    """
+    raw_path = Path(args.raw)
+    try:
+        raw_text = raw_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot read results file {raw_path}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        raw_doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        print(f"error: results file {raw_path} is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+
+    battery = None
+    if args.battery:
+        try:
+            battery = load_battery(Path(args.battery))
+        except BatteryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        summary = summarize_results(raw_doc, battery=battery, source_raw=str(raw_path))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    out_path = Path(args.out) if args.out else raw_path.parent / summary_filename(raw_path)
+    write_summary(summary, out_path)
+    print(f"summary: {out_path}")
+    return overall_exit_code(summary)
+
+
 def _cmd_reap(args: argparse.Namespace) -> int:
     run_id = make_run_id(args.run_token)
     try:
@@ -314,6 +355,20 @@ def build_parser() -> argparse.ArgumentParser:
     status_p = sub.add_parser("status", help="list live hosts for a run-token")
     status_p.add_argument("--run-token", required=True, help="the run-token whose hosts to list")
     status_p.set_defaults(func=_cmd_status)
+
+    summarize_p = sub.add_parser(
+        "summarize", help="read a raw results file -> write a versioned .summary.json (exit = verdict)"
+    )
+    summarize_p.add_argument("raw", help="path to a raw vmlease results JSON file")
+    summarize_p.add_argument(
+        "--battery", default="",
+        help="optional battery JSON: authoritative probe-id->command labels + declared-but-not-run detection",
+    )
+    summarize_p.add_argument(
+        "--out", default="",
+        help="explicit summary output path (default: <stem>.summary.json beside the raw file)",
+    )
+    summarize_p.set_defaults(func=_cmd_summarize)
 
     reap_p = sub.add_parser("reap", help="destroy all hosts for a run-token (orphan backstop)")
     reap_p.add_argument("--run-token", required=True, help="the run-token whose hosts to destroy")

@@ -28,6 +28,7 @@ vmlease run    --battery <f.json> --run-token <slug> \          # provision -> p
                --operator probe --results-dir <dir> [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
+vmlease summarize <raw-results.json> [--battery <b.json>] [--out <s.json>]  # ONE canonical reader -> .summary.json
 ```
 
 The Hetzner provider relies on the operator's active `hcloud` context (configured out of band).
@@ -43,6 +44,25 @@ and `run` emit non-fatal `warning:`s for both (see `lint_battery`):
   wrong reason.
 - **A probe's `ok` is its command's exit code** — so gate assertions with `exit $rc`. A command ending in
   `… && echo OK || echo FAIL` always exits 0, so `ok` is `true` no matter which token it printed.
+
+### Summarizing results (`vmlease summarize`)
+
+A raw results file records each probe's `ok` as *only its exit code* — but the real "did it pass?" lives
+in `*_OK` / `*_FAIL` assertion tokens the probe prints to stdout (the vacuous-ok footgun). `summarize` is
+the ONE canonical reader: it writes a versioned `<stem>.summary.json` companion beside the raw file (the
+raw file is never mutated) and exits with the overall verdict so a caller can gate without parsing:
+
+```
+vmlease summarize results/vmlease-run-ts.json; echo $?   # 0 = all PASS/PASS_NO_ASSERTIONS, non-zero otherwise
+```
+
+The summary carries `schema_version: "1"`; per host its `distro`/`image`/`detail` + a probe record each
+with a computed `verdict`, the four harvested token buckets, and bounded stdout/stderr tails; a `matrix`
+pivot (canonical command × distro, collapsed worst-of); and `totals` by verdict. The per-probe verdict is
+deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit → `FAIL`; else zero exit
+with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) → `PASS_NO_ASSERTIONS`. Pass
+`--battery <b.json>` to use authoritative command labels and surface declared-but-not-run probes per host;
+without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
 
 ## Development
 
