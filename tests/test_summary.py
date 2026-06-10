@@ -12,21 +12,44 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from vmlease import cli, summary
-from vmlease.battery import parse_battery
+from vmlease import cli, model, summary
+from vmlease.battery import load_battery
 
-_BATTERY_JSON = json.dumps(
-    {
-        "name": "summary-demo",
-        "probes": [
-            {"id": "start", "title": "start the sandbox", "command": "true",
-             "tag": "mutating:host-root", "classifies": "sandbox start"},
-            {"id": "status-stopped", "title": "status while stopped", "command": "true",
-             "tag": "read-only", "classifies": "sandbox status"},
-            {"id": "destroy", "title": "destroy", "command": "true",
-             "tag": "mutating:host-root", "classifies": "sandbox destroy"},
-        ],
-    }
+
+def _battery_toml(name: str, probes: tuple[dict[str, str], ...]) -> str:
+    """Build a ``battery.toml`` manifest from probe dicts (id/title/run/tag/classifies)."""
+    lines = [f"name = '''{name}'''", ""]
+    for p in probes:
+        lines.append("[[probe]]")
+        for key in ("id", "title", "tag", "classifies"):
+            if key in p:
+                lines.append(f"{key} = '''{p[key]}'''")
+        lines.append(f"run = '''{p['run']}'''")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _write_battery(d: str, manifest: str) -> Path:
+    p = Path(d) / "battery.toml"
+    p.write_text(manifest, encoding="utf-8")
+    return p
+
+
+def _load_battery(manifest: str) -> model.Battery:
+    with tempfile.TemporaryDirectory() as d:
+        return load_battery(_write_battery(d, manifest))
+
+
+_BATTERY_MANIFEST = _battery_toml(
+    "summary-demo",
+    (
+        {"id": "start", "title": "start the sandbox", "run": "true",
+         "tag": "mutating:host-root", "classifies": "sandbox start"},
+        {"id": "status-stopped", "title": "status while stopped", "run": "true",
+         "tag": "read-only", "classifies": "sandbox status"},
+        {"id": "destroy", "title": "destroy", "run": "true",
+         "tag": "mutating:host-root", "classifies": "sandbox destroy"},
+    ),
 )
 
 
@@ -145,7 +168,7 @@ class TestSummarizeResults(unittest.TestCase):
         self.assertEqual(len(probe["stderr_tail"]), summary.TAIL_LEN)
 
     def test_battery_overlay_and_declared_but_not_run(self) -> None:
-        battery = parse_battery(_BATTERY_JSON)
+        battery = _load_battery(_BATTERY_MANIFEST)
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [
             _probe("start", stdout="A_OK"),
             _probe("status-stopped", stdout="B_OK"),
@@ -159,15 +182,12 @@ class TestSummarizeResults(unittest.TestCase):
     def test_builtin_label_wins_and_matrix_keys_stay_clean_with_battery(self) -> None:
         # A battery whose `classifies` for a KNOWN id is a long sentence (not a
         # label) must NOT pollute the command/matrix key — the builtin wins.
-        battery = parse_battery(json.dumps({
-            "name": "noisy",
-            "probes": [
-                {"id": "start", "title": "t", "command": "true", "tag": "mutating:host-root",
-                 "classifies": "a very long human sentence describing what start does in detail"},
-                {"id": "novel-probe", "title": "novel title", "command": "true",
-                 "tag": "read-only", "classifies": "novel classifies label"},
-            ],
-        }))
+        battery = _load_battery(_battery_toml("noisy", (
+            {"id": "start", "title": "t", "run": "true", "tag": "mutating:host-root",
+             "classifies": "a very long human sentence describing what start does in detail"},
+            {"id": "novel-probe", "title": "novel title", "run": "true",
+             "tag": "read-only", "classifies": "novel classifies label"},
+        )))
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [
             _probe("start", stdout="A_OK"),
             _probe("novel-probe", stdout="B_OK"),
@@ -268,8 +288,7 @@ class TestCliSummarize(unittest.TestCase):
             raw = self._write_raw(d, [{"distro": "ubuntu", "image": "u", "detail": "",
                                        "probes": [_probe("start", stdout="A_OK"),
                                                   _probe("status-stopped", stdout="B_OK")]}])
-            bpath = Path(d) / "b.json"
-            bpath.write_text(_BATTERY_JSON, encoding="utf-8")
+            bpath = _write_battery(d, _BATTERY_MANIFEST)
             out = Path(d) / "s.json"
             rc = cli.main(["summarize", str(raw), "--battery", str(bpath), "--out", str(out)])
             self.assertEqual(rc, 0)
@@ -300,8 +319,8 @@ class TestCliSummarize(unittest.TestCase):
     def test_bad_battery_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             raw = self._write_raw(d, [])
-            bpath = Path(d) / "b.json"
-            bpath.write_text("{nope", encoding="utf-8")
+            bpath = Path(d) / "battery.toml"
+            bpath.write_text("name = ", encoding="utf-8")
             err = io.StringIO()
             with redirect_stderr(err):
                 rc = cli.main(["summarize", str(raw), "--battery", str(bpath)])
