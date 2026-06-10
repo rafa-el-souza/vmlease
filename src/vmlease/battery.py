@@ -10,13 +10,13 @@ Format (JSON): ``{"name": "...", "probes": [{"id","title","command","tag",
 "classifies"?}, ...]}``. ``tag`` is one of the :class:`~vmlease.model.ProbeTag`
 values.
 
-**Authoring caveats** (:func:`lint_battery` warns about both): probes EXECUTE in
-**tag-rank** order (read-only -> operator-space -> host-root; stable within rank —
-see :meth:`~vmlease.model.Battery.ordered`), **NOT authoring order** — a verifier
-that must run AFTER a host-root setup probe has to be tagged so it sorts after it.
-And a probe's ``ok`` is its command's **exit code**, so gate assertions with
-``exit $rc`` (a command ending in ``echo OK`` / ``echo FAIL`` always exits 0 → a
-vacuous ``ok`` that ignores what it printed).
+**Authoring caveat** (:func:`lint_battery` warns about it): probes EXECUTE in
+**authoring order** — the order they appear in the ``probes`` array is the order
+they run and are recorded; ``tag`` records what a probe touches and governs sudo
+escalation but does NOT reorder execution. A probe's ``ok`` is its command's
+**exit code**, so gate assertions with ``exit $rc`` (a command ending in
+``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
+it printed).
 """
 
 from __future__ import annotations
@@ -113,29 +113,18 @@ def _assert_unique_ids(probes: tuple[Probe, ...]) -> None:
 def lint_battery(battery: Battery) -> tuple[str, ...]:
     """Non-fatal authoring warnings for a battery (never raises; ``()`` = clean).
 
-    The probe-workload contract is correct but makes two footguns easy to hit; this
-    surfaces them without changing the specced execution order or ``ok`` semantics:
+    Probes execute in **authoring order**, so there is no reorder to surprise an
+    author; the surviving footgun is ``ok`` semantics:
 
-    1. **order-surprise** — probes execute in **tag-rank** order (read-only ->
-       operator-space -> host-root, stable within rank; :meth:`Battery.ordered`),
-       NOT authoring order. A "set up then verify" author whose verifier is tagged
-       read-only/operator-space will see it run BEFORE the host-root setup it checks.
-    2. **vacuous-ok** — a probe's ``ok`` is its command's exit code. A command that
-       prints OK/FAIL tokens but is not ``exit``-gated always exits 0, so ``ok`` is
-       meaningless regardless of what it printed. Gate with ``exit $rc``.
+    - **vacuous-ok** — a probe's ``ok`` is its command's exit code. A command that
+      prints OK/FAIL tokens but is not ``exit``-gated always exits 0, so ``ok`` is
+      meaningless regardless of what it printed. Gate with ``exit $rc``.
 
     The vacuous-ok check is a best-effort heuristic (the shell is not parsed); the
     real guarantee is still the author's ``exit $rc``. Warnings are advisory — the
-    run, the execution order, and ``ok`` are all unaffected.
+    run and ``ok`` are unaffected.
     """
     warnings: list[str] = []
-    authored = [p.id for p in battery.probes]
-    executed = [p.id for p in battery.ordered()]
-    if authored != executed:
-        warnings.append(
-            f"execution order is tag-rank, NOT authoring order: "
-            f"authored {authored} -> executes {executed}"
-        )
     for probe in battery.probes:
         if _looks_vacuously_ok(probe.command):
             warnings.append(

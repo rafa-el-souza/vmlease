@@ -94,7 +94,7 @@ def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
 
 
 def _warn_battery(battery: Battery) -> None:
-    """Print non-fatal authoring warnings (tag-order surprise, vacuous ok) to stderr."""
+    """Print non-fatal authoring warnings (vacuous ok) to stderr."""
     for w in lint_battery(battery):
         print(f"warning: {w}", file=sys.stderr)
 

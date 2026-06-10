@@ -176,25 +176,26 @@ class TestModel(unittest.TestCase):
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertIsNone(p.timeout)
 
-    def test_battery_ordered_groups_by_tag(self) -> None:
-        b = battery_mod.parse_battery(_BATTERY_JSON)
-        order = [p.tag for p in b.ordered()]
-        self.assertEqual(
-            order,
-            [model.ProbeTag.READ_ONLY, model.ProbeTag.MUTATING_OPERATOR_SPACE, model.ProbeTag.MUTATING_HOST_ROOT],
-        )
+    def test_probe_source_defaults_empty(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertEqual(p.source, "")
 
-    def test_battery_ordered_stable_within_group(self) -> None:
-        # two host-root probes keep authoring order (the dependency order)
+    def test_probe_source_carries_provenance(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY, source="prep.sh")
+        self.assertEqual(p.source, "prep.sh")
+
+    def test_battery_probes_preserve_authoring_order(self) -> None:
+        # probes run + record in authoring order regardless of tag; a read-only
+        # probe authored AFTER a host-root probe stays after it (no tag-rank sort).
         doc = {
             "name": "x",
             "probes": [
-                {"id": "B2", "title": "second", "command": "c", "tag": "mutating:host-root"},
-                {"id": "B1", "title": "first", "command": "c", "tag": "mutating:host-root"},
+                {"id": "SETUP", "title": "setup", "command": "c", "tag": "mutating:host-root"},
+                {"id": "VERIFY", "title": "verify", "command": "c", "tag": "read-only"},
             ],
         }
         b = battery_mod.parse_battery(json.dumps(doc))
-        self.assertEqual([p.id for p in b.ordered()], ["B2", "B1"])
+        self.assertEqual([p.id for p in b.probes], ["SETUP", "VERIFY"])
 
 
 # --------------------------------------------------------------------------- #
@@ -512,22 +513,14 @@ class TestBatteryLint(unittest.TestCase):
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def test_order_surprise_warns_with_both_orders(self) -> None:
-        # authored host-root THEN read-only → executes read-only first (tag-rank)
+    def test_no_order_warning_for_mixed_tag_order(self) -> None:
+        # a read-only probe authored AFTER a host-root probe no longer warns —
+        # execution is authoring order, so there is no reorder to surprise on.
         b = self._b(
             self._p("SETUP", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
             self._p("VERIFY", "check; exit $?", ProbeTag.READ_ONLY),
         )
-        warns = battery_mod.lint_battery(b)
-        self.assertTrue(any("tag-rank" in w for w in warns))
-        self.assertTrue(any("VERIFY" in w and "SETUP" in w for w in warns))
-
-    def test_order_matching_authoring_has_no_order_warning(self) -> None:
-        b = self._b(
-            self._p("A", "uname -a; exit $?", ProbeTag.READ_ONLY),
-            self._p("B", "do; exit $?", ProbeTag.MUTATING_HOST_ROOT),
-        )
-        self.assertFalse(any("tag-rank" in w for w in battery_mod.lint_battery(b)))
+        self.assertEqual(battery_mod.lint_battery(b), ())
 
     def test_vacuous_ok_conditional_echo_warns(self) -> None:
         b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
@@ -1518,7 +1511,7 @@ class TestExecute(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertEqual(len(prov.created), 2)
         self.assertEqual(len(prov.destroyed), 2)  # ALWAYS torn down
-        # battery ran in tag order on each host (P1 read-only first, P12 host-root last)
+        # battery ran in authoring order on each host (P1 first, P12 authored last)
         self.assertEqual(fssh.ran[-1], "P12")
 
     def _upload_matrix(self, remote: str = "~/w.whl") -> tuple[runner.Matrix, Path]:
@@ -1940,7 +1933,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
     """T1b: timeout does not abort the battery; K consecutive timeouts stop it."""
 
     def _battery(self) -> model.Battery:
-        # four probes, all read-only so ordered() == authoring order (stable rank).
+        # four probes; they run in authoring order Q1..Q4.
         doc = {"name": "b", "probes": [
             {"id": "Q1", "title": "t", "command": "c", "tag": "read-only"},
             {"id": "Q2", "title": "t", "command": "c", "tag": "read-only"},
@@ -1988,6 +1981,19 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
 
     def test_breaker_constant_default_is_two(self) -> None:
         self.assertEqual(workload.MAX_CONSECUTIVE_TIMEOUTS, 2)
+
+    def test_mixed_tag_battery_runs_in_authoring_order(self) -> None:
+        # a host-root probe authored before a read-only one executes (and records)
+        # first — authoring order, not tag-rank; the read-only verifier runs after.
+        doc = {"name": "b", "probes": [
+            {"id": "SETUP", "title": "t", "command": "c", "tag": "mutating:host-root"},
+            {"id": "VERIFY", "title": "t", "command": "c", "tag": "read-only"},
+        ]}
+        wl = workload.ProbeWorkload(battery_mod.parse_battery(json.dumps(doc)))
+        ssh_fake = _ScriptedTimeoutSsh(set())
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(ssh_fake.ran, ["_detail", "SETUP", "VERIFY"])
+        self.assertEqual([r.probe_id for r in run.results], ["SETUP", "VERIFY"])
 
 
 # --------------------------------------------------------------------------- #

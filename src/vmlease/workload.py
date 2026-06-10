@@ -67,8 +67,8 @@ class ProbeWorkload:
     """The probe battery as a :class:`Workload`: host-detail snapshot + battery.
 
     Byte-faithful to the pre-seam probe path: it captures the self-describing
-    host-detail snapshot as the results header, then runs the battery in tag
-    order, returning one :class:`~vmlease.model.HostRun`. Readiness and upload
+    host-detail snapshot as the results header, then runs the battery in
+    authoring order, returning one :class:`~vmlease.model.HostRun`. Readiness and upload
     staging are NOT here — the runner owns them (they are transport-generic,
     shared by every workload).
     """
@@ -99,13 +99,13 @@ class ProbeWorkload:
         detail = ssh.run_probe(host, detail_probe).stdout
         results: list[ProbeResult] = []
         consecutive_timeouts = 0
-        ordered_probes = self._battery.ordered()
-        for probe in ordered_probes:
+        probes = self._battery.probes
+        for probe in probes:
             result = ssh.run_probe(host, probe)
             results.append(result)
             consecutive_timeouts = consecutive_timeouts + 1 if result.timed_out else 0
             if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-                not_run = [p.id for p in ordered_probes[len(results) :]]
+                not_run = [p.id for p in probes[len(results) :]]
                 detail = (
                     f"{detail}\nbattery stopped: host wedged after {consecutive_timeouts} "
                     f"consecutive probe timeouts; probes {not_run} not run"
