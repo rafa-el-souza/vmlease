@@ -12,7 +12,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 .DEFAULT_GOAL := help
-.PHONY: help install lint format typecheck test coverage check hooks clean
+.PHONY: help install lint lint-battery format typecheck test coverage check hooks clean
 
 help:  ## show this help
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -22,6 +22,9 @@ install:  ## sync the env + dev tools
 
 lint:  ## strict lint, no autofix
 	@uv run --quiet ruff check -q --output-format concise src tests && echo "✓ lint clean (exit 0)"
+
+lint-battery:  ## shellcheck the example battery bundle (severity-gated gate; requires shellcheck)
+	@uv run --quiet vmlease lint --battery examples/compose-plugin-check/battery.toml --severity error --require-shellcheck
 
 format:  ## apply ruff's SAFE autofixes (NOT `ruff format`, which is banned)
 	@uv run --quiet ruff check --fix src tests

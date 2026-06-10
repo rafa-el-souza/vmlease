@@ -1030,6 +1030,108 @@ class TestCli(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# cli — lint subcommand (severity-gated shellcheck gate; injected runner seam)
+# --------------------------------------------------------------------------- #
+class TestCliLint(unittest.TestCase):
+    def _write(self, d: str, run: str = "uname -r") -> str:
+        manifest = _battery_toml("lint-cli", (
+            {"id": "P", "title": "p", "run": run, "tag": "read-only"},
+        ))
+        return _write_battery_bundle(d, manifest)
+
+    def _runner(
+        self, stdout: str, *, returncode: int = 1
+    ) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+        return _run
+
+    def _unavailable_runner(self) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("shellcheck")
+
+        return _run
+
+    def _run_lint(
+        self,
+        argv: list[str],
+        runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]],
+    ) -> tuple[int, str, str]:
+        ns = cli.build_parser().parse_args(argv)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli._cmd_lint(ns, runner=runner)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_clean_battery_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)], self._runner("", returncode=0)
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("battery: lint-cli", out)
+            self.assertIn("threshold: error", out)
+
+    def test_error_finding_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)],
+                self._runner("-:1:1: error: syntax boom [SC1009]\n"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("SC1009", out)
+            self.assertIn("syntax boom", out)
+
+    def test_severity_warning_flips_warning_only_battery_to_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            sample = "-:1:7: warning: masking return values [SC2155]\n"
+            # at default `error`: a warning-only battery passes (exit 0)
+            rc_default, _, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)], self._runner(sample)
+            )
+            self.assertEqual(rc_default, 0)
+            # tightened to `warning`: the same finding now fails the gate
+            rc_strict, _, _ = self._run_lint(
+                ["lint", "--battery", self._write(d), "--severity", "warning"],
+                self._runner(sample),
+            )
+            self.assertEqual(rc_strict, 1)
+
+    def test_unavailable_skips_with_notice_and_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            # a vacuously-ok probe so the advisory check still has something to print
+            manifest = _battery_toml("lint-cli", (
+                {"id": "P", "title": "p", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
+            self.assertEqual(rc, 0)
+            self.assertIn("shellcheck unavailable", err)
+            self.assertIn("warning:", err)  # advisory vacuous-ok still printed
+
+    def test_unavailable_with_require_shellcheck_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", self._write(d), "--require-shellcheck"],
+                self._unavailable_runner(),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+            self.assertIn("shellcheck", err)
+
+    def test_malformed_battery_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "battery.toml"
+            p.write_text("name = ", encoding="utf-8")
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", str(p)], self._runner("", returncode=0)
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("error:", err)
+
+
+# --------------------------------------------------------------------------- #
 # templating
 # --------------------------------------------------------------------------- #
 class TestTemplating(unittest.TestCase):

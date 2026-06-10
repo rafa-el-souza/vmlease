@@ -23,12 +23,13 @@ capture structured results, and guarantee teardown.
 ## CLI
 
 ```
-vmlease plan   --battery <f.json> --run-token <slug>            # dry-run: what WOULD provision (zero provider calls)
-vmlease run    --battery <f.json> --run-token <slug> \          # provision -> probe -> ALWAYS tear down (billable)
+vmlease plan   --battery <battery.toml> --run-token <slug>      # dry-run: what WOULD provision (zero provider calls)
+vmlease run    --battery <battery.toml> --run-token <slug> \    # provision -> probe -> ALWAYS tear down (billable)
                --operator probe --results-dir <dir> [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
+vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
-vmlease summarize <raw-results.json> [--battery <b.json>] [--out <s.json>]  # ONE canonical reader -> .summary.json
+vmlease summarize <raw-results.json> [--battery <battery.toml>] [--out <s.json>]  # ONE canonical reader -> .summary.json
 ```
 
 The Hetzner provider relies on the operator's active `hcloud` context (configured out of band).
@@ -65,7 +66,7 @@ with a computed `verdict`, the four harvested token buckets, and bounded stdout/
 pivot (canonical command × distro, collapsed worst-of); and `totals` by verdict. The per-probe verdict is
 deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit → `FAIL`; else zero exit
 with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) → `PASS_NO_ASSERTIONS`. Pass
-`--battery <b.json>` to use authoritative command labels and surface declared-but-not-run probes per host;
+`--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes per host;
 without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
 
 ## Development
