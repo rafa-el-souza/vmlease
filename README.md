@@ -50,6 +50,9 @@ as **bash**. See `examples/compose-plugin-check/battery.toml`.
   non-fatal `warning:` for an un-gated token-printing probe; see `lint_battery`). A command ending in
   `… && echo OK || echo FAIL` always exits 0, so `ok` is `true` no matter which token it printed.
 
+Migrating a pre-TOML (JSON) battery? See [`docs/battery-toml-migration.md`](docs/battery-toml-migration.md)
+— field mapping, a one-time extraction helper, the authoring-order check, and a troubleshooting table.
+
 ### Summarizing results (`vmlease summarize`)
 
 A raw results file records each probe's `ok` as *only its exit code* — but the real "did it pass?" lives
