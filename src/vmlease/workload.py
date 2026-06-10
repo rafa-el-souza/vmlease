@@ -66,9 +66,9 @@ MAX_CONSECUTIVE_TIMEOUTS = 2
 class ProbeWorkload:
     """The probe battery as a :class:`Workload`: host-detail snapshot + battery.
 
-    Byte-faithful to the pre-seam probe path: it captures the self-describing
-    host-detail snapshot as the results header, then runs the battery in
-    authoring order, returning one :class:`~vmlease.model.HostRun`. Readiness and upload
+    Preserves the pre-seam probe path's per-probe capture contract: it captures
+    the self-describing host-detail snapshot as the results header, then runs the
+    battery in authoring order, returning one :class:`~vmlease.model.HostRun`. Readiness and upload
     staging are NOT here — the runner owns them (they are transport-generic,
     shared by every workload).
     """

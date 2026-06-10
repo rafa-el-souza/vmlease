@@ -1,7 +1,7 @@
 # workload-protocol Specification
 
 ## Purpose
-The injected-workload seam: the runner runs a caller-supplied `Workload` (a unit of on-host work over a ready host + an SSH connection, returning a `HostRun`) over the provision → run → guaranteed-teardown spine. The runner owns the lifecycle (readiness gate, upload staging, teardown); the workload owns only what runs on a ready host. The probe battery (`ProbeWorkload`) is the reference implementation — byte-faithful to the pre-seam probe path — and the seam admits other workloads (e.g. a CI gate job) with no change to provisioning or safety.
+The injected-workload seam: the runner runs a caller-supplied `Workload` (a unit of on-host work over a ready host + an SSH connection, returning a `HostRun`) over the provision → run → guaranteed-teardown spine. The runner owns the lifecycle (readiness gate, upload staging, teardown); the workload owns only what runs on a ready host. The probe battery (`ProbeWorkload`) is the reference implementation — preserving the pre-seam probe path's per-probe capture contract — and the seam admits other workloads (e.g. a CI gate job) with no change to provisioning or safety.
 ## Requirements
 ### Requirement: The runner executes a caller-injected workload
 
