@@ -19,6 +19,8 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from tests.battery_helpers import battery_toml
+
 # vmlease is a real package, so import it directly — this keeps mypy --strict
 # name-resolution working for the typed fakes below (importlib.import_module
 # would erase the symbol types).
@@ -135,7 +137,7 @@ class FakeSshRunner:
 
 def _demo_workload() -> workload.ProbeWorkload:
     """The probe battery as a workload — the injected default for runner tests."""
-    return workload.ProbeWorkload(battery_mod.parse_battery(_BATTERY_JSON))
+    return workload.ProbeWorkload(_resolve_toml(_DEMO_BATTERY))
 
 
 def _fake_keypair(tmp: Path) -> keypair.Keypair:
@@ -146,15 +148,46 @@ def _fake_keypair(tmp: Path) -> keypair.Keypair:
     return keypair.Keypair(directory=d, private_key_path=priv, public_key="ssh-ed25519 AAAA probe")
 
 
-_BATTERY_JSON = json.dumps(
-    {
-        "name": "demo-battery",
-        "probes": [
-            {"id": "P1", "title": "subid", "command": "grep x /etc/subuid", "tag": "read-only", "classifies": "L2"},
-            {"id": "P6", "title": "linger", "command": "loginctl enable-linger", "tag": "mutating:operator-space"},
-            {"id": "P12", "title": "batch", "command": "sudo true", "tag": "mutating:host-root"},
-        ],
-    }
+# --------------------------------------------------------------------------- #
+# TOML battery fixtures — ``battery_toml`` lives in ``battery_helpers`` (shared)
+# --------------------------------------------------------------------------- #
+def _resolve_toml(manifest: str, scripts: dict[str, str] | None = None) -> model.Battery:
+    """Resolve a manifest (plus optional ``{path: contents}`` scripts) to a Battery.
+
+    Writes the bundle to a throwaway temp dir and loads it through the real
+    loader, so fixtures exercise the TOML + script-resolution path end-to-end.
+    """
+    d = Path(tempfile.mkdtemp())
+    for rel, contents in (scripts or {}).items():
+        target = d / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents, encoding="utf-8")
+    p = d / "battery.toml"
+    p.write_text(manifest, encoding="utf-8")
+    return battery_mod.load_battery(p)
+
+
+def _write_battery_bundle(
+    d: str, manifest: str, scripts: dict[str, str] | None = None
+) -> str:
+    """Write a ``battery.toml`` (+ optional script files) into ``d``; return its path."""
+    base = Path(d)
+    for rel, contents in (scripts or {}).items():
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents, encoding="utf-8")
+    p = base / "battery.toml"
+    p.write_text(manifest, encoding="utf-8")
+    return str(p)
+
+
+_DEMO_BATTERY = battery_toml(
+    "demo-battery",
+    (
+        {"id": "P1", "title": "subid", "run": "grep x /etc/subuid", "tag": "read-only", "classifies": "L2"},
+        {"id": "P6", "title": "linger", "run": "loginctl enable-linger", "tag": "mutating:operator-space"},
+        {"id": "P12", "title": "batch", "run": "sudo true", "tag": "mutating:host-root"},
+    ),
 )
 
 
@@ -176,25 +209,23 @@ class TestModel(unittest.TestCase):
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertIsNone(p.timeout)
 
-    def test_battery_ordered_groups_by_tag(self) -> None:
-        b = battery_mod.parse_battery(_BATTERY_JSON)
-        order = [p.tag for p in b.ordered()]
-        self.assertEqual(
-            order,
-            [model.ProbeTag.READ_ONLY, model.ProbeTag.MUTATING_OPERATOR_SPACE, model.ProbeTag.MUTATING_HOST_ROOT],
-        )
+    def test_probe_source_defaults_empty(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertEqual(p.source, "")
 
-    def test_battery_ordered_stable_within_group(self) -> None:
-        # two host-root probes keep authoring order (the dependency order)
-        doc = {
-            "name": "x",
-            "probes": [
-                {"id": "B2", "title": "second", "command": "c", "tag": "mutating:host-root"},
-                {"id": "B1", "title": "first", "command": "c", "tag": "mutating:host-root"},
-            ],
-        }
-        b = battery_mod.parse_battery(json.dumps(doc))
-        self.assertEqual([p.id for p in b.ordered()], ["B2", "B1"])
+    def test_probe_source_carries_provenance(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY, source="prep.sh")
+        self.assertEqual(p.source, "prep.sh")
+
+    def test_battery_probes_preserve_authoring_order(self) -> None:
+        # probes run + record in authoring order regardless of tag; a read-only
+        # probe authored AFTER a host-root probe stays after it (no tag-rank sort).
+        manifest = battery_toml("x", (
+            {"id": "SETUP", "title": "setup", "run": "c", "tag": "mutating:host-root"},
+            {"id": "VERIFY", "title": "verify", "run": "c", "tag": "read-only"},
+        ))
+        b = _resolve_toml(manifest)
+        self.assertEqual([p.id for p in b.probes], ["SETUP", "VERIFY"])
 
 
 # --------------------------------------------------------------------------- #
@@ -407,92 +438,198 @@ class TestHetznerProviderImpl(unittest.TestCase):
 # battery loader
 # --------------------------------------------------------------------------- #
 class TestBattery(unittest.TestCase):
+    def _one(self, **over: object) -> dict[str, object]:
+        base: dict[str, object] = {"id": "P", "title": "t", "run": "c", "tag": "read-only"}
+        base.update(over)
+        return base
+
     def test_parse_ok(self) -> None:
-        b = battery_mod.parse_battery(_BATTERY_JSON)
-        self.assertEqual(b.name, "demo-battery")
-        self.assertEqual(len(b.probes), 3)
-        self.assertEqual(b.probes[0].classifies, "L2")
+        spec = battery_mod.parse_battery(_DEMO_BATTERY)
+        self.assertEqual(spec.name, "demo-battery")
+        self.assertEqual(len(spec.probes), 3)
+        self.assertEqual(spec.probes[0].classifies, "L2")
 
-    def test_parse_bad_json(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery("{nope")
+    def test_resolve_ok(self) -> None:
+        # a well-formed manifest with a run probe AND a script probe resolves.
+        manifest = battery_toml("mixed", (
+            {"id": "R", "title": "inline", "run": "uname -r", "tag": "read-only"},
+            {"id": "S", "title": "scripted", "script": "prep.sh", "tag": "read-only"},
+        ))
+        b = _resolve_toml(manifest, {"prep.sh": "echo hi\n"})
+        self.assertEqual(b.name, "mixed")
+        self.assertEqual(b.probes[0].command, "uname -r")
+        self.assertEqual(b.probes[0].source, "<inline>")
+        self.assertEqual(b.probes[1].command, "echo hi\n")
+        self.assertEqual(b.probes[1].source, "prep.sh")
 
-    def test_parse_non_object_root(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps([1, 2, 3]))
+    def test_real_example_battery_loads(self) -> None:
+        # The shipped in-repo example is a standing regression artifact: it must
+        # load through the real loader and stay shaped as documented.
+        example = Path(__file__).parent.parent / "examples" / "compose-plugin-check" / "battery.toml"
+        b = battery_mod.load_battery(example)
+        self.assertEqual(len(b.probes), 1)
+        self.assertEqual(b.probes[0].tag, ProbeTag.READ_ONLY)
+        self.assertTrue(b.probes[0].command.strip())
 
-    def test_parse_probe_not_object(self) -> None:
+    def test_parse_bad_toml(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps({"name": "x", "probes": ["not-an-object"]}))
+            battery_mod.parse_battery("name = ")
 
     def test_parse_missing_name(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps({"probes": [{"id": "P", "title": "t", "command": "c", "tag": "read-only"}]}))
+            battery_mod.parse_battery(battery_toml("x", (self._one(),)).replace("name = '''x'''\n", ""))
 
     def test_parse_empty_probes(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps({"name": "x", "probes": []}))
+            battery_mod.parse_battery("name = '''x'''\n")
 
     def test_parse_missing_probe_field(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps({"name": "x", "probes": [{"id": "P", "title": "t", "command": "c"}]}))
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\nrun = '''c'''\ntag = '''read-only'''\n"
+            )
 
     def test_parse_unknown_tag(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps({"name": "x", "probes": [{"id": "P", "title": "t", "command": "c", "tag": "weird"}]}))
+            battery_mod.parse_battery(battery_toml("x", (self._one(tag="weird"),)))
+
+    def test_parse_neither_run_nor_script(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\ntag = '''read-only'''\n"
+            )
+
+    def test_parse_both_run_and_script(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nscript = '''s.sh'''\n"
+            )
+
+    def test_parse_unrecognized_root_key(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(
+                "name = '''x'''\nbogus = '''v'''\n\n[[probe]]\nid = '''P'''\n"
+                "title = '''t'''\ntag = '''read-only'''\nrun = '''c'''\n"
+            )
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_parse_probe_not_a_table(self) -> None:
+        # a `probe` array element that is not a table is rejected.
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery("name = '''x'''\nprobe = ['''not-a-table''']\n")
+
+    def test_parse_run_not_a_string(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = 5\n"
+            )
+
+    def test_parse_script_empty_string(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nscript = ''''''\n"
+            )
+
+    def test_parse_unrecognized_probe_key(self) -> None:
+        # a `timout` typo must fail loud, not silently use the default timeout.
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\ntimout = 30\n"
+            )
 
     def test_parse_duplicate_id(self) -> None:
-        doc = {"name": "x", "probes": [
-            {"id": "P", "title": "t", "command": "c", "tag": "read-only"},
-            {"id": "P", "title": "t2", "command": "c2", "tag": "read-only"},
-        ]}
+        manifest = battery_toml("x", (
+            {"id": "P", "title": "t", "run": "c", "tag": "read-only"},
+            {"id": "P", "title": "t2", "run": "c2", "tag": "read-only"},
+        ))
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps(doc))
+            battery_mod.parse_battery(manifest)
 
     def test_parse_timeout_absent_is_none(self) -> None:
         # back-compat: a battery without per-probe timeout loads, timeout None.
-        b = battery_mod.parse_battery(_BATTERY_JSON)
-        self.assertIsNone(b.probes[0].timeout)
+        spec = battery_mod.parse_battery(_DEMO_BATTERY)
+        self.assertIsNone(spec.probes[0].timeout)
 
     def test_parse_timeout_value_carried(self) -> None:
-        doc = {"name": "x", "probes": [
-            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 42},
-        ]}
-        b = battery_mod.parse_battery(json.dumps(doc))
-        self.assertEqual(b.probes[0].timeout, 42.0)
+        spec = battery_mod.parse_battery(battery_toml("x", (self._one(timeout=42),)))
+        self.assertEqual(spec.probes[0].timeout, 42.0)
 
     def test_parse_timeout_non_positive_raises(self) -> None:
-        doc = {"name": "x", "probes": [
-            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": 0},
-        ]}
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps(doc))
+            battery_mod.parse_battery(battery_toml("x", (self._one(timeout=0),)))
 
     def test_parse_timeout_non_numeric_raises(self) -> None:
-        doc = {"name": "x", "probes": [
-            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": "soon"},
-        ]}
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps(doc))
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\ntimeout = '''soon'''\n"
+            )
 
     def test_parse_timeout_bool_rejected(self) -> None:
         # bool is an int subclass; ``true`` must not be silently read as ``1``.
-        doc = {"name": "x", "probes": [
-            {"id": "P", "title": "t", "command": "c", "tag": "read-only", "timeout": True},
-        ]}
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(json.dumps(doc))
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\ntimeout = true\n"
+            )
+
+    # --- resolution + symlink-safe containment ---------------------------- #
+    def test_resolve_script_absolute_path_rejected(self) -> None:
+        manifest = battery_toml("x", (self._one(script="/etc/passwd"),))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(manifest)
+
+    def test_resolve_script_dotdot_escape_rejected(self) -> None:
+        manifest = battery_toml("x", (self._one(script="../secret.sh"),))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(manifest)
+
+    def test_resolve_script_symlink_out_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_d, tempfile.TemporaryDirectory() as bundle_d:
+            secret = Path(outside_d) / "secret.sh"
+            secret.write_text("echo leak\n", encoding="utf-8")
+            link = Path(bundle_d) / "prep.sh"
+            link.symlink_to(secret)  # contained-looking name, out-of-tree target
+            manifest = battery_toml("x", (self._one(script="prep.sh"),))
+            (Path(bundle_d) / "battery.toml").write_text(manifest, encoding="utf-8")
+            with self.assertRaises(battery_mod.BatteryError):
+                battery_mod.load_battery(Path(bundle_d) / "battery.toml")
+
+    def test_resolve_missing_script_names_probe_and_path(self) -> None:
+        manifest = battery_toml("x", (self._one(script="prep.sh"),))
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            _resolve_toml(manifest)
+        self.assertIn("'P'", str(ctx.exception))
+        self.assertIn("prep.sh", str(ctx.exception))
+
+    def test_resolve_empty_script_file_rejected(self) -> None:
+        manifest = battery_toml("x", (self._one(script="prep.sh"),))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(manifest, {"prep.sh": "   \n\t"})
+
+    def test_resolve_empty_run_block_rejected(self) -> None:
+        manifest = battery_toml("x", (self._one(run="   \n"),))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(manifest)
+
+    def test_resolve_run_only_battery_no_script_files(self) -> None:
+        # a run-only battery loads with no script files present beside it.
+        b = _resolve_toml(_DEMO_BATTERY)
+        self.assertEqual([p.source for p in b.probes], ["<inline>", "<inline>", "<inline>"])
 
     def test_load_battery_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "b.json"
-            p.write_text(_BATTERY_JSON, encoding="utf-8")
-            b = battery_mod.load_battery(p)
+            p = _write_battery_bundle(d, _DEMO_BATTERY)
+            b = battery_mod.load_battery(Path(p))
             self.assertEqual(b.name, "demo-battery")
 
     def test_load_battery_missing_file(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.load_battery(Path("/no/such/battery.json"))
+            battery_mod.load_battery(Path("/no/such/battery.toml"))
 
 
 # --------------------------------------------------------------------------- #
@@ -512,22 +649,14 @@ class TestBatteryLint(unittest.TestCase):
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def test_order_surprise_warns_with_both_orders(self) -> None:
-        # authored host-root THEN read-only → executes read-only first (tag-rank)
+    def test_no_order_warning_for_mixed_tag_order(self) -> None:
+        # a read-only probe authored AFTER a host-root probe no longer warns —
+        # execution is authoring order, so there is no reorder to surprise on.
         b = self._b(
             self._p("SETUP", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
             self._p("VERIFY", "check; exit $?", ProbeTag.READ_ONLY),
         )
-        warns = battery_mod.lint_battery(b)
-        self.assertTrue(any("tag-rank" in w for w in warns))
-        self.assertTrue(any("VERIFY" in w and "SETUP" in w for w in warns))
-
-    def test_order_matching_authoring_has_no_order_warning(self) -> None:
-        b = self._b(
-            self._p("A", "uname -a; exit $?", ProbeTag.READ_ONLY),
-            self._p("B", "do; exit $?", ProbeTag.MUTATING_HOST_ROOT),
-        )
-        self.assertFalse(any("tag-rank" in w for w in battery_mod.lint_battery(b)))
+        self.assertEqual(battery_mod.lint_battery(b), ())
 
     def test_vacuous_ok_conditional_echo_warns(self) -> None:
         b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
@@ -551,6 +680,126 @@ class TestBatteryLint(unittest.TestCase):
     def test_plain_command_not_flagged(self) -> None:
         b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())
+
+
+# --------------------------------------------------------------------------- #
+# battery.shellcheck_battery — severity-graded findings over every probe (D5)
+# --------------------------------------------------------------------------- #
+# A realistic ``shellcheck --shell=bash --format=gcc -`` sample: an SC2155 warning
+# (return-value masking) and an SC2015 note (the ``A && B || C`` footgun). The
+# filename is ``-`` because the script is fed over stdin.
+_GCC_SAMPLE = (
+    "-:1:7: warning: Declare and assign separately to avoid masking return values. [SC2155]\n"
+    "-:3:12: note: Note that A && B || C is not if-then-else. C may run when A is true. [SC2015]\n"
+)
+
+
+class TestShellcheckDriver(unittest.TestCase):
+    def _b(self, *probes: Probe) -> model.Battery:
+        return model.Battery(name="t", probes=tuple(probes))
+
+    def _runner(
+        self, stdout: str, *, returncode: int = 1
+    ) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        calls: list[tuple[list[str], str | None]] = []
+
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, stdin_text))
+            return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+        self.calls = calls
+        return _run
+
+    def test_parses_severities_codes_locations(self) -> None:
+        b = self._b(Probe(id="PREP", title="prep", command="x=$(date)\n\ngrep f && a || b", tag=ProbeTag.READ_ONLY, source="prep.sh"))
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner(_GCC_SAMPLE))
+        assert isinstance(findings, tuple)
+        self.assertEqual(len(findings), 2)
+        warn, note = findings
+        self.assertEqual((warn.severity, warn.code, warn.line, warn.column), ("warning", "SC2155", 1, 7))
+        self.assertEqual((note.severity, note.code, note.line, note.column), ("note", "SC2015", 3, 12))
+        # script probe -> location is the script path; line numbers index file content
+        self.assertEqual(warn.location, "prep.sh")
+        self.assertEqual(warn.probe_id, "PREP")
+        self.assertNotIn("[SC2155]", warn.message)
+
+    def test_run_probe_labelled_by_probe_id_and_fed_via_stdin(self) -> None:
+        b = self._b(Probe(id="KVER", title="k", command="uname -r && echo ok || echo no", tag=ProbeTag.READ_ONLY, source="<inline>"))
+        runner = self._runner("-:1:9: note: msg [SC2015]\n")
+        findings = battery_mod.shellcheck_battery(b, runner=runner)
+        assert isinstance(findings, tuple)
+        # run-block findings are located by the probe's source ("<inline>") + id
+        self.assertEqual(findings[0].location, "<inline>")
+        self.assertEqual(findings[0].probe_id, "KVER")
+        # both kinds fed over stdin: argv ends with "-", stdin carries the command
+        argv, stdin_text = self.calls[0]
+        self.assertEqual(argv, ["shellcheck", "--shell=bash", "--format=gcc", "-"])
+        self.assertEqual(stdin_text, "uname -r && echo ok || echo no")
+
+    def test_both_probe_kinds_fed_via_stdin_with_correct_labels(self) -> None:
+        b = self._b(
+            Probe(id="S", title="s", command="echo from-script", tag=ProbeTag.READ_ONLY, source="s.sh"),
+            Probe(id="R", title="r", command="echo from-run", tag=ProbeTag.READ_ONLY, source="<inline>"),
+        )
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:1:1: style: m [SC2086]\n"))
+        assert isinstance(findings, tuple)
+        self.assertEqual([f.location for f in findings], ["s.sh", "<inline>"])
+        # every call fed the command text over stdin, no path on the argv
+        self.assertEqual([stdin for _, stdin in self.calls], ["echo from-script", "echo from-run"])
+        for argv, _ in self.calls:
+            self.assertEqual(argv[-1], "-")
+            self.assertNotIn("--", argv)
+
+    def test_non_matching_lines_skipped(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
+        noisy = "\nIn - line 1:\n^-- some caret art\n" + _GCC_SAMPLE
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner(noisy))
+        assert isinstance(findings, tuple)
+        self.assertEqual(len(findings), 2)
+
+    def test_finding_without_code_keeps_empty_code(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:2:4: error: bare message no code\n"))
+        assert isinstance(findings, tuple)
+        self.assertEqual(findings[0].code, "")
+        self.assertEqual(findings[0].message, "bare message no code")
+
+    def test_file_not_found_yields_unavailable_sentinel(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
+
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("shellcheck")
+
+        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+
+    def test_timeout_yields_unavailable_sentinel(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
+
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, 60.0)
+
+        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+
+    def test_findings_at_or_above_thresholds(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
+        sample = (
+            "-:1:1: style: s [SC2086]\n"
+            "-:2:1: note: n [SC2015]\n"
+            "-:3:1: warning: w [SC2155]\n"
+            "-:4:1: error: e [SC1009]\n"
+        )
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner(sample))
+        assert isinstance(findings, tuple)
+        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "style")), 4)
+        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "note")), 3)
+        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "warning")), 2)
+        sev = [f.severity for f in battery_mod.findings_at_or_above(findings, "error")]
+        self.assertEqual(sev, ["error"])
+
+    def test_clean_battery_yields_empty_findings_not_sentinel(self) -> None:
+        b = self._b(Probe(id="P", title="p", command="uname -r", tag=ProbeTag.READ_ONLY, source="<inline>"))
+        findings = battery_mod.shellcheck_battery(b, runner=self._runner("", returncode=0))
+        self.assertEqual(findings, ())
 
 
 # --------------------------------------------------------------------------- #
@@ -677,20 +926,15 @@ class TestRunner(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestCli(unittest.TestCase):
     def _write_battery(self, d: str) -> str:
-        p = Path(d) / "b.json"
-        p.write_text(_BATTERY_JSON, encoding="utf-8")
-        return str(p)
+        return _write_battery_bundle(d, _DEMO_BATTERY)
 
     def test_plan_surfaces_lint_warnings_to_stderr(self) -> None:
         # a vacuously-ok probe → plan warns (non-fatal) on stderr, still exits 0
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "lint.json"
-            p.write_text(
-                json.dumps({"name": "lint", "probes": [
-                    {"id": "V", "title": "v", "command": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
-                ]}),
-                encoding="utf-8",
-            )
+            manifest = battery_toml("lint", (
+                {"id": "V", "title": "v", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+            ))
+            p = Path(_write_battery_bundle(d, manifest))
             err = io.StringIO()
             with redirect_stdout(io.StringIO()), redirect_stderr(err):
                 rc = cli.main(["plan", "--battery", str(p), "--distros", "ubuntu", "--run-token", "lint-run"])
@@ -711,8 +955,8 @@ class TestCli(unittest.TestCase):
 
     def test_plan_bad_battery_returns_2(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "bad.json"
-            p.write_text("{nope", encoding="utf-8")
+            p = Path(d) / "battery.toml"
+            p.write_text("name = ", encoding="utf-8")
             rc = cli.main(["plan", "--battery", str(p), "--run-token", "cli-run"])
             self.assertEqual(rc, 2)
 
@@ -763,6 +1007,108 @@ class TestCli(unittest.TestCase):
                 "--run-token", "cli-run", "--upload", str(link),
             ])
             self.assertEqual(rc, 2)
+
+
+# --------------------------------------------------------------------------- #
+# cli — lint subcommand (severity-gated shellcheck gate; injected runner seam)
+# --------------------------------------------------------------------------- #
+class TestCliLint(unittest.TestCase):
+    def _write(self, d: str, run: str = "uname -r") -> str:
+        manifest = battery_toml("lint-cli", (
+            {"id": "P", "title": "p", "run": run, "tag": "read-only"},
+        ))
+        return _write_battery_bundle(d, manifest)
+
+    def _runner(
+        self, stdout: str, *, returncode: int = 1
+    ) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+        return _run
+
+    def _unavailable_runner(self) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("shellcheck")
+
+        return _run
+
+    def _run_lint(
+        self,
+        argv: list[str],
+        runner: Callable[[list[str], str | None], subprocess.CompletedProcess[str]],
+    ) -> tuple[int, str, str]:
+        ns = cli.build_parser().parse_args(argv)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli._cmd_lint(ns, runner=runner)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_clean_battery_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)], self._runner("", returncode=0)
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("battery: lint-cli", out)
+            self.assertIn("threshold: error", out)
+
+    def test_error_finding_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)],
+                self._runner("-:1:1: error: syntax boom [SC1009]\n"),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("SC1009", out)
+            self.assertIn("syntax boom", out)
+
+    def test_severity_warning_flips_warning_only_battery_to_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            sample = "-:1:7: warning: masking return values [SC2155]\n"
+            # at default `error`: a warning-only battery passes (exit 0)
+            rc_default, _, _ = self._run_lint(
+                ["lint", "--battery", self._write(d)], self._runner(sample)
+            )
+            self.assertEqual(rc_default, 0)
+            # tightened to `warning`: the same finding now fails the gate
+            rc_strict, _, _ = self._run_lint(
+                ["lint", "--battery", self._write(d), "--severity", "warning"],
+                self._runner(sample),
+            )
+            self.assertEqual(rc_strict, 1)
+
+    def test_unavailable_skips_with_notice_and_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            # a vacuously-ok probe so the advisory check still has something to print
+            manifest = battery_toml("lint-cli", (
+                {"id": "P", "title": "p", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
+            self.assertEqual(rc, 0)
+            self.assertIn("shellcheck unavailable", err)
+            self.assertIn("warning:", err)  # advisory vacuous-ok still printed
+
+    def test_unavailable_with_require_shellcheck_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", self._write(d), "--require-shellcheck"],
+                self._unavailable_runner(),
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+            self.assertIn("shellcheck", err)
+
+    def test_malformed_battery_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "battery.toml"
+            p.write_text("name = ", encoding="utf-8")
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", str(p)], self._runner("", returncode=0)
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("error:", err)
 
 
 # --------------------------------------------------------------------------- #
@@ -1518,7 +1864,7 @@ class TestExecute(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertEqual(len(prov.created), 2)
         self.assertEqual(len(prov.destroyed), 2)  # ALWAYS torn down
-        # battery ran in tag order on each host (P1 read-only first, P12 host-root last)
+        # battery ran in authoring order on each host (P1 first, P12 authored last)
         self.assertEqual(fssh.ran[-1], "P12")
 
     def _upload_matrix(self, remote: str = "~/w.whl") -> tuple[runner.Matrix, Path]:
@@ -1940,14 +2286,14 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
     """T1b: timeout does not abort the battery; K consecutive timeouts stop it."""
 
     def _battery(self) -> model.Battery:
-        # four probes, all read-only so ordered() == authoring order (stable rank).
-        doc = {"name": "b", "probes": [
-            {"id": "Q1", "title": "t", "command": "c", "tag": "read-only"},
-            {"id": "Q2", "title": "t", "command": "c", "tag": "read-only"},
-            {"id": "Q3", "title": "t", "command": "c", "tag": "read-only"},
-            {"id": "Q4", "title": "t", "command": "c", "tag": "read-only"},
-        ]}
-        return battery_mod.parse_battery(json.dumps(doc))
+        # four probes; they run in authoring order Q1..Q4.
+        manifest = battery_toml("b", (
+            {"id": "Q1", "title": "t", "run": "c", "tag": "read-only"},
+            {"id": "Q2", "title": "t", "run": "c", "tag": "read-only"},
+            {"id": "Q3", "title": "t", "run": "c", "tag": "read-only"},
+            {"id": "Q4", "title": "t", "run": "c", "tag": "read-only"},
+        ))
+        return _resolve_toml(manifest)
 
     def _spec(self) -> model.HostSpec:
         return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu")
@@ -1989,15 +2335,58 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
     def test_breaker_constant_default_is_two(self) -> None:
         self.assertEqual(workload.MAX_CONSECUTIVE_TIMEOUTS, 2)
 
+    def test_mixed_tag_battery_runs_in_authoring_order(self) -> None:
+        # a host-root probe authored before a read-only one executes (and records)
+        # first — authoring order, not tag-rank; the read-only verifier runs after.
+        manifest = battery_toml("b", (
+            {"id": "SETUP", "title": "t", "run": "c", "tag": "mutating:host-root"},
+            {"id": "VERIFY", "title": "t", "run": "c", "tag": "read-only"},
+        ))
+        wl = workload.ProbeWorkload(_resolve_toml(manifest))
+        ssh_fake = _ScriptedTimeoutSsh(set())
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(ssh_fake.ran, ["_detail", "SETUP", "VERIFY"])
+        self.assertEqual([r.probe_id for r in run.results], ["SETUP", "VERIFY"])
+
+    def test_script_probe_resolves_and_executes_via_workload(self) -> None:
+        # a `script` probe's resolved command (the file's contents) reaches the
+        # transport unchanged — exercising the script-ref path end-to-end.
+        manifest = battery_toml("b", (
+            {"id": "SCRIPTED", "title": "t", "script": "prep.sh", "tag": "read-only"},
+        ))
+        script_body = "set -euo pipefail\nuname -r\nexit 0\n"
+        battery = _resolve_toml(manifest, {"prep.sh": script_body})
+
+        seen: list[str] = []
+
+        class _CommandRecordingSsh:
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                seen.append(probe.command)
+                return ProbeResult(probe.id, probe.tag, 0, "", "")
+
+            def upload(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+            def wait_until_ready(self, host: Host) -> None:
+                return None
+
+            def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+                return 0
+
+            def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+                return None
+
+        wl = workload.ProbeWorkload(battery)
+        wl.run(self._spec(), self._host(), _CommandRecordingSsh())
+        self.assertIn(script_body, seen)  # the file's contents reached the transport
+
 
 # --------------------------------------------------------------------------- #
 # cli — run (confirm gate) / reap / status, with provider + ssh stubbed
 # --------------------------------------------------------------------------- #
 class TestCliRun(unittest.TestCase):
     def _write_battery(self, d: str) -> str:
-        p = Path(d) / "b.json"
-        p.write_text(_BATTERY_JSON, encoding="utf-8")
-        return str(p)
+        return _write_battery_bundle(d, _DEMO_BATTERY)
 
     def test_run_aborts_without_confirm(self) -> None:
         # _cmd_run reads via injected reader; "n" aborts before provisioning

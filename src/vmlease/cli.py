@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""vmlease CLI — ``plan`` · ``run`` · ``status`` · ``reap``.
+"""vmlease CLI — ``plan`` · ``run`` · ``status`` · ``lint`` · ``reap``.
 
 - ``plan``   dry-run: what WOULD be provisioned (zero provider calls).
 - ``run``    provision -> probe -> ALWAYS tear down; write a timestamped results
              file. Gated by a confirm-before-create prompt (``--yes`` to skip).
 - ``status`` list the live hosts carrying a run's label.
+- ``lint``   shellcheck every probe in a battery bundle; severity-gated exit code.
 - ``reap``   destroy every host carrying a run's label (the orphan backstop).
+
+A battery is a **TOML bundle** (a ``battery.toml`` manifest plus optional
+co-located ``.sh`` scripts); the ``--battery`` flag points at the manifest.
 
 Invoked as the ``vmlease`` console script. The Hetzner provider relies on the
 operator's already-active ``hcloud`` context; the token is never read here.
 
-    vmlease plan --battery <f.json> --run-token <slug>
-    vmlease run  --battery <f.json> --run-token <slug> \
+    vmlease plan --battery <battery.toml> --run-token <slug>
+    vmlease run  --battery <battery.toml> --run-token <slug> \
         --operator probe --results-dir <dir> [--yes]
+    vmlease lint --battery <battery.toml> [--severity warning] [--require-shellcheck]
     vmlease reap --run-token <slug>
 """
 
@@ -29,7 +34,15 @@ from vmlease.archbuild import (
     build_live_rescue_writer,
     ensure_arch_keyring,
 )
-from vmlease.battery import BatteryError, lint_battery, load_battery
+from vmlease.battery import (
+    BatteryError,
+    ShellcheckFinding,
+    ShellcheckRunner,
+    findings_at_or_above,
+    lint_battery,
+    load_battery,
+    shellcheck_battery,
+)
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
 from vmlease.model import Battery, HostRun, UploadSpec
@@ -94,7 +107,7 @@ def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
 
 
 def _warn_battery(battery: Battery) -> None:
-    """Print non-fatal authoring warnings (tag-order surprise, vacuous ok) to stderr."""
+    """Print non-fatal authoring warnings (vacuous ok) to stderr."""
     for w in lint_battery(battery):
         print(f"warning: {w}", file=sys.stderr)
 
@@ -305,8 +318,66 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_lint(args: argparse.Namespace, *, runner: ShellcheckRunner | None = None) -> int:
+    """Shellcheck every probe in a battery bundle; severity-gated exit code (D5/D6).
+
+    Loads + resolves the bundle (a malformed bundle is ``error:`` + exit 2), prints
+    the advisory vacuous-ok warnings, then runs the shellcheck driver over every
+    probe. ``runner`` is the injectable shellcheck seam (tests pass a fake; the
+    default lets the driver spawn the real binary). Exit contract:
+
+    - clean — no finding at or above ``--severity`` → ``0``
+    - any finding at or above ``--severity`` → ``1``
+    - shellcheck unavailable → notice + ``0`` (advisory still ran), unless
+      ``--require-shellcheck`` makes the absence itself a ``1`` failure.
+    """
+    try:
+        battery = load_battery(Path(args.battery))
+    except BatteryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
+    _warn_battery(battery)
+
+    result = shellcheck_battery(battery, runner=runner)
+    if not isinstance(result, tuple):
+        # The driver returned the unavailable sentinel (binary absent / wedged).
+        if args.require_shellcheck:
+            print(
+                "error: shellcheck is not installed and --require-shellcheck was given",
+                file=sys.stderr,
+            )
+            return 1
+        print("notice: shellcheck unavailable — skipped; advisory checks ran", file=sys.stderr)
+        return 0
+
+    _print_findings(result)
+    _print_lint_summary(result, args.severity)
+    return 1 if findings_at_or_above(result, args.severity) else 0
+
+
+def _print_findings(findings: tuple[ShellcheckFinding, ...]) -> None:
+    """Print findings grouped by probe (source label, line:col, severity, SC code, message)."""
+    by_probe: dict[str, list[ShellcheckFinding]] = {}
+    for f in findings:
+        by_probe.setdefault(f.probe_id, []).append(f)
+    for probe_id, group in by_probe.items():
+        print(f"probe {probe_id} ({group[0].location}):")
+        for f in group:
+            code = f"{f.code} " if f.code else ""
+            print(f"  {f.line}:{f.column}: {f.severity}: {code}{f.message}")
+
+
+def _print_lint_summary(findings: tuple[ShellcheckFinding, ...], severity: str) -> None:
+    """Print a one-line summary: counts by severity + the active threshold."""
+    counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in ("error", "warning", "note", "style")}
+    parts = ", ".join(f"{counts[sev]} {sev}" for sev in ("error", "warning", "note", "style"))
+    print(f"summary: {parts} (threshold: {severity})")
+
+
 def _add_matrix_args(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--battery", required=True, help="path to the battery JSON file")
+    sp.add_argument("--battery", required=True, help="path to the battery.toml manifest (the TOML bundle)")
     sp.add_argument("--distros", default=",".join(DEFAULT_DISTRO_KEYS), help="comma-separated distro keys")
     sp.add_argument("--server-type", default="cpx22", help="instance size (default: cpx22)")
     sp.add_argument("--max-hosts", type=int, default=DEFAULT_MAX_HOSTS, help="cost-guard host cap")
@@ -356,13 +427,25 @@ def build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--run-token", required=True, help="the run-token whose hosts to list")
     status_p.set_defaults(func=_cmd_status)
 
+    lint_p = sub.add_parser("lint", help="shellcheck every probe in a battery bundle (severity-gated exit)")
+    lint_p.add_argument("--battery", required=True, help="path to the battery.toml manifest (the TOML bundle)")
+    lint_p.add_argument(
+        "--severity", choices=("error", "warning", "note"), default="error",
+        help="fail (exit 1) on any shellcheck finding at or above this severity (default: error)",
+    )
+    lint_p.add_argument(
+        "--require-shellcheck", action="store_true",
+        help="a missing shellcheck binary fails the gate (exit 1) instead of skipping",
+    )
+    lint_p.set_defaults(func=_cmd_lint)
+
     summarize_p = sub.add_parser(
         "summarize", help="read a raw results file -> write a versioned .summary.json (exit = verdict)"
     )
     summarize_p.add_argument("raw", help="path to a raw vmlease results JSON file")
     summarize_p.add_argument(
         "--battery", default="",
-        help="optional battery JSON: authoritative probe-id->command labels + declared-but-not-run detection",
+        help="optional battery.toml: authoritative probe-id->command labels + declared-but-not-run detection",
     )
     summarize_p.add_argument(
         "--out", default="",

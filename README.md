@@ -23,27 +23,35 @@ capture structured results, and guarantee teardown.
 ## CLI
 
 ```
-vmlease plan   --battery <f.json> --run-token <slug>            # dry-run: what WOULD provision (zero provider calls)
-vmlease run    --battery <f.json> --run-token <slug> \          # provision -> probe -> ALWAYS tear down (billable)
+vmlease plan   --battery <battery.toml> --run-token <slug>      # dry-run: what WOULD provision (zero provider calls)
+vmlease run    --battery <battery.toml> --run-token <slug> \    # provision -> probe -> ALWAYS tear down (billable)
                --operator probe --results-dir <dir> [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
+vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
-vmlease summarize <raw-results.json> [--battery <b.json>] [--out <s.json>]  # ONE canonical reader -> .summary.json
+vmlease summarize <raw-results.json> [--battery <battery.toml>] [--out <s.json>]  # ONE canonical reader -> .summary.json
 ```
 
 The Hetzner provider relies on the operator's active `hcloud` context (configured out of band).
 
-### Authoring a battery (two footguns `vmlease` warns about)
+### Authoring a battery
 
-A battery is a JSON list of probes. Two contract details bite "set up, then verify" batteries — `plan`
-and `run` emit non-fatal `warning:`s for both (see `lint_battery`):
+A battery is a **TOML bundle**: a `battery.toml` manifest (a `name` plus a `[[probe]]` array) alongside any
+co-located shell scripts. Each probe declares a stable `id`, a `title`, a `tag`, an optional `classifies`
+label and `timeout`, and **exactly one of** an inline `run` block (TOML's `'''…'''` literal strings need no
+escaping) or a `script` reference to a sibling `.sh` file (resolved relative to the manifest and contained
+to the bundle — an absolute path, a `..` escape, or an out-of-tree symlink is rejected). Probes are authored
+as **bash**. See `examples/compose-plugin-check/battery.toml`.
 
-- **Probes execute in tag-rank order, NOT authoring order** — read-only → operator-space → host-root
-  (stable within a rank). A verifier that must run *after* a `mutating:host-root` setup probe has to be
-  tagged so it sorts after it; otherwise it inspects the host *before* the setup and passes/fails for the
-  wrong reason.
-- **A probe's `ok` is its command's exit code** — so gate assertions with `exit $rc`. A command ending in
+- **Probes execute in authoring order** — the manifest *is* the execution order, regardless of `tag`. A
+  verifier that must run *after* a `mutating:host-root` setup probe is simply authored after it; `tag`
+  records what a probe touches and governs sudo escalation but no longer reorders execution.
+- **A probe's `ok` is its command's exit code** — so gate assertions with `exit $rc` (`plan`/`run` emit a
+  non-fatal `warning:` for an un-gated token-printing probe; see `lint_battery`). A command ending in
   `… && echo OK || echo FAIL` always exits 0, so `ok` is `true` no matter which token it printed.
+
+Migrating a pre-TOML (JSON) battery? See [`docs/battery-toml-migration.md`](docs/battery-toml-migration.md)
+— field mapping, a one-time extraction helper, the authoring-order check, and a troubleshooting table.
 
 ### Summarizing results (`vmlease summarize`)
 
@@ -61,7 +69,7 @@ with a computed `verdict`, the four harvested token buckets, and bounded stdout/
 pivot (canonical command × distro, collapsed worst-of); and `totals` by verdict. The per-probe verdict is
 deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit → `FAIL`; else zero exit
 with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) → `PASS_NO_ASSERTIONS`. Pass
-`--battery <b.json>` to use authoritative command labels and surface declared-but-not-run probes per host;
+`--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes per host;
 without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
 
 ## Development

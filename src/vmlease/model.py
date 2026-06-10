@@ -15,8 +15,9 @@ class ProbeTag(StrEnum):
     """How a probe touches the host — recorded metadata, not a guardrail.
 
     Hosts are disposable, so probes mutate freely where mutation buys signal;
-    the tag records what state a probe left (so results are interpretable and
-    the runner can order read-only probes before mutating ones).
+    the tag records what state a probe left (so results are interpretable) and
+    governs the sudo-escalation contract (a probe escalates only when tagged
+    host-root). It does NOT order execution — probes run in authoring order.
     """
 
     READ_ONLY = "read-only"
@@ -31,10 +32,17 @@ class Probe:
     Attributes:
         id: Stable short identifier (e.g. ``"P1"``).
         title: Human-readable one-line description.
-        command: The shell command run over SSH as the operator. A probe never
-            invokes ``sudo`` unless its tag is ``MUTATING_HOST_ROOT`` (the one
-            sanctioned escalation probe).
-        tag: What the probe touches (:class:`ProbeTag`).
+        command: The **resolved** executable shell run over SSH as the operator —
+            the verbatim inline block, or the contents of the probe's script file.
+            A probe never invokes ``sudo`` unless its tag is ``MUTATING_HOST_ROOT``
+            (the one sanctioned escalation probe).
+        source: Provenance of ``command`` — the script path it was read from, or
+            ``"<inline>"`` for an inline command. Used only for lint output and
+            error messages. Defaults to ``""`` so direct ``Probe(...)``
+            construction stays back-compatible.
+        tag: What the probe touches (:class:`ProbeTag`). Records what state the
+            probe leaves and governs the sudo-escalation contract; it does NOT
+            order execution — probes run in authoring order.
         classifies: The design action this probe classifies (free text, for the
             results report — e.g. "L2 subuid append").
         timeout: Optional per-probe wall-clock bound (seconds) for the bounded
@@ -50,27 +58,20 @@ class Probe:
     tag: ProbeTag
     classifies: str = ""
     timeout: float | None = None
+    source: str = ""
 
 
 @dataclass(frozen=True)
 class Battery:
-    """An ordered, named collection of probes loaded from a data file."""
+    """A named collection of probes loaded from a data file.
+
+    Probes execute in **authoring order** — the order they appear in ``probes``
+    is the order they run and are recorded. ``tag`` records what each probe
+    touches and governs sudo escalation; it does not reorder execution.
+    """
 
     name: str
     probes: tuple[Probe, ...]
-
-    def ordered(self) -> tuple[Probe, ...]:
-        """Probes in execution order: read-only, then operator-space, then host-root.
-
-        Stable within each tag group (preserves the authoring order), so the
-        declared dependency order inside the host-root batch is respected.
-        """
-        rank = {
-            ProbeTag.READ_ONLY: 0,
-            ProbeTag.MUTATING_OPERATOR_SPACE: 1,
-            ProbeTag.MUTATING_HOST_ROOT: 2,
-        }
-        return tuple(sorted(self.probes, key=lambda p: rank[p.tag]))
 
 
 @dataclass(frozen=True)

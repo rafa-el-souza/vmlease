@@ -1,7 +1,7 @@
 # workload-protocol Specification
 
 ## Purpose
-The injected-workload seam: the runner runs a caller-supplied `Workload` (a unit of on-host work over a ready host + an SSH connection, returning a `HostRun`) over the provision → run → guaranteed-teardown spine. The runner owns the lifecycle (readiness gate, upload staging, teardown); the workload owns only what runs on a ready host. The probe battery (`ProbeWorkload`) is the reference implementation — byte-faithful to the pre-seam probe path — and the seam admits other workloads (e.g. a CI gate job) with no change to provisioning or safety.
+The injected-workload seam: the runner runs a caller-supplied `Workload` (a unit of on-host work over a ready host + an SSH connection, returning a `HostRun`) over the provision → run → guaranteed-teardown spine. The runner owns the lifecycle (readiness gate, upload staging, teardown); the workload owns only what runs on a ready host. The probe battery (`ProbeWorkload`) is the reference implementation — preserving the pre-seam probe path's per-probe capture contract — and the seam admits other workloads (e.g. a CI gate job) with no change to provisioning or safety.
 ## Requirements
 ### Requirement: The runner executes a caller-injected workload
 
@@ -43,9 +43,9 @@ does not provision, gate readiness, stage uploads, or tear the host down.
 ### Requirement: The probe battery is the reference workload implementation
 
 The system SHALL provide the probe battery as a workload implementation (`ProbeWorkload`) whose on-host
-behavior — a host-detail snapshot followed by the tag-ordered battery — is unchanged from before the
-seam existed, so the probe path's results are byte-faithful. The runner SHALL NOT name `ProbeWorkload`
-itself; the caller (the CLI) constructs it from a loaded battery and injects it.
+behavior — a host-detail snapshot followed by the battery, run in authoring order — preserves the probe
+path's contract: results are captured per probe exactly as before the seam existed. The runner SHALL NOT
+name `ProbeWorkload` itself; the caller (the CLI) constructs it from a loaded battery and injects it.
 
 #### Scenario: The probe path runs as an injected workload
 
