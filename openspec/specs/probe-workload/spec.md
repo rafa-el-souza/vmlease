@@ -10,7 +10,7 @@ stdout, and stderr, marking a probe ok exactly when it exits zero (interpretatio
 per-probe — an expected fail is still recorded data, not a run error). A probe SHALL escalate via sudo
 only when its tag is host-root. Each probe SHALL be bounded by a timeout: a probe MAY declare an optional
 per-probe `timeout`, and absent one it SHALL inherit a run-wide default supplied by the caller, so no
-single probe can block the battery — and thus the host's teardown — without bound. The battery JSON
+single probe can block the battery — and thus the host's teardown — without bound. The battery manifest
 SHALL remain back-compatible: a probe without a `timeout` is valid and uses the run-wide default. A probe
 that exceeds its timeout SHALL be recorded as a timed-out result (marked distinctly from a non-zero exit)
 and SHALL NOT abort the battery — the remaining probes still run, exactly as for a non-zero exit. To bound

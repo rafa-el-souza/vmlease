@@ -43,9 +43,9 @@ does not provision, gate readiness, stage uploads, or tear the host down.
 ### Requirement: The probe battery is the reference workload implementation
 
 The system SHALL provide the probe battery as a workload implementation (`ProbeWorkload`) whose on-host
-behavior — a host-detail snapshot followed by the tag-ordered battery — is unchanged from before the
-seam existed, so the probe path's results are byte-faithful. The runner SHALL NOT name `ProbeWorkload`
-itself; the caller (the CLI) constructs it from a loaded battery and injects it.
+behavior — a host-detail snapshot followed by the battery, run in authoring order — preserves the probe
+path's contract: results are captured per probe exactly as before the seam existed. The runner SHALL NOT
+name `ProbeWorkload` itself; the caller (the CLI) constructs it from a loaded battery and injects it.
 
 #### Scenario: The probe path runs as an injected workload
 
