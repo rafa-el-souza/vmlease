@@ -365,8 +365,8 @@ def _print_findings(findings: tuple[ShellcheckFinding, ...]) -> None:
     for probe_id, group in by_probe.items():
         print(f"probe {probe_id} ({group[0].location}):")
         for f in group:
-            code = f" {f.code}" if f.code else ""
-            print(f"  {f.line}:{f.column}: {f.severity}:{code} {f.message}")
+            code = f"{f.code} " if f.code else ""
+            print(f"  {f.line}:{f.column}: {f.severity}: {code}{f.message}")
 
 
 def _print_lint_summary(findings: tuple[ShellcheckFinding, ...], severity: str) -> None:

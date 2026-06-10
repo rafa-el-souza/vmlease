@@ -1,8 +1,9 @@
 """Battery loader — probes as data, NOT hardcoded.
 
 A battery is a declarative list of probes living with the project/change that
-needs it (e.g. ``openspec/explorations/<slug>/probes/``), so the harness stays
-project-agnostic: any change supplies its own battery bundle. This module
+needs it (e.g. the in-repo ``examples/compose-plugin-check/battery.toml``), so
+the harness stays project-agnostic: any change supplies its own battery bundle.
+This module
 parses that bundle into typed :class:`~vmlease.model.Battery` / ``Probe``
 objects and validates the shape (fail loud on a malformed battery).
 
@@ -45,6 +46,13 @@ sudo escalation but does NOT reorder execution. A probe's ``ok`` is its command'
 **exit code**, so gate assertions with ``exit $rc`` (a command ending in
 ``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
 it printed). The results document this feeds remains JSON.
+
+**Bash authoring contract**: probe commands are authored as **bash** — the
+dialect ``vmlease lint`` checks via ``--shell=bash`` — and all four shipped
+distro profiles provide bash for the operator. The transport-level bash
+guarantee (executing each probe via ``bash -s`` over stdin) is a queued
+follow-up change; until then this is an **authoring contract**, not a transport
+guarantee.
 """
 
 from __future__ import annotations
@@ -369,9 +377,6 @@ class _ShellcheckUnavailable:
     """
 
     __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - trivial repr
-        return "SHELLCHECK_UNAVAILABLE"
 
 
 SHELLCHECK_UNAVAILABLE = _ShellcheckUnavailable()

@@ -19,6 +19,8 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from tests.battery_helpers import _battery_toml
+
 # vmlease is a real package, so import it directly — this keeps mypy --strict
 # name-resolution working for the typed fakes below (importlib.import_module
 # would erase the symbol types).
@@ -147,39 +149,8 @@ def _fake_keypair(tmp: Path) -> keypair.Keypair:
 
 
 # --------------------------------------------------------------------------- #
-# TOML battery fixtures — a small authoring helper so fixtures are real bundles
+# TOML battery fixtures — ``_battery_toml`` lives in ``battery_helpers`` (shared)
 # --------------------------------------------------------------------------- #
-def _toml_str(value: str) -> str:
-    """Render a Python string as a TOML literal multi-line string (no escaping)."""
-    return f"'''{value}'''"
-
-
-def _battery_toml(name: str, probes: tuple[dict[str, object], ...]) -> str:
-    """Build a ``battery.toml`` manifest from probe dicts.
-
-    Each probe dict carries ``id``/``title``/``tag`` plus exactly one of ``run``
-    (an inline block) or ``script`` (a path); ``classifies``/``timeout`` optional.
-    Probes are written in the given order — that order IS the execution order, so
-    callers list probes in their intended authoring (formerly tag-rank) order.
-    """
-    lines = [f"name = {_toml_str(name)}", ""]
-    for p in probes:
-        lines.append("[[probe]]")
-        lines.append(f"id = {_toml_str(str(p['id']))}")
-        lines.append(f"title = {_toml_str(str(p['title']))}")
-        lines.append(f"tag = {_toml_str(str(p['tag']))}")
-        if "classifies" in p:
-            lines.append(f"classifies = {_toml_str(str(p['classifies']))}")
-        if "timeout" in p:
-            lines.append(f"timeout = {p['timeout']!r}")
-        if "script" in p:
-            lines.append(f"script = {_toml_str(str(p['script']))}")
-        else:
-            lines.append(f"run = {_toml_str(str(p['run']))}")
-        lines.append("")
-    return "\n".join(lines)
-
-
 def _resolve_toml(manifest: str, scripts: dict[str, str] | None = None) -> model.Battery:
     """Resolve a manifest (plus optional ``{path: contents}`` scripts) to a Battery.
 
@@ -490,6 +461,15 @@ class TestBattery(unittest.TestCase):
         self.assertEqual(b.probes[0].source, "<inline>")
         self.assertEqual(b.probes[1].command, "echo hi\n")
         self.assertEqual(b.probes[1].source, "prep.sh")
+
+    def test_real_example_battery_loads(self) -> None:
+        # The shipped in-repo example is a standing regression artifact: it must
+        # load through the real loader and stay shaped as documented.
+        example = Path(__file__).parent.parent / "examples" / "compose-plugin-check" / "battery.toml"
+        b = battery_mod.load_battery(example)
+        self.assertEqual(len(b.probes), 1)
+        self.assertEqual(b.probes[0].tag, ProbeTag.READ_ONLY)
+        self.assertTrue(b.probes[0].command.strip())
 
     def test_parse_bad_toml(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):

@@ -12,21 +12,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from tests.battery_helpers import _battery_toml
 from vmlease import cli, model, summary
 from vmlease.battery import load_battery
-
-
-def _battery_toml(name: str, probes: tuple[dict[str, str], ...]) -> str:
-    """Build a ``battery.toml`` manifest from probe dicts (id/title/run/tag/classifies)."""
-    lines = [f"name = '''{name}'''", ""]
-    for p in probes:
-        lines.append("[[probe]]")
-        for key in ("id", "title", "tag", "classifies"):
-            if key in p:
-                lines.append(f"{key} = '''{p[key]}'''")
-        lines.append(f"run = '''{p['run']}'''")
-        lines.append("")
-    return "\n".join(lines)
 
 
 def _write_battery(d: str, manifest: str) -> Path:

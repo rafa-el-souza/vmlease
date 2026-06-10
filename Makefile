@@ -39,7 +39,7 @@ coverage:  ## run the suite under coverage + report (fails below the floor)
 	@uv run --quiet coverage run -m unittest discover -s tests -t . --buffer
 	@uv run --quiet coverage report
 
-check: lint typecheck test coverage  ## the full gate (lint -> typecheck -> test -> coverage)
+check: lint lint-battery typecheck test coverage  ## the full gate (lint -> lint-battery -> typecheck -> test -> coverage)
 
 hooks:  ## install the pre-commit gate
 	@uv run --quiet pre-commit install
