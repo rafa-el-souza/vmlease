@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from tests.battery_helpers import _battery_toml
+from tests.battery_helpers import battery_toml
 from vmlease import cli, model, summary
 from vmlease.battery import load_battery
 
@@ -28,7 +28,7 @@ def _load_battery(manifest: str) -> model.Battery:
         return load_battery(_write_battery(d, manifest))
 
 
-_BATTERY_MANIFEST = _battery_toml(
+_BATTERY_MANIFEST = battery_toml(
     "summary-demo",
     (
         {"id": "start", "title": "start the sandbox", "run": "true",
@@ -170,7 +170,7 @@ class TestSummarizeResults(unittest.TestCase):
     def test_builtin_label_wins_and_matrix_keys_stay_clean_with_battery(self) -> None:
         # A battery whose `classifies` for a KNOWN id is a long sentence (not a
         # label) must NOT pollute the command/matrix key — the builtin wins.
-        battery = _load_battery(_battery_toml("noisy", (
+        battery = _load_battery(battery_toml("noisy", (
             {"id": "start", "title": "t", "run": "true", "tag": "mutating:host-root",
              "classifies": "a very long human sentence describing what start does in detail"},
             {"id": "novel-probe", "title": "novel title", "run": "true",

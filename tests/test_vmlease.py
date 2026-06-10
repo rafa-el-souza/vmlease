@@ -19,7 +19,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from tests.battery_helpers import _battery_toml
+from tests.battery_helpers import battery_toml
 
 # vmlease is a real package, so import it directly — this keeps mypy --strict
 # name-resolution working for the typed fakes below (importlib.import_module
@@ -149,7 +149,7 @@ def _fake_keypair(tmp: Path) -> keypair.Keypair:
 
 
 # --------------------------------------------------------------------------- #
-# TOML battery fixtures — ``_battery_toml`` lives in ``battery_helpers`` (shared)
+# TOML battery fixtures — ``battery_toml`` lives in ``battery_helpers`` (shared)
 # --------------------------------------------------------------------------- #
 def _resolve_toml(manifest: str, scripts: dict[str, str] | None = None) -> model.Battery:
     """Resolve a manifest (plus optional ``{path: contents}`` scripts) to a Battery.
@@ -181,7 +181,7 @@ def _write_battery_bundle(
     return str(p)
 
 
-_DEMO_BATTERY = _battery_toml(
+_DEMO_BATTERY = battery_toml(
     "demo-battery",
     (
         {"id": "P1", "title": "subid", "run": "grep x /etc/subuid", "tag": "read-only", "classifies": "L2"},
@@ -220,7 +220,7 @@ class TestModel(unittest.TestCase):
     def test_battery_probes_preserve_authoring_order(self) -> None:
         # probes run + record in authoring order regardless of tag; a read-only
         # probe authored AFTER a host-root probe stays after it (no tag-rank sort).
-        manifest = _battery_toml("x", (
+        manifest = battery_toml("x", (
             {"id": "SETUP", "title": "setup", "run": "c", "tag": "mutating:host-root"},
             {"id": "VERIFY", "title": "verify", "run": "c", "tag": "read-only"},
         ))
@@ -451,7 +451,7 @@ class TestBattery(unittest.TestCase):
 
     def test_resolve_ok(self) -> None:
         # a well-formed manifest with a run probe AND a script probe resolves.
-        manifest = _battery_toml("mixed", (
+        manifest = battery_toml("mixed", (
             {"id": "R", "title": "inline", "run": "uname -r", "tag": "read-only"},
             {"id": "S", "title": "scripted", "script": "prep.sh", "tag": "read-only"},
         ))
@@ -477,7 +477,7 @@ class TestBattery(unittest.TestCase):
 
     def test_parse_missing_name(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(_battery_toml("x", (self._one(),)).replace("name = '''x'''\n", ""))
+            battery_mod.parse_battery(battery_toml("x", (self._one(),)).replace("name = '''x'''\n", ""))
 
     def test_parse_empty_probes(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
@@ -491,7 +491,7 @@ class TestBattery(unittest.TestCase):
 
     def test_parse_unknown_tag(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(_battery_toml("x", (self._one(tag="weird"),)))
+            battery_mod.parse_battery(battery_toml("x", (self._one(tag="weird"),)))
 
     def test_parse_neither_run_nor_script(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
@@ -542,7 +542,7 @@ class TestBattery(unittest.TestCase):
             )
 
     def test_parse_duplicate_id(self) -> None:
-        manifest = _battery_toml("x", (
+        manifest = battery_toml("x", (
             {"id": "P", "title": "t", "run": "c", "tag": "read-only"},
             {"id": "P", "title": "t2", "run": "c2", "tag": "read-only"},
         ))
@@ -555,12 +555,12 @@ class TestBattery(unittest.TestCase):
         self.assertIsNone(spec.probes[0].timeout)
 
     def test_parse_timeout_value_carried(self) -> None:
-        spec = battery_mod.parse_battery(_battery_toml("x", (self._one(timeout=42),)))
+        spec = battery_mod.parse_battery(battery_toml("x", (self._one(timeout=42),)))
         self.assertEqual(spec.probes[0].timeout, 42.0)
 
     def test_parse_timeout_non_positive_raises(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(_battery_toml("x", (self._one(timeout=0),)))
+            battery_mod.parse_battery(battery_toml("x", (self._one(timeout=0),)))
 
     def test_parse_timeout_non_numeric_raises(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
@@ -579,12 +579,12 @@ class TestBattery(unittest.TestCase):
 
     # --- resolution + symlink-safe containment ---------------------------- #
     def test_resolve_script_absolute_path_rejected(self) -> None:
-        manifest = _battery_toml("x", (self._one(script="/etc/passwd"),))
+        manifest = battery_toml("x", (self._one(script="/etc/passwd"),))
         with self.assertRaises(battery_mod.BatteryError):
             _resolve_toml(manifest)
 
     def test_resolve_script_dotdot_escape_rejected(self) -> None:
-        manifest = _battery_toml("x", (self._one(script="../secret.sh"),))
+        manifest = battery_toml("x", (self._one(script="../secret.sh"),))
         with self.assertRaises(battery_mod.BatteryError):
             _resolve_toml(manifest)
 
@@ -594,25 +594,25 @@ class TestBattery(unittest.TestCase):
             secret.write_text("echo leak\n", encoding="utf-8")
             link = Path(bundle_d) / "prep.sh"
             link.symlink_to(secret)  # contained-looking name, out-of-tree target
-            manifest = _battery_toml("x", (self._one(script="prep.sh"),))
+            manifest = battery_toml("x", (self._one(script="prep.sh"),))
             (Path(bundle_d) / "battery.toml").write_text(manifest, encoding="utf-8")
             with self.assertRaises(battery_mod.BatteryError):
                 battery_mod.load_battery(Path(bundle_d) / "battery.toml")
 
     def test_resolve_missing_script_names_probe_and_path(self) -> None:
-        manifest = _battery_toml("x", (self._one(script="prep.sh"),))
+        manifest = battery_toml("x", (self._one(script="prep.sh"),))
         with self.assertRaises(battery_mod.BatteryError) as ctx:
             _resolve_toml(manifest)
         self.assertIn("'P'", str(ctx.exception))
         self.assertIn("prep.sh", str(ctx.exception))
 
     def test_resolve_empty_script_file_rejected(self) -> None:
-        manifest = _battery_toml("x", (self._one(script="prep.sh"),))
+        manifest = battery_toml("x", (self._one(script="prep.sh"),))
         with self.assertRaises(battery_mod.BatteryError):
             _resolve_toml(manifest, {"prep.sh": "   \n\t"})
 
     def test_resolve_empty_run_block_rejected(self) -> None:
-        manifest = _battery_toml("x", (self._one(run="   \n"),))
+        manifest = battery_toml("x", (self._one(run="   \n"),))
         with self.assertRaises(battery_mod.BatteryError):
             _resolve_toml(manifest)
 
@@ -931,7 +931,7 @@ class TestCli(unittest.TestCase):
     def test_plan_surfaces_lint_warnings_to_stderr(self) -> None:
         # a vacuously-ok probe → plan warns (non-fatal) on stderr, still exits 0
         with tempfile.TemporaryDirectory() as d:
-            manifest = _battery_toml("lint", (
+            manifest = battery_toml("lint", (
                 {"id": "V", "title": "v", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
             ))
             p = Path(_write_battery_bundle(d, manifest))
@@ -1014,7 +1014,7 @@ class TestCli(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestCliLint(unittest.TestCase):
     def _write(self, d: str, run: str = "uname -r") -> str:
-        manifest = _battery_toml("lint-cli", (
+        manifest = battery_toml("lint-cli", (
             {"id": "P", "title": "p", "run": run, "tag": "read-only"},
         ))
         return _write_battery_bundle(d, manifest)
@@ -1081,7 +1081,7 @@ class TestCliLint(unittest.TestCase):
     def test_unavailable_skips_with_notice_and_exits_0(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             # a vacuously-ok probe so the advisory check still has something to print
-            manifest = _battery_toml("lint-cli", (
+            manifest = battery_toml("lint-cli", (
                 {"id": "P", "title": "p", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
             ))
             p = _write_battery_bundle(d, manifest)
@@ -2287,7 +2287,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
 
     def _battery(self) -> model.Battery:
         # four probes; they run in authoring order Q1..Q4.
-        manifest = _battery_toml("b", (
+        manifest = battery_toml("b", (
             {"id": "Q1", "title": "t", "run": "c", "tag": "read-only"},
             {"id": "Q2", "title": "t", "run": "c", "tag": "read-only"},
             {"id": "Q3", "title": "t", "run": "c", "tag": "read-only"},
@@ -2338,7 +2338,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
     def test_mixed_tag_battery_runs_in_authoring_order(self) -> None:
         # a host-root probe authored before a read-only one executes (and records)
         # first — authoring order, not tag-rank; the read-only verifier runs after.
-        manifest = _battery_toml("b", (
+        manifest = battery_toml("b", (
             {"id": "SETUP", "title": "t", "run": "c", "tag": "mutating:host-root"},
             {"id": "VERIFY", "title": "t", "run": "c", "tag": "read-only"},
         ))
@@ -2351,7 +2351,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
     def test_script_probe_resolves_and_executes_via_workload(self) -> None:
         # a `script` probe's resolved command (the file's contents) reaches the
         # transport unchanged — exercising the script-ref path end-to-end.
-        manifest = _battery_toml("b", (
+        manifest = battery_toml("b", (
             {"id": "SCRIPTED", "title": "t", "script": "prep.sh", "tag": "read-only"},
         ))
         script_body = "set -euo pipefail\nuname -r\nexit 0\n"

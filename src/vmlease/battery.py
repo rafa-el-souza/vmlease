@@ -3,9 +3,8 @@
 A battery is a declarative list of probes living with the project/change that
 needs it (e.g. the in-repo ``examples/compose-plugin-check/battery.toml``), so
 the harness stays project-agnostic: any change supplies its own battery bundle.
-This module
-parses that bundle into typed :class:`~vmlease.model.Battery` / ``Probe``
-objects and validates the shape (fail loud on a malformed battery).
+This module parses that bundle into typed :class:`~vmlease.model.Battery` /
+``Probe`` objects and validates the shape (fail loud on a malformed battery).
 
 Format — a **TOML bundle**: a ``battery.toml`` manifest plus optional sibling
 shell scripts, parsed with the standard-library ``tomllib`` (no third-party
