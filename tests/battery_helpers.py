@@ -17,7 +17,8 @@ def battery_toml(name: str, probes: tuple[dict[str, object], ...]) -> str:
     """Build a ``battery.toml`` manifest from probe dicts.
 
     Each probe dict carries ``id``/``title``/``tag`` plus exactly one of ``run``
-    (an inline block) or ``script`` (a path); ``classifies``/``timeout`` optional.
+    (an inline block) or ``script`` (a path); ``classifies``/``timeout``/
+    ``success_when`` optional.
     Probes are written in the given order — that order IS the execution order, so
     callers list probes in their intended authoring (formerly tag-rank) order.
     """
@@ -31,6 +32,8 @@ def battery_toml(name: str, probes: tuple[dict[str, object], ...]) -> str:
             lines.append(f"classifies = {toml_str(str(p['classifies']))}")
         if "timeout" in p:
             lines.append(f"timeout = {p['timeout']!r}")
+        if "success_when" in p:
+            lines.append(f"success_when = {toml_str(str(p['success_when']))}")
         if "script" in p:
             lines.append(f"script = {toml_str(str(p['script']))}")
         else:

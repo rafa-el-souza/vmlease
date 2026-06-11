@@ -66,7 +66,7 @@ from typing import Literal
 
 from vmlease.model import Battery, Probe, ProbeTag
 
-_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script"})
+_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when"})
 _ROOT_KEYS = frozenset({"name", "probe"})
 
 
@@ -109,6 +109,7 @@ class _ProbeSpec:
     timeout: float | None
     run: str | None
     script: str | None
+    success_when: str = ""
 
 
 def parse_battery(text: str) -> _BatterySpec:
@@ -171,6 +172,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         valid = [t.value for t in ProbeTag]
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
     timeout = _parse_timeout(index, raw)
+    success_when = _parse_success_when(index, raw)
     run, script = _parse_command_form(index, raw)
     return _ProbeSpec(
         id=str(raw["id"]),
@@ -180,6 +182,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         timeout=timeout,
         run=run,
         script=script,
+        success_when=success_when,
     )
 
 
@@ -224,6 +227,24 @@ def _parse_timeout(index: int, raw: dict[object, object]) -> float | None:
     return float(value)
 
 
+def _parse_success_when(index: int, raw: dict[object, object]) -> str:
+    """Parse the optional per-probe ``success_when`` literal token.
+
+    Absent means ``""`` (exit-code reading — back-compatible). A *declared* value
+    must be a non-empty, non-whitespace-only string; a non-string or a
+    whitespace-only value is a malformed battery and raises :class:`BatteryError`
+    naming the probe.
+    """
+    if "success_when" not in raw:
+        return ""
+    value = raw["success_when"]
+    if not isinstance(value, str) or not value.strip():
+        raise BatteryError(
+            f"probe #{index} 'success_when' must be a non-empty string, got {value!r}"
+        )
+    return value
+
+
 def _assert_unique_ids(specs: tuple[_ProbeSpec, ...]) -> None:
     seen: set[str] = set()
     for s in specs:
@@ -265,6 +286,7 @@ def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:
         classifies=spec.classifies,
         timeout=spec.timeout,
         source=source,
+        success_when=spec.success_when,
     )
 
 

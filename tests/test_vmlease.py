@@ -627,6 +627,39 @@ class TestBattery(unittest.TestCase):
                 "tag = '''read-only'''\nrun = '''c'''\ntimeout = true\n"
             )
 
+    def test_parse_success_when_absent_is_empty(self) -> None:
+        # back-compat: a battery without success_when loads, token "".
+        spec = battery_mod.parse_battery(_DEMO_BATTERY)
+        self.assertEqual(spec.probes[0].success_when, "")
+
+    def test_parse_success_when_value_carried(self) -> None:
+        spec = battery_mod.parse_battery(battery_toml("x", (self._one(success_when="READY"),)))
+        self.assertEqual(spec.probes[0].success_when, "READY")
+
+    def test_resolve_success_when_carried_onto_probe(self) -> None:
+        # the resolved Probe carries the declared token through to model.
+        b = _resolve_toml(battery_toml("x", (self._one(success_when="READY"),)))
+        self.assertEqual(b.probes[0].success_when, "READY")
+
+    def test_parse_success_when_empty_string_raises_naming_probe(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = ''''''\n"
+            )
+        self.assertIn("success_when", str(ctx.exception))
+
+    def test_parse_success_when_whitespace_only_raises(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(battery_toml("x", (self._one(success_when="   "),)))
+
+    def test_parse_success_when_non_string_raises(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = 5\n"
+            )
+
     # --- resolution + symlink-safe containment ---------------------------- #
     def test_resolve_script_absolute_path_rejected(self) -> None:
         manifest = battery_toml("x", (self._one(script="/etc/passwd"),))
@@ -1371,6 +1404,15 @@ class TestSsh(unittest.TestCase):
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
         self.assertFalse(res.timed_out)  # a within-timeout probe is not a timeout
 
+    def test_run_probe_threads_success_when_and_derives_ok_from_token(self) -> None:
+        # a declaring probe's token travels into the result, and ``ok`` is read off
+        # stdout (the token line present) even though the exit code is non-zero.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "noise\nREADY\nmore", ""))
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY, success_when="READY")
+        res = r.run_probe(self._host(), probe)
+        self.assertEqual(res.success_when, "READY")
+        self.assertTrue(res.ok)  # token line present → ok despite non-zero exit
+
     def test_run_probe_blocking_seam_records_timed_out_result(self) -> None:
         # T1: a slow/blocking transport that raises TimeoutExpired is RECORDED as a
         # timed-out result (exit 124, timed_out=True, partial output), not raised
@@ -1867,6 +1909,21 @@ class TestResults(unittest.TestCase):
         self.assertFalse(doc["hosts"][0]["probes"][0]["timed_out"])  # normal probe
         self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
         self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
+        # success_when is serialized unconditionally, including for the timed-out probe.
+        self.assertEqual(doc["hosts"][0]["probes"][0]["success_when"], "")
+        self.assertEqual(doc["hosts"][0]["probes"][1]["success_when"], "")
+
+    def test_serialize_declaring_probe_ok_from_token_and_carries_field(self) -> None:
+        # end-to-end: a declaring probe whose stdout carries the token serializes
+        # ok=True (token-derived, despite a non-zero exit) AND its success_when field.
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        res = (ProbeResult("P1", ProbeTag.READ_ONLY, 1, "noise\nREADY\n", "", success_when="READY"),)
+        hr = model.HostRun(host_spec=spec, detail="ok", results=res)
+        doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
+        probe = doc["hosts"][0]["probes"][0]
+        self.assertEqual(probe["success_when"], "READY")
+        self.assertTrue(probe["ok"])  # token-derived ok despite exit_code 1
+        self.assertEqual(probe["exit_code"], 1)
 
     def test_write_results_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:

@@ -245,6 +245,7 @@ class OpenSshRunner:
             exit_code=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
+            success_when=probe.success_when,
         )
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
@@ -397,6 +398,7 @@ def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpir
         stdout=stdout,
         stderr=stderr,
         timed_out=True,
+        success_when=probe.success_when,
     )
 
 
