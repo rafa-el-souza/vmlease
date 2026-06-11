@@ -10,8 +10,9 @@ Format — a **TOML bundle**: a ``battery.toml`` manifest plus optional sibling
 shell scripts, parsed with the standard-library ``tomllib`` (no third-party
 dependency). The manifest carries a non-empty string ``name`` and a non-empty
 ``[[probe]]`` array. Each probe declares a stable ``id``, a ``title``, a ``tag``
-(one of the :class:`~vmlease.model.ProbeTag` values), an optional ``classifies``
-label and ``timeout`` (seconds), and **exactly one of**:
+(one of the :class:`~vmlease.model.ProbeTag` values), optional ``classifies``
+label, ``timeout`` (seconds) and ``success_when`` token (see the authoring
+caveat below), and **exactly one of**:
 
 - ``run`` — a literal inline shell block (TOML's ``'''…'''`` multi-line strings
   need no escaping), used verbatim as the command; provenance ``"<inline>"``.
@@ -40,11 +41,18 @@ that **every** ``Probe.command`` is non-empty resolved shell.
 
 **Authoring caveat** (:func:`lint_battery` warns about it): probes EXECUTE in
 **authoring order** — the order they appear in the ``[[probe]]`` array is the
-order they run and are recorded; ``tag`` records what a probe touches and governs
-sudo escalation but does NOT reorder execution. A probe's ``ok`` is its command's
-**exit code**, so gate assertions with ``exit $rc`` (a command ending in
+order they run and are recorded; ``tag`` records what a probe touches but does
+NOT reorder execution. A probe's ``ok`` is its command's **exit code by
+default**, so gate assertions with ``exit $rc`` (a command ending in
 ``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
-it printed). The results document this feeds remains JSON.
+it printed). A probe MAY instead declare an optional ``success_when`` token:
+then ``ok`` is whether that token appears as a complete line of stdout (exit
+code ignored), so such a probe needs no ``exit $rc`` and is exempt from the
+vacuous-ok warning. On sudo: the resolved command runs **verbatim** — ``tag``
+does not inject, strip, or enforce ``sudo``; the ``mutating:host-root`` tag
+**authorizes and records** escalation, and :func:`lint_battery` emits an
+**advisory** warning when a non-host-root probe invokes ``sudo`` (a mislabel
+surfaced, not a blocked run). The results document this feeds remains JSON.
 
 **Bash authoring contract**: probe commands are authored as **bash** — the
 dialect ``vmlease lint`` checks via ``--shell=bash`` — and all four shipped
