@@ -6,22 +6,56 @@ The probe battery workload: declarative `Probe`/`Battery` data loaded from a TOM
 ### Requirement: Each probe is run over SSH as the operator and its outcome captured
 
 The system SHALL run each probe's command over SSH as the non-root operator and capture its exit code,
-stdout, and stderr, marking a probe ok exactly when it exits zero (interpretation of a non-zero exit is
-per-probe — an expected fail is still recorded data, not a run error). A probe SHALL escalate via sudo
-only when its tag is host-root. Each probe SHALL be bounded by a timeout: a probe MAY declare an optional
-per-probe `timeout`, and absent one it SHALL inherit a run-wide default supplied by the caller, so no
-single probe can block the battery — and thus the host's teardown — without bound. The battery manifest
-SHALL remain back-compatible: a probe without a `timeout` is valid and uses the run-wide default. A probe
-that exceeds its timeout SHALL be recorded as a timed-out result (marked distinctly from a non-zero exit)
-and SHALL NOT abort the battery — the remaining probes still run, exactly as for a non-zero exit. To bound
-the cost of a wedged host, after a configurable number of **consecutive** timed-out probes (default 2) the
-system SHALL stop running the rest of that host's battery and record why, rather than spending a full
-timeout on every remaining probe.
+stdout, and stderr. A probe's `ok` SHALL be determined by exactly one of two readings: when the probe
+declares a `success_when` token, `ok` is true exactly when that token appears as a complete line
+(ignoring leading/trailing whitespace) of the captured stdout — the exit code does not participate;
+absent a declaration, `ok` is true exactly when the probe exits zero (interpretation of a non-zero exit
+is per-probe — an expected fail is still recorded data, not a run error). A timed-out probe SHALL NOT
+be ok under either reading — a killed probe's partial output is not a verdict. The system SHALL execute
+the resolved command **verbatim**: it SHALL NOT inject, strip, or refuse `sudo` based on the probe's
+tag. Escalation is an authoring contract — the author writes `sudo` in the command, and the host-root
+tag authorizes and records that escalation — backed by an advisory lint warning (see the lint
+requirement), not by an enforcement gate. Each probe SHALL be bounded by a timeout: a probe MAY declare
+an optional per-probe `timeout`, and absent one it SHALL inherit a run-wide default supplied by the
+caller, so no single probe can block the battery — and thus the host's teardown — without bound. The
+battery manifest SHALL remain back-compatible: a probe without a `timeout` is valid and uses the
+run-wide default. A probe that exceeds its timeout SHALL be recorded as a timed-out result (marked
+distinctly from a non-zero exit) and SHALL NOT abort the battery — the remaining probes still run,
+exactly as for a non-zero exit. To bound the cost of a wedged host, after a configurable number of
+**consecutive** timed-out probes (default 2) the system SHALL stop running the rest of that host's
+battery and record why, rather than spending a full timeout on every remaining probe.
 
 #### Scenario: Probe outcome is captured
 
-- **WHEN** a probe runs on a ready host
+- **WHEN** a probe with no `success_when` declaration runs on a ready host
 - **THEN** its exit code, stdout, and stderr are recorded, with ok set iff the exit code is zero
+
+#### Scenario: A declared success token decides ok instead of the exit code
+
+- **WHEN** a probe declaring `success_when = "CORE_RUNNING_OK"` prints that token as a line of stdout
+  and exits non-zero
+- **THEN** its result is ok — the declared token replaces the exit-code reading
+
+#### Scenario: A missing declared token makes the probe not ok even on exit zero
+
+- **WHEN** a probe declaring a `success_when` token exits zero without printing the token as a line
+- **THEN** its result is not ok — exit-gating gymnastics are not consulted for a declaring probe
+
+#### Scenario: A diagnostic mention of the token does not pass the probe
+
+- **WHEN** a declaring probe's stdout contains the token only embedded in a longer line (e.g. a banner
+  or a count), never as its own line
+- **THEN** its result is not ok
+
+#### Scenario: A timed-out probe is never ok
+
+- **WHEN** a declaring probe prints its token and then exceeds its timeout
+- **THEN** the result is recorded as timed out and is not ok — partial output is not a verdict
+
+#### Scenario: The command runs verbatim regardless of tag
+
+- **WHEN** a probe not tagged host-root has `sudo` in its command
+- **THEN** the command is executed unchanged (the mismatch is the lint's concern, not the runner's)
 
 #### Scenario: A non-zero probe does not abort the battery
 
@@ -109,44 +143,82 @@ non-zero — and SHALL still tear the host down.
 
 ### Requirement: A loaded battery is linted for footguns, surfaced non-fatally
 
-The system SHALL lint a loaded battery for the **vacuous-ok** footgun and surface a **non-fatal** warning:
-a probe command that is **not exit-gated** yet prints success/failure tokens — so its `ok`, which reflects
-only the exit code, would be vacuous. The lint itself SHALL NOT raise, reorder probes, or alter the
-exit-code `ok` semantics — it only warns. (The former "order-surprise" footgun no longer exists: execution
-order is now authoring order — see "Probes run in authoring order" — so there is no hidden reordering to
-warn about.)
+The system SHALL lint a loaded battery and surface **non-fatal** warnings; the lint itself SHALL NOT
+raise, reorder probes, or alter any probe's `ok` semantics — it only warns. Two footguns are checked:
+
+- **vacuous-ok** — a probe **without** a `success_when` declaration whose command is **not exit-gated**
+  yet prints success/failure tokens — its `ok`, which reflects only the exit code, would be vacuous. A
+  probe **with** a `success_when` declaration SHALL NOT be flagged: its `ok` is read from the declared
+  token, so an un-gated token-printing command is exactly the intended authoring style.
+- **non-host-root sudo** — a probe whose tag is not host-root but whose command invokes `sudo`: the
+  escalation authoring contract reserves `sudo` for host-root-tagged probes, so the mismatch means the
+  tag is lying about what the probe does. The command still runs verbatim; the warning surfaces the
+  mislabel.
+
+(The former "order-surprise" footgun no longer exists: execution order is now authoring order — see
+"Probes run in authoring order" — so there is no hidden reordering to warn about.)
 
 #### Scenario: A vacuously-ok probe warns
 
-- **WHEN** a probe's command prints success/failure tokens but is not gated with an explicit exit
+- **WHEN** a probe without `success_when` prints success/failure tokens but is not gated with an
+  explicit exit
 - **THEN** a non-fatal warning naming the probe is surfaced (its `ok` reflects only the exit code), and
   the run still proceeds
 
+#### Scenario: A success_when probe is exempt from the vacuous-ok warning
+
+- **WHEN** a probe declares `success_when` and its command prints tokens without an explicit exit
+- **THEN** no vacuous-ok warning is surfaced for it — its `ok` is read from the declared token
+
+#### Scenario: A non-host-root probe invoking sudo warns
+
+- **WHEN** a probe tagged read-only or operator-space has `sudo` in its command
+- **THEN** a non-fatal warning naming the probe is surfaced, and the run still proceeds with the
+  command unchanged
+
+#### Scenario: A host-root probe invoking sudo does not warn
+
+- **WHEN** a probe tagged host-root has `sudo` in its command
+- **THEN** no sudo warning is surfaced — escalation is what the tag authorizes
+
 #### Scenario: A clean battery warns nothing
 
-- **WHEN** no probe has an un-gated token-printing tail
+- **WHEN** no probe has an un-gated token-printing tail (absent `success_when`) and no non-host-root
+  probe invokes sudo
 - **THEN** no lint warning is surfaced
 
 ### Requirement: A battery is declarative data loaded from a TOML manifest
 
 The system SHALL load a named probe battery from a **TOML manifest**, where each probe is a declarative
-record carrying a stable id, title, tag, optional classification, and optional timeout, plus its command
-expressed as **exactly one of** an inline `run` block (a literal shell string) or a `script` reference to a
-co-located shell file. The system SHALL raise a clear error for a malformed battery — invalid TOML, a
-missing required field, an unknown tag, an **unrecognized key** at the root or on a probe (a typo like
-`timout` SHALL fail loud, naming the key, rather than silently falling back to a default), a probe
-declaring **neither** `run` nor `script`, or a probe declaring **both**. The manifest is parsed with the
-standard library (no third-party dependency); the results document this feeds remains JSON.
+record carrying a stable id, title, tag, optional classification, optional timeout, and optional
+`success_when` success token, plus its command expressed as **exactly one of** an inline `run` block (a
+literal shell string) or a `script` reference to a co-located shell file. The system SHALL raise a clear
+error for a malformed battery — invalid TOML, a missing required field, an unknown tag, an
+**unrecognized key** at the root or on a probe (a typo like `timout` SHALL fail loud, naming the key,
+rather than silently falling back to a default), a probe declaring **neither** `run` nor `script`, a
+probe declaring **both**, or a `success_when` that is declared but empty or whitespace-only (such a
+token could never match a line, making the probe unconditionally not-ok). The manifest is parsed with
+the standard library (no third-party dependency); the results document this feeds remains JSON.
 
 #### Scenario: A well-formed battery loads
 
 - **WHEN** a valid battery TOML manifest is loaded
 - **THEN** a named battery of probes is returned, each probe carrying its resolved command
 
+#### Scenario: A probe declaring a success token loads and carries it
+
+- **WHEN** a probe declares `success_when = "SETUP_OK"`
+- **THEN** the battery loads and that probe carries the token for the runner's ok reading
+
 #### Scenario: A malformed battery is rejected
 
 - **WHEN** a battery manifest is invalid TOML, missing a required field, or names an unknown tag
 - **THEN** the system raises a battery-load error
+
+#### Scenario: An empty declared success token is rejected
+
+- **WHEN** a probe declares a `success_when` that is empty or whitespace-only
+- **THEN** the system raises a battery-load error naming the probe
 
 #### Scenario: A probe must declare exactly one command form
 
@@ -161,11 +233,11 @@ standard library (no third-party dependency); the results document this feeds re
 ### Requirement: Probes run in authoring order
 
 The system SHALL execute a battery's probes in the order they appear in the manifest — the manifest **is**
-the execution order, regardless of tag. A probe's `tag` records what the probe touches (and governs the
-sudo-escalation contract) but SHALL NOT reorder execution. Results SHALL be recorded in that same
-authoring order. This lets a probe's prerequisites be expressed directly — author the prerequisite probe
-earlier — and makes the results sequence match the manifest, so a result is interpreted in the order it
-was written.
+the execution order, regardless of tag. A probe's `tag` records what the probe touches (and is the
+authoring contract that authorizes sudo escalation — see the probe-outcome requirement) but SHALL NOT
+reorder execution. Results SHALL be recorded in that same authoring order. This lets a probe's
+prerequisites be expressed directly — author the prerequisite probe earlier — and makes the results
+sequence match the manifest, so a result is interpreted in the order it was written.
 
 #### Scenario: Probes run top-to-bottom as written
 
