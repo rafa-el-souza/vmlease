@@ -83,7 +83,8 @@ class Battery:
 
     Probes execute in **authoring order** — the order they appear in ``probes``
     is the order they run and are recorded. ``tag`` records what each probe
-    touches and governs sudo escalation; it does not reorder execution.
+    touches (and authorizes/records sudo escalation — the command runs verbatim,
+    the lint warns on a non-host-root sudo); it does not reorder execution.
     """
 
     name: str
