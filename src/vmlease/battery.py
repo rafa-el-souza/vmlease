@@ -319,24 +319,52 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     """Non-fatal authoring warnings for a battery (never raises; ``()`` = clean).
 
     Probes execute in **authoring order**, so there is no reorder to surprise an
-    author; the surviving footgun is ``ok`` semantics:
+    author; two footguns are checked, both advisory:
 
-    - **vacuous-ok** — a probe's ``ok`` is its command's exit code. A command that
-      prints OK/FAIL tokens but is not ``exit``-gated always exits 0, so ``ok`` is
-      meaningless regardless of what it printed. Gate with ``exit $rc``.
+    - **vacuous-ok** — a probe **without** a ``success_when`` declaration whose
+      ``ok`` is its command's exit code. A command that prints OK/FAIL tokens but is
+      not ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what
+      it printed. Gate with ``exit $rc``. A probe **with** a ``success_when``
+      declaration is **exempt**: its ``ok`` is read from the declared token, not the
+      exit code, so an un-gated token-printing tail is exactly the intended
+      authoring style, not a footgun.
 
-    The vacuous-ok check is a best-effort heuristic (the shell is not parsed); the
-    real guarantee is still the author's ``exit $rc``. Warnings are advisory — the
-    run and ``ok`` are unaffected.
+    - **non-host-root sudo** — a probe whose tag is not ``MUTATING_HOST_ROOT`` but
+      whose command invokes ``sudo``. The escalation authoring contract reserves
+      ``sudo`` for host-root-tagged probes, so the mismatch means the tag is lying
+      about what the probe does. The command still runs verbatim; the warning
+      surfaces the mislabel.
+
+    Both checks are best-effort heuristics (the shell is not parsed); the real
+    guarantee is still the author's ``exit $rc`` / tag. Warnings are advisory — the
+    run and ``ok`` are unaffected, and a single probe may trigger both rules.
     """
     warnings: list[str] = []
     for probe in battery.probes:
-        if _looks_vacuously_ok(probe.command):
+        if not probe.success_when and _looks_vacuously_ok(probe.command):
             warnings.append(
                 f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
                 f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
             )
+        if probe.tag is not ProbeTag.MUTATING_HOST_ROOT and _invokes_sudo(probe.command):
+            warnings.append(
+                f"probe {probe.id!r}: command invokes sudo but the probe is not tagged "
+                f"{ProbeTag.MUTATING_HOST_ROOT.value!r} -- escalation belongs to host-root probes; "
+                f"the command still runs verbatim, so re-tag the probe or drop the sudo"
+            )
     return tuple(warnings)
+
+
+def _invokes_sudo(command: str) -> bool:
+    """True iff ``command`` invokes ``sudo`` (word-boundary heuristic).
+
+    Best-effort, same character as :func:`_looks_vacuously_ok`: the shell is not
+    parsed, so this matches a ``sudo`` word anywhere in the command text. The
+    word-boundary anchor keeps it from firing on substrings like ``pseudo`` or
+    ``sudoers``. No run behavior depends on the result — it only feeds an advisory
+    warning.
+    """
+    return re.search(r"\bsudo\b", command) is not None
 
 
 def _looks_vacuously_ok(command: str) -> bool:

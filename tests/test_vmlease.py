@@ -764,6 +764,56 @@ class TestBatteryLint(unittest.TestCase):
         b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())
 
+    def _ps(self, pid: str, cmd: str, tag: ProbeTag, success_when: str) -> Probe:
+        return Probe(id=pid, title=pid, command=cmd, tag=tag, success_when=success_when)
+
+    def test_success_when_probe_exempt_from_vacuous_ok(self) -> None:
+        # un-gated token-printing tail, but ok is token-derived -> not a footgun.
+        b = self._b(
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY")
+        )
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_same_probe_without_success_when_still_warns(self) -> None:
+        b = self._b(self._p("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY))
+        warns = battery_mod.lint_battery(b)
+        self.assertTrue(any("'T'" in w and "exit $rc" in w for w in warns))
+
+    def test_non_host_root_sudo_warns_naming_probe(self) -> None:
+        b = self._b(self._p("S", "sudo systemctl restart foo; exit $?", ProbeTag.READ_ONLY))
+        warns = battery_mod.lint_battery(b)
+        self.assertTrue(
+            any("'S'" in w and "sudo" in w and "mutating:host-root" in w for w in warns)
+        )
+
+    def test_operator_space_sudo_warns(self) -> None:
+        b = self._b(self._p("O", "sudo -n true; exit $?", ProbeTag.MUTATING_OPERATOR_SPACE))
+        self.assertTrue(any("'O'" in w and "sudo" in w for w in battery_mod.lint_battery(b)))
+
+    def test_host_root_sudo_does_not_warn(self) -> None:
+        b = self._b(self._p("H", "sudo systemctl restart foo; exit $?", ProbeTag.MUTATING_HOST_ROOT))
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_sudo_word_boundary_no_false_positive_on_substrings(self) -> None:
+        # 'pseudo' / 'sudoers' must NOT trip the sudo heuristic.
+        b = self._b(self._p("P", "cat /etc/sudoers; ls /pseudo; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_clean_battery_with_declared_and_gated_probes_silent(self) -> None:
+        b = self._b(
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY"),
+            self._p("G", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
+        )
+        self.assertEqual(battery_mod.lint_battery(b), ())
+
+    def test_probe_can_trigger_both_rules(self) -> None:
+        # un-gated token tail (no success_when) AND non-host-root sudo -> two warnings.
+        b = self._b(self._p("B", "sudo check && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        warns = battery_mod.lint_battery(b)
+        self.assertEqual(len(warns), 2)
+        self.assertTrue(any("exit $rc" in w for w in warns))
+        self.assertTrue(any("sudo" in w for w in warns))
+
 
 # --------------------------------------------------------------------------- #
 # battery.shellcheck_battery — severity-graded findings over every probe (D5)
