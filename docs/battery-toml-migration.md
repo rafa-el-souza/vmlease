@@ -13,10 +13,20 @@ shellchecks every probe and reports real `file:line:col` locations, and is sever
 a CI/pre-commit gate.
 
 **What did NOT change:** the **results** document is still JSON (and `vmlease summarize` still reads
-it); `tag` still means what a probe touches and still governs sudo escalation; per-probe `timeout`
-semantics, the consecutive-timeout breaker, `ok` = exit code, uploads, teardown/reap — all unchanged.
-The `plan`/`run`/`status`/`reap` CLI surface is unchanged except that `--battery` now takes the
-manifest path.
+it); `tag` still means what a probe touches; per-probe `timeout` semantics, the consecutive-timeout
+breaker, uploads, teardown/reap — all unchanged. `ok` = exit code **unless a probe declares
+`success_when`** (a new optional key — see below). The resolved command runs **verbatim**: `tag` does
+not inject, strip, or enforce `sudo`; the `mutating:host-root` tag authorizes and records escalation,
+and `vmlease lint` emits an advisory warning when a non-host-root probe invokes `sudo` (a mislabel,
+not a block). The `plan`/`run`/`status`/`reap` CLI surface is unchanged except that `--battery` now
+takes the manifest path.
+
+**New optional key — `success_when`:** a probe may declare a single literal token (e.g.
+`success_when = "CORE_RUNNING_OK"`). When present, it **replaces** the exit-code reading: `ok` is true
+iff that token appears as a *complete line* of the probe's stdout (substring matches do not count, and
+the exit code is ignored). Such a probe needs no `rc=0; …; exit $rc` plumbing and is exempt from the
+vacuous-ok lint warning. A timed-out probe is never `ok` regardless of `success_when`. Omit the key to
+keep the exit-code reading; existing batteries that never declare it behave exactly as before.
 
 ---
 

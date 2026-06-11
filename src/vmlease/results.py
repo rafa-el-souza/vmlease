@@ -37,6 +37,7 @@ def serialize_run(run_id: str, timestamp: str, host_runs: list[HostRun]) -> str:
                         "id": r.probe_id,
                         "tag": r.tag.value,
                         "exit_code": r.exit_code,
+                        "success_when": r.success_when,
                         "ok": r.ok,
                         "timed_out": r.timed_out,
                         "stdout": r.stdout,

@@ -90,6 +90,45 @@ class TestVerdict(unittest.TestCase):
     def test_pass_no_assertions(self) -> None:
         self.assertEqual(summary.verdict(0, False, [], []), summary.PASS_NO_ASSERTIONS)
 
+    # --- declared-predicate branch (success_when) --------------------------- #
+    def test_declared_ok_true_nonzero_exit_is_pass(self) -> None:
+        # (5.2a) declared success_when + recorded ok=True + non-zero exit → PASS:
+        # the declared predicate overrides the exit-code rule.
+        self.assertEqual(
+            summary.verdict(1, False, [], [], success_when="GATE_OK", ok=True), summary.PASS
+        )
+
+    def test_declared_ok_false_with_stray_ok_token_is_fail(self) -> None:
+        # (5.2b) declared + ok=False + a stray *_OK token in stdout → FAIL:
+        # the declared predicate overrides both the exit-code and ok-token rules.
+        self.assertEqual(
+            summary.verdict(0, False, [], ["STRAY_OK"], success_when="GATE_OK", ok=False),
+            summary.FAIL,
+        )
+
+    def test_declared_ok_false_with_stray_fail_token_is_fail(self) -> None:
+        # declared + ok=False + a stray *_FAIL diagnostic → still FAIL (no double-count,
+        # the predicate is authoritative over the fail-token arm too).
+        self.assertEqual(
+            summary.verdict(0, False, ["STRAY_FAIL"], [], success_when="GATE_OK", ok=False),
+            summary.FAIL,
+        )
+
+    def test_declared_timed_out_is_timeout(self) -> None:
+        # (5.2c) declared + timed_out=True → TIMEOUT dominates the declared predicate.
+        self.assertEqual(
+            summary.verdict(0, True, [], ["GATE_OK"], success_when="GATE_OK", ok=True),
+            summary.TIMEOUT,
+        )
+
+    def test_undeclared_defaults_unchanged(self) -> None:
+        # (5.2d) an exit-code probe (empty success_when) gets the exact pre-branch verdict
+        # across all four arms — the new params default so the old precedence is verbatim.
+        self.assertEqual(summary.verdict(0, False, ["X_FAIL"], []), summary.FAIL)        # fail-token
+        self.assertEqual(summary.verdict(1, False, [], ["Y_OK"]), summary.FAIL)          # nonzero exit
+        self.assertEqual(summary.verdict(0, False, [], ["Y_OK"]), summary.PASS)          # ok-token
+        self.assertEqual(summary.verdict(0, False, [], []), summary.PASS_NO_ASSERTIONS)  # no tokens
+
 
 # --------------------------------------------------------------------------- #
 # summarize_results
@@ -195,6 +234,38 @@ class TestSummarizeResults(unittest.TestCase):
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [_probe("mystery")]}])
         s = summary.summarize_results(doc)
         self.assertEqual(s["hosts"][0]["probes"][0]["command"], "mystery")
+
+    def test_declaring_probe_honors_recorded_ok_over_exit_and_tokens(self) -> None:
+        # End-to-end through _summarize_probe: a declaring probe that exits non-zero but
+        # recorded ok=True (and even carries a stray *_FAIL diagnostic) is PASS, and that
+        # PASS flows into totals + a zero overall exit code.
+        raw_probe = {
+            "id": "start", "tag": "read-only", "exit_code": 1, "ok": True,
+            "timed_out": False, "success_when": "GATE_OK",
+            "stdout": "GATE_OK\nSOME_NOISE_FAIL", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.PASS)
+        self.assertTrue(probe["ok"])
+        self.assertEqual(probe["fail_tokens"], ["SOME_NOISE_FAIL"])  # harvested but not authoritative
+        self.assertEqual(s["totals"][summary.PASS], 1)
+        self.assertEqual(s["totals"][summary.FAIL], 0)
+        self.assertEqual(summary.overall_exit_code(s), 0)
+
+    def test_declaring_probe_recorded_not_ok_is_fail(self) -> None:
+        # A declaring probe recorded ok=False is FAIL even on a zero exit with a stray *_OK.
+        raw_probe = {
+            "id": "start", "tag": "read-only", "exit_code": 0, "ok": False,
+            "timed_out": False, "success_when": "GATE_OK",
+            "stdout": "STRAY_OK", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.FAIL)
+        self.assertEqual(summary.overall_exit_code(s), 1)
 
     def test_token_trailing_boundary_rejects_longer_word(self) -> None:
         # `_FAILED` (a longer word) must NOT be harvested as a `_FAIL` token.

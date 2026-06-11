@@ -10,8 +10,9 @@ Format — a **TOML bundle**: a ``battery.toml`` manifest plus optional sibling
 shell scripts, parsed with the standard-library ``tomllib`` (no third-party
 dependency). The manifest carries a non-empty string ``name`` and a non-empty
 ``[[probe]]`` array. Each probe declares a stable ``id``, a ``title``, a ``tag``
-(one of the :class:`~vmlease.model.ProbeTag` values), an optional ``classifies``
-label and ``timeout`` (seconds), and **exactly one of**:
+(one of the :class:`~vmlease.model.ProbeTag` values), optional ``classifies``
+label, ``timeout`` (seconds) and ``success_when`` token (see the authoring
+caveat below), and **exactly one of**:
 
 - ``run`` — a literal inline shell block (TOML's ``'''…'''`` multi-line strings
   need no escaping), used verbatim as the command; provenance ``"<inline>"``.
@@ -40,11 +41,18 @@ that **every** ``Probe.command`` is non-empty resolved shell.
 
 **Authoring caveat** (:func:`lint_battery` warns about it): probes EXECUTE in
 **authoring order** — the order they appear in the ``[[probe]]`` array is the
-order they run and are recorded; ``tag`` records what a probe touches and governs
-sudo escalation but does NOT reorder execution. A probe's ``ok`` is its command's
-**exit code**, so gate assertions with ``exit $rc`` (a command ending in
+order they run and are recorded; ``tag`` records what a probe touches but does
+NOT reorder execution. A probe's ``ok`` is its command's **exit code by
+default**, so gate assertions with ``exit $rc`` (a command ending in
 ``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
-it printed). The results document this feeds remains JSON.
+it printed). A probe MAY instead declare an optional ``success_when`` token:
+then ``ok`` is whether that token appears as a complete line of stdout (exit
+code ignored), so such a probe needs no ``exit $rc`` and is exempt from the
+vacuous-ok warning. On sudo: the resolved command runs **verbatim** — ``tag``
+does not inject, strip, or enforce ``sudo``; the ``mutating:host-root`` tag
+**authorizes and records** escalation, and :func:`lint_battery` emits an
+**advisory** warning when a non-host-root probe invokes ``sudo`` (a mislabel
+surfaced, not a blocked run). The results document this feeds remains JSON.
 
 **Bash authoring contract**: probe commands are authored as **bash** — the
 dialect ``vmlease lint`` checks via ``--shell=bash`` — and all four shipped
@@ -66,7 +74,7 @@ from typing import Literal
 
 from vmlease.model import Battery, Probe, ProbeTag
 
-_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script"})
+_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when"})
 _ROOT_KEYS = frozenset({"name", "probe"})
 
 
@@ -109,6 +117,7 @@ class _ProbeSpec:
     timeout: float | None
     run: str | None
     script: str | None
+    success_when: str = ""
 
 
 def parse_battery(text: str) -> _BatterySpec:
@@ -171,6 +180,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         valid = [t.value for t in ProbeTag]
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
     timeout = _parse_timeout(index, raw)
+    success_when = _parse_success_when(index, raw)
     run, script = _parse_command_form(index, raw)
     return _ProbeSpec(
         id=str(raw["id"]),
@@ -180,6 +190,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         timeout=timeout,
         run=run,
         script=script,
+        success_when=success_when,
     )
 
 
@@ -224,6 +235,24 @@ def _parse_timeout(index: int, raw: dict[object, object]) -> float | None:
     return float(value)
 
 
+def _parse_success_when(index: int, raw: dict[object, object]) -> str:
+    """Parse the optional per-probe ``success_when`` literal token.
+
+    Absent means ``""`` (exit-code reading — back-compatible). A *declared* value
+    must be a non-empty, non-whitespace-only string; a non-string or a
+    whitespace-only value is a malformed battery and raises :class:`BatteryError`
+    naming the probe.
+    """
+    if "success_when" not in raw:
+        return ""
+    value = raw["success_when"]
+    if not isinstance(value, str) or not value.strip():
+        raise BatteryError(
+            f"probe #{index} 'success_when' must be a non-empty string, got {value!r}"
+        )
+    return value
+
+
 def _assert_unique_ids(specs: tuple[_ProbeSpec, ...]) -> None:
     seen: set[str] = set()
     for s in specs:
@@ -265,6 +294,7 @@ def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:
         classifies=spec.classifies,
         timeout=spec.timeout,
         source=source,
+        success_when=spec.success_when,
     )
 
 
@@ -297,24 +327,52 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     """Non-fatal authoring warnings for a battery (never raises; ``()`` = clean).
 
     Probes execute in **authoring order**, so there is no reorder to surprise an
-    author; the surviving footgun is ``ok`` semantics:
+    author; two footguns are checked, both advisory:
 
-    - **vacuous-ok** — a probe's ``ok`` is its command's exit code. A command that
-      prints OK/FAIL tokens but is not ``exit``-gated always exits 0, so ``ok`` is
-      meaningless regardless of what it printed. Gate with ``exit $rc``.
+    - **vacuous-ok** — a probe **without** a ``success_when`` declaration whose
+      ``ok`` is its command's exit code. A command that prints OK/FAIL tokens but is
+      not ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what
+      it printed. Gate with ``exit $rc``. A probe **with** a ``success_when``
+      declaration is **exempt**: its ``ok`` is read from the declared token, not the
+      exit code, so an un-gated token-printing tail is exactly the intended
+      authoring style, not a footgun.
 
-    The vacuous-ok check is a best-effort heuristic (the shell is not parsed); the
-    real guarantee is still the author's ``exit $rc``. Warnings are advisory — the
-    run and ``ok`` are unaffected.
+    - **non-host-root sudo** — a probe whose tag is not ``MUTATING_HOST_ROOT`` but
+      whose command invokes ``sudo``. The escalation authoring contract reserves
+      ``sudo`` for host-root-tagged probes, so the mismatch means the tag is lying
+      about what the probe does. The command still runs verbatim; the warning
+      surfaces the mislabel.
+
+    Both checks are best-effort heuristics (the shell is not parsed); the real
+    guarantee is still the author's ``exit $rc`` / tag. Warnings are advisory — the
+    run and ``ok`` are unaffected, and a single probe may trigger both rules.
     """
     warnings: list[str] = []
     for probe in battery.probes:
-        if _looks_vacuously_ok(probe.command):
+        if not probe.success_when and _looks_vacuously_ok(probe.command):
             warnings.append(
                 f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
                 f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
             )
+        if probe.tag is not ProbeTag.MUTATING_HOST_ROOT and _invokes_sudo(probe.command):
+            warnings.append(
+                f"probe {probe.id!r}: command invokes sudo but the probe is not tagged "
+                f"{ProbeTag.MUTATING_HOST_ROOT.value!r} -- escalation belongs to host-root probes; "
+                f"the command still runs verbatim, so re-tag the probe or drop the sudo"
+            )
     return tuple(warnings)
+
+
+def _invokes_sudo(command: str) -> bool:
+    """True iff ``command`` invokes ``sudo`` (word-boundary heuristic).
+
+    Best-effort, same character as :func:`_looks_vacuously_ok`: the shell is not
+    parsed, so this matches a ``sudo`` word anywhere in the command text. The
+    word-boundary anchor keeps it from firing on substrings like ``pseudo`` or
+    ``sudoers``. No run behavior depends on the result — it only feeds an advisory
+    warning.
+    """
+    return re.search(r"\bsudo\b", command) is not None
 
 
 def _looks_vacuously_ok(command: str) -> bool:

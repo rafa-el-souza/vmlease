@@ -26,28 +26,42 @@ identifying the contract version.
 ### Requirement: Per-probe verdict is computed deterministically from the token convention
 
 For each probe, the summarizer SHALL compute a single `verdict` from the probe's `exit_code`, `timed_out`
-flag, and the assertion tokens harvested from its stdout. Token harvesting SHALL be generic: substrings
-matching `[A-Z][A-Z0-9_]*_(OK|FAIL|info|review)` are bucketed by suffix into `ok_tokens`, `fail_tokens`,
-`info_tokens`, `review_tokens`. The verdict precedence SHALL be: `timed_out` true → `TIMEOUT`; else any
+flag, recorded `ok`, declared `success_when` predicate, and the assertion tokens harvested from its stdout.
+Token harvesting SHALL be generic: substrings matching `[A-Z][A-Z0-9_]*_(OK|FAIL|info|review)` are bucketed
+by suffix into `ok_tokens`, `fail_tokens`, `info_tokens`, `review_tokens`. The verdict precedence SHALL be:
+`timed_out` true → `TIMEOUT`; else, **when the probe declared a non-empty `success_when`, the declared
+predicate is authoritative — `verdict` is `PASS` when the probe is `ok` and `FAIL` otherwise, overriding the
+exit-code and fail-token rules** (the summarizer honors the probe's recorded `ok` — the single source of the
+pass/fail predicate — and SHALL NOT re-derive the token line-match); else (no `success_when` declared) any
 `fail_tokens` OR `exit_code != 0` → `FAIL`; else `exit_code == 0` with at least one `ok_token` → `PASS`;
-else (`exit_code == 0`, no assertion tokens) → `PASS_NO_ASSERTIONS`.
+else (`exit_code == 0`, no assertion tokens) → `PASS_NO_ASSERTIONS`. A probe that does not declare
+`success_when` SHALL receive exactly the verdict it received before this predicate branch existed.
 
 #### Scenario: Failing token forces FAIL even on a zero exit
-- **WHEN** a probe has `exit_code` 0 but its stdout contains `START_CORE_NOT_RUNNING_FAIL`
+- **WHEN** a probe has `exit_code` 0, no `success_when`, but its stdout contains `START_CORE_NOT_RUNNING_FAIL`
 - **THEN** that probe's `verdict` is `FAIL`
 - **AND** `fail_tokens` contains `START_CORE_NOT_RUNNING_FAIL`
 
 #### Scenario: Passing probe
-- **WHEN** a probe has `exit_code` 0, stdout contains `SETUP_EXIT0_OK`, and no `*_FAIL` token
+- **WHEN** a probe has `exit_code` 0, no `success_when`, stdout contains `SETUP_EXIT0_OK`, and no `*_FAIL` token
 - **THEN** its `verdict` is `PASS`
 
 #### Scenario: Timeout dominates
 - **WHEN** a probe has `timed_out` true
-- **THEN** its `verdict` is `TIMEOUT` regardless of tokens or exit code
+- **THEN** its `verdict` is `TIMEOUT` regardless of tokens, exit code, or a declared `success_when`
 
 #### Scenario: Zero exit with no assertion tokens
-- **WHEN** a probe has `exit_code` 0 and stdout contains no `*_OK`/`*_FAIL` token
+- **WHEN** a probe has `exit_code` 0, no `success_when`, and stdout contains no `*_OK`/`*_FAIL` token
 - **THEN** its `verdict` is `PASS_NO_ASSERTIONS`
+
+#### Scenario: A declared success predicate that holds is PASS despite a non-zero exit
+- **WHEN** a probe declares a non-empty `success_when`, is recorded `ok` true, and has a non-zero `exit_code`
+- **THEN** its `verdict` is `PASS` — the declared predicate overrides the exit-code rule
+
+#### Scenario: A declared success predicate that fails is FAIL despite a passing token in stdout
+- **WHEN** a probe declares a non-empty `success_when`, is recorded `ok` false, and its stdout nonetheless
+  contains a stray `*_OK` (or `*_FAIL`) diagnostic token
+- **THEN** its `verdict` is `FAIL` — the declared predicate overrides both the exit-code and fail-token rules
 
 ### Requirement: Summary carries per-host probe records, a matrix pivot, and totals
 

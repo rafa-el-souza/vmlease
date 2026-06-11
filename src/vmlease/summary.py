@@ -50,9 +50,12 @@ Summary shape (``schema_version`` ``"1"``)::
 Verdict rule (per probe, deterministic precedence):
 
 1. ``timed_out`` true → ``TIMEOUT``;
-2. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
-3. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
-4. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
+2. else, when the probe declared a non-empty ``success_when``, the declared
+   predicate is authoritative → ``PASS`` iff the *recorded* ``ok`` holds, else
+   ``FAIL`` (overriding the exit-code and fail-token rules);
+3. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
+4. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
+5. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
 """
 
 from __future__ import annotations
@@ -145,10 +148,27 @@ def harvest_tokens(stdout: str) -> dict[str, list[str]]:
     return buckets
 
 
-def verdict(exit_code: int, timed_out: bool, fail_tokens: list[str], ok_tokens: list[str]) -> str:
-    """Compute the one canonical verdict for a probe (see the module docstring)."""
+def verdict(
+    exit_code: int,
+    timed_out: bool,
+    fail_tokens: list[str],
+    ok_tokens: list[str],
+    success_when: str = "",
+    ok: bool = False,
+) -> str:
+    """Compute the one canonical verdict for a probe (see the module docstring).
+
+    Precedence: ``timed_out`` dominates. When the probe declared a non-empty
+    ``success_when`` the declared predicate is authoritative — the verdict is
+    ``PASS`` iff the probe's *recorded* ``ok`` holds, else ``FAIL`` — overriding
+    the exit-code and fail-token rules (the single source of the pass/fail
+    predicate; the line-match is never re-derived here). A probe with no
+    ``success_when`` falls through to the exact exit-code precedence unchanged.
+    """
     if timed_out:
         return TIMEOUT
+    if success_when:
+        return PASS if ok else FAIL
     if fail_tokens or exit_code != 0:
         return FAIL
     if ok_tokens:
@@ -190,15 +210,19 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
     timed_out = bool(raw_probe.get("timed_out", False))
     stdout = str(raw_probe.get("stdout", ""))
     stderr = str(raw_probe.get("stderr", ""))
+    ok = bool(raw_probe.get("ok", exit_code == 0))
+    success_when = str(raw_probe.get("success_when", ""))
     tokens = harvest_tokens(stdout)
     return {
         "id": probe_id,
         "command": _command_for(probe_id, command_map),
         "tag": str(raw_probe.get("tag", "")),
         "exit_code": exit_code,
-        "ok": bool(raw_probe.get("ok", exit_code == 0)),
+        "ok": ok,
         "timed_out": timed_out,
-        "verdict": verdict(exit_code, timed_out, tokens["fail_tokens"], tokens["ok_tokens"]),
+        "verdict": verdict(
+            exit_code, timed_out, tokens["fail_tokens"], tokens["ok_tokens"], success_when, ok
+        ),
         **tokens,
         "stdout_tail": stdout[-TAIL_LEN:],
         "stderr_tail": stderr[-TAIL_LEN:],
