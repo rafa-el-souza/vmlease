@@ -201,6 +201,56 @@ class TestModel(unittest.TestCase):
         self.assertTrue(ok.ok)
         self.assertFalse(bad.ok)
 
+    def test_probe_result_ok_undeclared_exit_zero(self) -> None:
+        # (a) undeclared + exit 0 -> ok (exit-code reading)
+        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "anything", "")
+        self.assertTrue(res.ok)
+
+    def test_probe_result_not_ok_undeclared_exit_nonzero(self) -> None:
+        # (b) undeclared + exit 3 -> not ok
+        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "anything", "")
+        self.assertFalse(res.ok)
+
+    def test_probe_result_ok_declared_token_line_overrides_nonzero_exit(self) -> None:
+        # (c) declared token present as a line + exit 3 -> ok (token replaces exit code)
+        res = model.ProbeResult(
+            "P1", model.ProbeTag.READ_ONLY, 3, "noise\n  CORE_RUNNING_OK  \nmore", "",
+            success_when="CORE_RUNNING_OK",
+        )
+        self.assertTrue(res.ok)
+
+    def test_probe_result_not_ok_declared_token_absent_exit_zero(self) -> None:
+        # (d) declared + exit 0 but token absent -> not ok (exit code not consulted)
+        res = model.ProbeResult(
+            "P1", model.ProbeTag.READ_ONLY, 0, "other output", "",
+            success_when="CORE_RUNNING_OK",
+        )
+        self.assertFalse(res.ok)
+
+    def test_probe_result_not_ok_token_only_embedded_in_line(self) -> None:
+        # (e) token only embedded in a longer line, never its own line -> not ok
+        res = model.ProbeResult(
+            "P1", model.ProbeTag.READ_ONLY, 0, "found CORE_RUNNING_OK in scan", "",
+            success_when="CORE_RUNNING_OK",
+        )
+        self.assertFalse(res.ok)
+
+    def test_probe_result_not_ok_declared_token_but_timed_out(self) -> None:
+        # (f) declared token present but timed_out=True -> not ok (partial output is no verdict)
+        res = model.ProbeResult(
+            "P1", model.ProbeTag.READ_ONLY, 0, "CORE_RUNNING_OK", "",
+            timed_out=True, success_when="CORE_RUNNING_OK",
+        )
+        self.assertFalse(res.ok)
+
+    def test_probe_success_when_defaults_empty(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertEqual(p.success_when, "")
+
+    def test_probe_result_success_when_defaults_empty(self) -> None:
+        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        self.assertEqual(res.success_when, "")
+
     def test_probe_result_timed_out_defaults_false(self) -> None:
         res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
         self.assertFalse(res.timed_out)

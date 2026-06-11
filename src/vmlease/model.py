@@ -16,8 +16,12 @@ class ProbeTag(StrEnum):
 
     Hosts are disposable, so probes mutate freely where mutation buys signal;
     the tag records what state a probe left (so results are interpretable) and
-    governs the sudo-escalation contract (a probe escalates only when tagged
-    host-root). It does NOT order execution — probes run in authoring order.
+    names the sudo-escalation authoring contract: escalation belongs to a
+    host-root-tagged probe, so the host-root tag authorizes and records that a
+    probe escalates. The tag does NOT enforce this — the resolved command runs
+    verbatim and the system injects, strips, or refuses nothing based on tag; an
+    advisory lint warns when a non-host-root probe invokes sudo. The tag also
+    does NOT order execution — probes run in authoring order.
     """
 
     READ_ONLY = "read-only"
@@ -34,15 +38,26 @@ class Probe:
         title: Human-readable one-line description.
         command: The **resolved** executable shell run over SSH as the operator —
             the verbatim inline block, or the contents of the probe's script file.
-            A probe never invokes ``sudo`` unless its tag is ``MUTATING_HOST_ROOT``
-            (the one sanctioned escalation probe).
+            The system runs this command **verbatim**: it does not inject, strip,
+            or refuse ``sudo`` based on the tag. Escalation is an authoring
+            contract — the author writes ``sudo`` in the command, and the
+            ``MUTATING_HOST_ROOT`` tag authorizes and records that escalation;
+            an advisory lint warns on a non-host-root probe that invokes sudo.
         source: Provenance of ``command`` — the script path it was read from, or
             ``"<inline>"`` for an inline command. Used only for lint output and
             error messages. Defaults to ``""`` so direct ``Probe(...)``
             construction stays back-compatible.
         tag: What the probe touches (:class:`ProbeTag`). Records what state the
-            probe leaves and governs the sudo-escalation contract; it does NOT
-            order execution — probes run in authoring order.
+            probe leaves and names the sudo-escalation authoring contract
+            (host-root authorizes and records escalation; the command still runs
+            verbatim and an advisory lint, not the tag, flags a mismatch); it
+            does NOT order execution — probes run in authoring order.
+        success_when: Optional literal success token. When non-empty, the
+            probe's :attr:`ProbeResult.ok` is decided by this token appearing as
+            a **complete line** of stdout (leading/trailing whitespace stripped),
+            replacing the exit-code reading — the author emits it as its own line
+            (``echo TOKEN``). ``""`` (the default, back-compatible) keeps ``ok``
+            exit-code-based.
         classifies: The design action this probe classifies (free text, for the
             results report — e.g. "L2 subuid append").
         timeout: Optional per-probe wall-clock bound (seconds) for the bounded
@@ -59,6 +74,7 @@ class Probe:
     classifies: str = ""
     timeout: float | None = None
     source: str = ""
+    success_when: str = ""
 
 
 @dataclass(frozen=True)
@@ -149,11 +165,25 @@ class ProbeResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    success_when: str = ""
 
     @property
     def ok(self) -> bool:
-        """``True`` iff the probe exited zero. (Interpretation is per-probe;
-        a ``False`` ``ok`` may be an *expected* fail — see the battery doc.)"""
+        """Whether the probe passed, by exactly one of two readings.
+
+        A timed-out result is never ok — a killed probe's partial output is not
+        a verdict. Otherwise, when ``success_when`` is declared (non-empty), the
+        probe is ok iff that token appears as a **complete line** of stdout
+        (each line stripped of leading/trailing whitespace) — the exit code does
+        not participate. When ``success_when`` is ``""`` (the default,
+        back-compatible reading), the probe is ok iff it exited zero.
+        Interpretation of a not-ok result is per-probe; it may be an *expected*
+        fail — see the battery doc.
+        """
+        if self.timed_out:
+            return False
+        if self.success_when:
+            return any(line.strip() == self.success_when for line in self.stdout.splitlines())
         return self.exit_code == 0
 
 
