@@ -90,6 +90,7 @@ exit $rc
 | `probes: [...]` | `[[probe]]` tables | one table per probe, **in execution order** (see step 2) |
 | `id`, `title`, `tag`, `classifies`, `timeout` | same keys | unchanged meaning and validation |
 | `command` | **exactly one of** `run = '''…'''` or `script = "file.sh"` | `run` for one-liners; `script` for anything non-trivial |
+| *(none)* | `success_when = "TOKEN"` | **new, optional** probe key — `ok` becomes "TOKEN is a complete stdout line" instead of exit-code 0 (see above); omit to keep exit-code semantics |
 
 The schema is **strict**: any key not listed above — at the root or on a probe — is rejected by name
 (a `timout` typo now fails loud instead of silently using the default). An empty `run` block or empty
@@ -197,7 +198,12 @@ zero provider calls. If `plan` is happy, `run` behaves exactly as before.
 
 - `examples/compose-plugin-check/` in this repo is the migrated reference bundle (it is also lint-gated
   in `make check`).
-- sandbox-ai `tests/vmlease/oprootless-full-chain.json`: already authored in dependency order
-  (`PREP → SETUP → START → ATTACH → STOP_DESTROY`, one rank dominant), so step 2 is a no-op — extract
-  the five blobs to `.sh` files (step 1), reformat, lint. Its `tests/vmlease/README.md` run recipes
-  need only the `--battery` path updated to the new manifest.
+- sandbox-ai `tests/vmlease/` — **migrated** (its `modernize-vmlease-batteries` change). The three
+  per-command lifecycle batteries are now TOML bundles (`baseline-op-rootless/`,
+  `baseline-separate-user-sudo/`, `baseline-separate-user-polkit/`, each a `battery.toml`). They were
+  already in dependency order (one dominant rank), so step 2 was a no-op. Note the authoring choice: the
+  probes are **inline `run = '''…'''` blocks**, NOT per-probe `.sh` files — inline blocks are
+  runtime- and shellcheck-equivalent to `script` files (both resolve to the probe command, both lint via
+  stdin), and keep each battery reviewable in one manifest. Reach for a `script` file only when a probe is
+  genuinely large; the ">80 chars → its own file" scaffold heuristic over-produces files for a
+  many-similar-probe lifecycle battery.
