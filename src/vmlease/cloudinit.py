@@ -31,17 +31,19 @@ _MINIMAL_TEMPLATE = "cloudinit-minimal.sh.tmpl"
 # Sysprep run over SSH as the (NOPASSWD-sudo) operator on the build host BEFORE
 # poweroff/snapshot. A snapshot freezes /etc/machine-id into the image, so every
 # host restored from it would otherwise share one machine-id — breaking systemd,
-# journald and dbus (which key state off it) across restored hosts (F-009). The
-# subtle part (E-012 10.1, real-host 2026-06-12): you CANNOT just empty (truncate)
-# or remove (rm) the file, because systemd RE-COMMITS its in-memory machine-id back
-# into it during the graceful-poweroff shutdown — so the snapshot freezes the
-# builder's id and every restore inherits it (proven: the file is ABSENT right
-# before poweroff, yet the snapshot still carries the builder's id; confirmed
-# across builds with both truncate and rm). The fix is systemd's documented
-# golden-image sentinel: write the literal ``uninitialized\n``. A PRESENT file with
-# that exact content is NOT overwritten during shutdown AND flags systemd to
-# regenerate a fresh, unique id on the next boot. ``sync`` makes the reset durable;
-# the dbus copy/symlink is cleared so it re-derives from the regenerated id.
+# journald and dbus (which key state off it) across restored hosts (F-009). TWO
+# real-host findings (E-012 10.1, 2026-06-12) shape the exact command — both proven
+# by build→restore-x3 runs:
+#   1. ``sync`` is LOAD-BEARING. The reset write is not durable on the snapshot
+#      unless explicitly synced: the fast poweroff→create-image otherwise captures
+#      the stale on-disk block and the snapshot keeps the BUILDER's id, which every
+#      restore inherits. (Dropping ``sync`` → 3 distinct hosts all read one shared
+#      id; with it → 3 distinct ids.) A clean ACPI poweroff does NOT reliably flush
+#      it in time.
+#   2. The reset VALUE is systemd's golden-image sentinel ``uninitialized\n`` (a
+#      PRESENT file that systemd regenerates a fresh, unique id from on first boot),
+#      not ``truncate -s0`` (empty) or ``rm`` (absent).
+# The dbus copy/symlink is cleared so it re-derives from the regenerated id.
 SYSPREP_COMMAND: str = (
     "printf 'uninitialized\\n' | sudo tee /etc/machine-id >/dev/null"
     " ; sudo rm -f /var/lib/dbus/machine-id ; sync"

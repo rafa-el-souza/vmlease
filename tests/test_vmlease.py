@@ -1756,18 +1756,18 @@ class TestMinimalCloudInit(unittest.TestCase):
         self.assertIn("ssh-ed25519 KEY\nPUBKEY", out)
 
     def test_sysprep_resets_machine_id_to_uninitialized_sentinel(self) -> None:
-        # E-012 10.1 (real-host, 2026-06-12): neither truncate (empty) nor rm
-        # (absent) survives — systemd re-commits its in-memory id into the file
-        # during the graceful-poweroff shutdown, freezing the builder's id in the
-        # snapshot. The fix is systemd's golden-image sentinel: a PRESENT
-        # /etc/machine-id containing exactly ``uninitialized`` is not overwritten at
-        # shutdown and forces first-boot regeneration of a unique id per restore.
+        # E-012 10.1 (real-host, 2026-06-12), two findings, both proven by
+        # build→restore-x3 runs: (1) the reset VALUE is systemd's golden-image
+        # sentinel ``uninitialized`` (a present file regenerated on first boot), not
+        # truncate (empty) or rm (absent); (2) ``sync`` is LOAD-BEARING — without it
+        # the reset is not durable on the snapshot and every restore reads the
+        # builder's id (dropping sync → 3 hosts shared one id; with it → 3 distinct).
         self.assertIn("uninitialized", cloudinit.SYSPREP_COMMAND)
         self.assertIn("/etc/machine-id", cloudinit.SYSPREP_COMMAND)
         self.assertNotIn("truncate", cloudinit.SYSPREP_COMMAND)
         # the dbus copy/symlink is cleared so it re-derives from the regenerated id
         self.assertIn("/var/lib/dbus/machine-id", cloudinit.SYSPREP_COMMAND)
-        # sync makes the reset durable before the snapshot
+        # sync is load-bearing: the reset must be flushed before the snapshot
         self.assertIn("sync", cloudinit.SYSPREP_COMMAND)
 
 
