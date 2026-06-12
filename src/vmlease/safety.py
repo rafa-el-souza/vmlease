@@ -22,6 +22,8 @@ import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vmlease.imagecache import LABEL_PURPOSE, PURPOSE_IMAGE_CACHE
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -38,11 +40,36 @@ DEFAULT_ALLOWED_SERVER_TYPES: frozenset[str] = frozenset({"cpx11", "cpx21", "cpx
 # 4-distro battery).
 DEFAULT_MAX_HOSTS = 8
 
+
+def server_type_arch(server_type: str) -> str:
+    """Map a Hetzner server type to its CPU architecture (``"arm"`` / ``"x86"``).
+
+    The Hetzner naming rule: ``cax*`` are Ampere ARM64 boxes; everything else
+    (``cpx*`` / ``cx*`` / ``ccx*``) is x86. The architecture is part of the cache
+    content key and the only hard restore match (D9), so it is derived here — one
+    place — and shared by both ``build-image`` and the ``run`` cache path.
+    """
+    return "arm" if server_type.startswith("cax") else "x86"
+
+# Self-runaway cap on cached images vmlease keeps. This is vmlease's OWN tidiness
+# limit — NOT the provider account-wide snapshot ceiling, which is project-blind
+# and enforced separately by ``ProviderQuotaError`` raised inside the provider.
+DEFAULT_MAX_IMAGES = 10
+
 _RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,38}$")
 
 
 class CostGuardError(ValueError):
     """A matrix would exceed the host cap or use a non-allowlisted server type."""
+
+
+class ImageQuotaError(ValueError):
+    """Caching another image would exceed vmlease's self-imposed image cap.
+
+    Distinct from the provider account-wide ceiling (a ``ProviderQuotaError``
+    raised inside the provider): this is vmlease refusing to let its OWN cached
+    image set grow without bound.
+    """
 
 
 class UploadError(ValueError):
@@ -172,6 +199,11 @@ def label_selector(run_id: str) -> str:
     return f"{LABEL_KEY}={run_id}"
 
 
+def label_selector_purpose() -> str:
+    """The label selector for the cache-image query index (``vmlease-purpose=image-cache``)."""
+    return f"{LABEL_PURPOSE}={PURPOSE_IMAGE_CACHE}"
+
+
 @dataclass(frozen=True)
 class CostGuard:
     """Bounds a run: max host count + an allowlist of cheap server types."""
@@ -196,6 +228,31 @@ class CostGuard:
             raise CostGuardError(
                 f"server type(s) {bad} not in the cheap allowlist "
                 f"{sorted(self.allowed_server_types)}; refuse to provision."
+            )
+
+
+@dataclass(frozen=True)
+class ImageQuotaGuard:
+    """Caps how many cache images vmlease keeps — count-only, no allowlist.
+
+    The guard answers exactly one question — *is there headroom to create one
+    more image?* — and nothing else: prune/supersession/reclaim decisions belong
+    to ``build-image``'s orchestration, not here.
+    """
+
+    max_images: int = DEFAULT_MAX_IMAGES
+
+    def check(self, current_count: int) -> None:
+        """Refuse when there is no headroom to create one more cache image.
+
+        Raises :class:`ImageQuotaError` iff ``current_count >= self.max_images``
+        (no room for another); returns ``None`` when within bounds.
+        """
+        if current_count >= self.max_images:
+            raise ImageQuotaError(
+                f"{current_count} cache image(s) already exist; the image quota guard "
+                f"caps at {self.max_images}. Run reap-images to reclaim space, or raise "
+                f"--max-images deliberately."
             )
 
 

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# vmlease minimal restore cloud-init — re-authorize the operator key on a host
+# restored from a snapshot image. The operator account, sudoers drop-in, docker
+# prerequisites and all prep are ALREADY baked into the snapshot (F-009): cloud-init
+# re-runs per-instance on a snapshot boot, so we re-inject ONLY the fresh per-run
+# operator key and re-assert the readiness sentinel — nothing else.
+# Slots use a double-at delimiter; every shell $VAR / $(...) passes through untouched.
+set -Eeuo pipefail
+
+vmlease_minimal_main() {
+  local operator='@@operator@@'
+
+  # --- re-authorize the throwaway probe public key for the baked operator ---
+  install -d -m 0700 -o "$operator" -g "$operator" "/home/$operator/.ssh"
+  install -m 0600 -o "$operator" -g "$operator" /dev/stdin "/home/$operator/.ssh/authorized_keys" <<'PUBKEY'
+@@operator_pubkey@@
+PUBKEY
+
+  # --- re-assert the readiness sentinel the harness polls for over SSH ------
+  # Idempotent: the snapshot already carries it, but re-touching guarantees a
+  # restored host reports ready even if the path was cleared during sysprep.
+  touch /var/lib/vmlease-ready
+  echo "vmlease minimal restore cloud-init complete for $operator"
+}
+
+vmlease_minimal_main "$@"

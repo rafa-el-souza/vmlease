@@ -116,3 +116,39 @@ hanging the run.
 - **THEN** the subprocess is killed and the destroy surfaces as a failed teardown (reap-able), rather than
   blocking the host's `finally` forever
 
+### Requirement: The provider supports snapshot image operations
+The provider seam SHALL support creating an image (snapshot) from a host, listing images by label,
+deleting an image, and powering a host off — each operating on a provider-agnostic `Image` (id, labels,
+creation timestamp, disk size, architecture). Image deletion SHALL be idempotent (a not-found delete is
+success) and power-off SHALL be idempotent (an already-off host is success). A provider's resource-limit
+error SHALL be translated, inside the provider implementation, into a typed `ProviderQuotaError` (a
+`ProviderError` subclass); no provider-specific error string or number SHALL escape the provider seam.
+
+#### Scenario: Snapshot operations work on agnostic Image objects
+- **WHEN** the runner creates, lists, or deletes a cache image
+- **THEN** it does so through the Provider protocol, receiving `Image` objects rather than provider CLI output
+
+#### Scenario: A provider snapshot-limit error is typed at the seam
+- **WHEN** the provider reports its snapshot-count limit during image creation
+- **THEN** the provider implementation raises a typed `ProviderQuotaError`, not a raw provider string
+
+### Requirement: Provisioning restores from a matching cached image
+When provisioning a host, the runner SHALL look up whether a cached image matches the host's content key,
+architecture, and disk bound (the snapshot's disk size ≤ the target server's disk), and on a match create
+the server from that image (restore, skipping
+rescue-write and package install); on no match it SHALL provision via the normal cold path. This lookup
+SHALL be performed at provision time, never during `plan`. A run SHALL **consume** cache images but SHALL
+**NOT create** them — cache images are produced only by `build-image`.
+
+#### Scenario: A matching image is restored
+- **WHEN** provisioning a host whose content key matches an existing cached image of the right architecture and disk bound
+- **THEN** the server is created from that image rather than from the default image
+
+#### Scenario: plan still makes zero provider calls
+- **WHEN** `plan` is run while caching is available
+- **THEN** it makes zero provider calls and shows the cold (pre-cache) provisioning path
+
+#### Scenario: A run never builds a cache image
+- **WHEN** a run encounters a cache miss
+- **THEN** it provisions via the cold path and does not create a cache image
+

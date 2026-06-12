@@ -38,14 +38,22 @@ its resources can be re-found for status/reap.
 
 ### Requirement: Every resource carries the run label
 
-The system SHALL apply the `vmlease=<run-id>` label to every provisioned resource, and SHALL expose that
-label as the selector used to list and reap a run's hosts.
+The system SHALL apply the `vmlease=<run-id>` label to every provisioned **run host** — the ephemeral,
+billable servers of a run, **including the throwaway builder a `build-image` provisions** — and SHALL
+expose that label as the selector used to list and reap a run's hosts. **Persistent cache images are NOT
+run hosts**: they are content-addressed and carry their own image-class label set (`vmlease-purpose=image-cache`,
+`vmlease-cache-key`, …) instead of the ephemeral per-run label, and so are excluded from per-run reap (see
+"Cached images are reaped as a persistent class").
 
-#### Scenario: Resources are reap-discoverable by label
+#### Scenario: Run hosts are reap-discoverable by label
 
-- **WHEN** hosts are provisioned for a run
-- **THEN** each carries the `vmlease=<run-id>` label and is discoverable by the `vmlease=<run-id>`
-  selector
+- **WHEN** hosts are provisioned for a run (including a `build-image` builder)
+- **THEN** each carries the `vmlease=<run-id>` label and is discoverable by the `vmlease=<run-id>` selector
+
+#### Scenario: A cache image does not carry the run label
+
+- **WHEN** `build-image` creates a cache image
+- **THEN** the image carries its content-addressed label set, not the `vmlease=<run-id>` label
 
 ### Requirement: Confirm-before-create gates real spend
 
@@ -172,4 +180,44 @@ requirement governs the **entry-point** directory itself.
 
 - **WHEN** a directory upload source does not exist, is not a directory, or is not readable
 - **THEN** the push is refused with an error describing the problem, and nothing is transferred
+
+### Requirement: The image quota guard caps cached image count
+A count-only image quota guard SHALL cap the number of vmlease cache images (default 10, overridable),
+checked during build-image before a builder is provisioned. It is a self-limit on vmlease's own images,
+distinct from the provider's account-wide ceiling (which is enforced separately by the typed provider
+quota error). Reaching the guard with no same-group superseded image to reclaim SHALL raise
+`ImageQuotaError`.
+
+#### Scenario: At the guard cap with nothing to reclaim refuses
+- **WHEN** build-image is at the image cap and no same-group superseded image exists
+- **THEN** it raises `ImageQuotaError` before provisioning a builder
+
+### Requirement: Cached images are reaped as a persistent class
+Cache images SHALL be reaped by a dedicated `reap-images` command — by distro, by an explicit older-than
+cutoff timestamp, or by supersession (a content key no longer current for its group) — with a `--dry-run`
+mode that reports without deleting. Reaping SHALL be idempotent and best-effort with a partial-success
+report. Supersession resolution SHALL be fail-safe: a group whose current key cannot be resolved is kept
+and warned, never deleted. Cache images are persistent and SHALL NOT be reaped at run end.
+
+#### Scenario: Superseded reap is fail-safe on an unresolvable group
+- **WHEN** `reap-images --superseded` cannot resolve the current key for a group
+- **THEN** images of that group are kept and a warning is reported, while resolvable groups proceed
+
+#### Scenario: Older-than uses an explicit caller-supplied cutoff
+- **WHEN** `reap-images --older-than` is given an ISO-8601 cutoff timestamp
+- **THEN** images whose creation timestamp parses to before that cutoff are deleted, with no reliance on an internal clock
+
+#### Scenario: Supersession removes a whole group whose current image is absent
+- **WHEN** `reap-images --superseded` runs for a group whose current key resolves but no cached image matches it (upstream rolled and nothing was rebuilt)
+- **THEN** every cached image for that group is treated as superseded and deleted (use `--older-than` for age-protection instead)
+
+### Requirement: Cached images carry a persistent content-addressed label set
+Each cache image SHALL carry a persistent label set (purpose, content key, schema version, distro,
+architecture, source fingerprint, build provenance) emitted by a single function, and SHALL NOT carry the
+ephemeral per-run reap label. Image age for reaping SHALL be read from the image's own creation timestamp,
+not from a label.
+
+#### Scenario: A cache image survives a per-run reap
+- **WHEN** a run's per-run reap executes
+- **THEN** cache images, which lack the per-run label, are not deleted
 

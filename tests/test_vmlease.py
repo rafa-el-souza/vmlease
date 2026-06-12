@@ -30,6 +30,7 @@ from vmlease import (
     cli,
     cloudinit,
     distro,
+    imagecache,
     keypair,
     model,
     providers,
@@ -42,7 +43,7 @@ from vmlease import (
     workload,
 )
 from vmlease import battery as battery_mod
-from vmlease.model import Host, HostSpec, Probe, ProbeResult, ProbeTag
+from vmlease.model import Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
 
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +58,17 @@ class FakeProvider:
         self.destroyed: list[Host] = []
         self._live: dict[str, Host] = {}
         self._lock = threading.Lock()
+        # snapshot ops (downstream milestones drive the cache through these):
+        self.images: dict[str, Image] = {}
+        self.created_images: list[tuple[str, str, dict[str, str]]] = []
+        self.deleted_images: list[str] = []
+        self.powered_off: list[str] = []
+        self._image_seq = 0
+        # per-server power state (default "running"; power_off flips it to "off").
+        self._power: dict[str, str] = {}
+        # per-server-type primary disk GB (default 40.0; set entries to override).
+        self.server_type_disks: dict[str, float] = {}
+        self.default_server_type_disk: float = 40.0
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         # each host gets a DISTINCT ip so a parallel run mirrors reality.
@@ -75,6 +87,53 @@ class FakeProvider:
     def list_labeled(self, run_id: str) -> list[Host]:
         sel = f"{safety.LABEL_KEY}={run_id}"
         return [h for h in self._live.values() if f"{safety.LABEL_KEY}={h.labels.get(safety.LABEL_KEY)}" == sel]
+
+    def create_image(self, server_id: str, description: str, labels: dict[str, str]) -> Image:
+        # labels applied atomically (mirrors the real provider): the returned
+        # Image carries exactly the labels the caller passed, indexed in-memory.
+        with self._lock:
+            self._image_seq += 1
+            image_id = f"img-{self._image_seq}"
+            image = Image(
+                id=image_id,
+                created="2024-01-01T00:00:00+00:00",
+                disk_size=40.0,  # a plausible default builder disk (GB)
+                arch="x86",
+                labels=dict(labels),
+            )
+            self.images[image_id] = image
+            self.created_images.append((server_id, description, dict(labels)))
+        return image
+
+    def list_images(self, selector: str) -> list[Image]:
+        # selector is "k=v"; match images whose label k equals v (the query index).
+        with self._lock:
+            if "=" not in selector:
+                return list(self.images.values())
+            key, _, value = selector.partition("=")
+            return [img for img in self.images.values() if img.labels.get(key) == value]
+
+    def delete_image(self, image_id: str) -> None:
+        # idempotent: deleting an absent image is success (concurrent prune/reap race).
+        with self._lock:
+            self.deleted_images.append(image_id)
+            self.images.pop(image_id, None)
+
+    def power_off(self, server_id: str) -> None:
+        # idempotent: powering off an already-off (or absent) host is success.
+        with self._lock:
+            self.powered_off.append(server_id)
+            self._power[server_id] = "off"
+
+    def server_status(self, server_id: str) -> str:
+        # default "running"; power_off flips it to "off".
+        with self._lock:
+            return self._power.get(server_id, "running")
+
+    def server_type_disk(self, server_type: str) -> float:
+        # a settable per-type disk; defaults to default_server_type_disk.
+        with self._lock:
+            return self.server_type_disks.get(server_type, self.default_server_type_disk)
 
 
 def _fake_subprocess(
@@ -312,6 +371,33 @@ class TestSafety(unittest.TestCase):
         with self.assertRaises(safety.CostGuardError):
             safety.CostGuard().check(["cpx22", "ccx63"])
 
+    def test_image_quota_guard_passes_under_cap(self) -> None:
+        # Default cap is 10; nine images leaves headroom for one more.
+        safety.ImageQuotaGuard().check(9)  # no raise
+
+    def test_image_quota_guard_at_cap_raises(self) -> None:
+        # At the cap there is no headroom to create one more — refuse.
+        with self.assertRaises(safety.ImageQuotaError):
+            safety.ImageQuotaGuard().check(safety.DEFAULT_MAX_IMAGES)
+
+    def test_image_quota_guard_over_cap_raises(self) -> None:
+        with self.assertRaises(safety.ImageQuotaError):
+            safety.ImageQuotaGuard().check(safety.DEFAULT_MAX_IMAGES + 5)
+
+    def test_image_quota_guard_honors_custom_max(self) -> None:
+        g = safety.ImageQuotaGuard(max_images=2)
+        g.check(1)  # one image, headroom for one more — passes
+        with self.assertRaises(safety.ImageQuotaError):
+            g.check(2)  # at the custom cap — refuse
+
+    def test_image_quota_error_message_is_operator_actionable(self) -> None:
+        with self.assertRaises(safety.ImageQuotaError) as ctx:
+            safety.ImageQuotaGuard(max_images=3).check(3)
+        msg = str(ctx.exception)
+        self.assertIn("reap-images", msg)
+        self.assertIn("--max-images", msg)
+        self.assertIn("3", msg)
+
 
 # --------------------------------------------------------------------------- #
 # providers — argv builders + parsers (pure) + impl via injected runner
@@ -388,6 +474,119 @@ class TestProviderArgv(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             providers.parse_list_output("{not json")
 
+    # --- snapshot image argv builders (pure) --------------------------------
+    def test_build_create_image_argv_shape_and_atomic_labels(self) -> None:
+        argv = providers.build_create_image_argv("99", "v1-arch-snap", {"vmlease-cache-key": "k", "a": "b"})
+        self.assertEqual(argv[:5], ["hcloud", "server", "create-image", "--type", "snapshot"])
+        self.assertEqual(argv[argv.index("--description") + 1], "v1-arch-snap")
+        # labels in the create call (atomic), sorted, server id last
+        self.assertLess(argv.index("a=b"), argv.index("vmlease-cache-key=k"))
+        self.assertEqual(argv[-1], "99")
+        self.assertIn("--label", argv)
+
+    def test_build_list_images_argv_snapshot_json(self) -> None:
+        argv = providers.build_list_images_argv("vmlease-purpose=image-cache")
+        self.assertEqual(
+            argv,
+            ["hcloud", "image", "list", "--selector", "vmlease-purpose=image-cache",
+             "--type", "snapshot", "--output", "json"],
+        )
+
+    def test_build_describe_delete_poweroff_argv(self) -> None:
+        self.assertEqual(providers.build_describe_image_argv("7"), ["hcloud", "image", "describe", "7", "--output", "json"])
+        self.assertEqual(providers.build_delete_image_argv("7"), ["hcloud", "image", "delete", "7"])
+        self.assertEqual(providers.build_poweroff_argv("7"), ["hcloud", "server", "poweroff", "7"])
+
+    def test_build_describe_server_argv(self) -> None:
+        self.assertEqual(
+            providers.build_describe_server_argv("7"),
+            ["hcloud", "server", "describe", "7", "--output", "json"],
+        )
+
+    def test_parse_server_status(self) -> None:
+        self.assertEqual(providers.parse_server_status(json.dumps({"status": "off"})), "off")
+        self.assertEqual(providers.parse_server_status(json.dumps({"status": "running"})), "running")
+
+    def test_parse_server_status_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status("{not json")
+
+    def test_parse_server_status_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status(json.dumps([1, 2]))
+
+    def test_parse_server_status_missing_status_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status(json.dumps({"id": 9}))
+
+    def test_build_describe_server_type_argv(self) -> None:
+        self.assertEqual(
+            providers.build_describe_server_type_argv("cpx22"),
+            ["hcloud", "server-type", "describe", "cpx22", "--output", "json"],
+        )
+
+    def test_parse_server_type_disk(self) -> None:
+        self.assertEqual(providers.parse_server_type_disk(json.dumps({"disk": 80})), 80.0)
+        self.assertEqual(providers.parse_server_type_disk(json.dumps({"disk": 40.5})), 40.5)
+
+    def test_parse_server_type_disk_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk("{not json")
+
+    def test_parse_server_type_disk_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk(json.dumps([1, 2]))
+
+    def test_parse_server_type_disk_missing_disk_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk(json.dumps({"name": "cpx22"}))
+
+    def test_parse_image_list(self) -> None:
+        out = json.dumps([
+            {"id": 11, "labels": {"vmlease-cache-key": "k1"}, "created": "2024-04-25T13:26:27+00:00",
+             "disk_size": 40, "architecture": "x86"},
+            "garbage",
+            {"id": 12, "labels": {}, "created": "2024-05-01T00:00:00+00:00", "image_size": 1.5, "architecture": "arm"},
+        ])
+        images = providers.parse_image_list(out)
+        self.assertEqual([i.id for i in images], ["11", "12"])
+        self.assertEqual(images[0].created, "2024-04-25T13:26:27+00:00")
+        self.assertEqual(images[0].disk_size, 40.0)
+        self.assertEqual(images[0].arch, "x86")
+        self.assertEqual(images[0].labels, {"vmlease-cache-key": "k1"})
+        # disk_size falls back to image_size when disk_size is absent
+        self.assertEqual(images[1].disk_size, 1.5)
+        self.assertEqual(images[1].arch, "arm")
+
+    def test_parse_image_list_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list("{not json")
+
+    def test_parse_image_list_not_array_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list(json.dumps({"id": 1}))
+
+    def test_parse_image_describe(self) -> None:
+        out = json.dumps({"id": 5, "labels": {"a": "b"}, "created": "2024-01-02T03:04:05+00:00", "disk_size": 80, "architecture": "x86"})
+        img = providers.parse_image_describe(out)
+        self.assertEqual((img.id, img.disk_size, img.arch), ("5", 80.0, "x86"))
+
+    def test_parse_image_describe_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_describe(json.dumps([1, 2]))
+
+    def test_parse_image_describe_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_describe("{not json")
+
+    def test_image_from_dict_missing_id_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list(json.dumps([{"created": "2024-01-01T00:00:00+00:00"}]))
+
+    def test_image_defaults_when_fields_absent(self) -> None:
+        img = providers.parse_image_list(json.dumps([{"id": 9}]))[0]
+        self.assertEqual((img.created, img.disk_size, img.arch, img.labels), ("", 0.0, "", {}))
+
 
 class TestHetznerProviderImpl(unittest.TestCase):
     def _spec(self) -> model.HostSpec:
@@ -432,19 +631,19 @@ class TestHetznerProviderImpl(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=3, sleep=lambda _s: None)
 
-    def test_destroy_passes_delete_timeout_to_seam(self) -> None:
-        # the delete subprocess is bounded — the ctor's delete_timeout reaches the seam
+    def test_destroy_passes_op_timeout_to_seam(self) -> None:
+        # the delete subprocess is bounded — the ctor's op_timeout reaches the seam
         seen: list[float | None] = []
 
         def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
             seen.append(timeout)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov = providers.HetznerProvider(runner=capture, op_timeout=37.5)
         prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
         self.assertEqual(seen, [37.5])
 
-    def test_destroy_default_delete_timeout_is_the_module_default(self) -> None:
+    def test_destroy_default_op_timeout_is_the_module_default(self) -> None:
         seen: list[float | None] = []
 
         def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
@@ -454,7 +653,7 @@ class TestHetznerProviderImpl(unittest.TestCase):
         providers.HetznerProvider(runner=capture).destroy(
             model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None
         )
-        self.assertEqual(seen, [providers.DEFAULT_DELETE_TIMEOUT])
+        self.assertEqual(seen, [providers.DEFAULT_OP_TIMEOUT])
 
     def test_destroy_wedged_subprocess_killed_surfaces_as_provider_error(self) -> None:
         # a delete that never returns (TimeoutExpired) is killed and surfaces as a
@@ -482,6 +681,127 @@ class TestHetznerProviderImpl(unittest.TestCase):
 
     def test_provider_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeProvider(), providers.Provider)
+
+    # --- snapshot image ops -------------------------------------------------
+    def test_create_image_scrapes_id_then_describes(self) -> None:
+        describe = json.dumps({"id": 42, "labels": {"vmlease-cache-key": "k"}, "created": "2024-04-25T13:26:27+00:00", "disk_size": 40, "architecture": "x86"})
+        seen: list[list[str]] = []
+
+        def scripted(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            if argv[1:3] == ["server", "create-image"]:
+                return subprocess.CompletedProcess(argv, 0, "Image 42 created from server 9\n", "")
+            return subprocess.CompletedProcess(argv, 0, describe, "")
+
+        prov = providers.HetznerProvider(runner=scripted)
+        img = prov.create_image("9", "v1-snap", {"vmlease-cache-key": "k"})
+        self.assertEqual((img.id, img.disk_size, img.arch), ("42", 40.0, "x86"))
+        # labels were applied in the create-image call (atomic), and a describe followed
+        self.assertIn("--label", seen[0])
+        self.assertEqual(seen[1][:4], ["hcloud", "image", "describe", "42"])
+
+    def test_create_image_quota_error_matches_code_not_message(self) -> None:
+        # the human message varies; the CODE resource_limit_exceeded is what's matched
+        stderr = "primary IP limit reached (resource_limit_exceeded, abc-123)"
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", stderr))
+        with self.assertRaises(providers.ProviderQuotaError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_create_image_quota_error_is_provider_error_subclass(self) -> None:
+        self.assertTrue(issubclass(providers.ProviderQuotaError, providers.ProviderError))
+
+    def test_create_image_other_failure_raises_plain_provider_error(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError) as ctx:
+            prov.create_image("9", "v1-snap", {})
+        self.assertNotIsInstance(ctx.exception, providers.ProviderQuotaError)
+
+    def test_create_image_unparseable_id_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "no digits here\n"))
+        with self.assertRaises(providers.ProviderError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_create_image_describe_failure_raises(self) -> None:
+        def scripted(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == ["server", "create-image"]:
+                return subprocess.CompletedProcess(argv, 0, "Image 42 created\n", "")
+            return subprocess.CompletedProcess(argv, 1, "", "describe boom")
+
+        prov = providers.HetznerProvider(runner=scripted)
+        with self.assertRaises(providers.ProviderError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_list_images_success(self) -> None:
+        out = json.dumps([{"id": 1, "labels": {"vmlease-purpose": "image-cache"}, "created": "2024-01-01T00:00:00+00:00", "disk_size": 40, "architecture": "x86"}])
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
+        images = prov.list_images("vmlease-purpose=image-cache")
+        self.assertEqual([i.id for i in images], ["1"])
+
+    def test_list_images_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.list_images("vmlease-purpose=image-cache")
+
+    def test_list_images_malformed_json_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "{not json"))
+        with self.assertRaises(providers.ProviderError):
+            prov.list_images("vmlease-purpose=image-cache")
+
+    def test_delete_image_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "Image 7 deleted"))
+        prov.delete_image("7")  # no raise
+
+    def test_delete_image_idempotent_on_not_found(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "image not found"))
+        prov.delete_image("7")  # not-found = success, no raise
+
+    def test_delete_image_other_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError):
+            prov.delete_image("7")
+
+    def test_power_off_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "Server 9 powered off"))
+        prov.power_off("9")  # no raise
+
+    def test_power_off_idempotent_when_already_off(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "server is already off"))
+        prov.power_off("9")  # already-off = success, no raise
+
+    def test_power_off_other_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError):
+            prov.power_off("9")
+
+    def test_server_status_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, json.dumps({"status": "off"})))
+        self.assertEqual(prov.server_status("9"), "off")
+
+    def test_server_status_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.server_status("9")
+
+    def test_server_type_disk_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, json.dumps({"disk": 80})))
+        self.assertEqual(prov.server_type_disk("cpx22"), 80.0)
+
+    def test_server_type_disk_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.server_type_disk("cpx22")
+
+    def test_image_ops_bounded_by_op_timeout(self) -> None:
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        prov = providers.HetznerProvider(runner=capture, op_timeout=37.5)
+        prov.delete_image("7")
+        prov.power_off("9")
+        self.assertEqual(seen, [37.5, 37.5])
 
 
 # --------------------------------------------------------------------------- #
@@ -1391,6 +1711,64 @@ class TestCloudInit(unittest.TestCase):
         bad = _BadFinalizeProfile(key="x", default_image="img", package_manager="apt", packages=("p",))
         with self.assertRaises(cloudinit.CloudInitError):
             cloudinit.render_finalize_block(bad)
+
+
+# --------------------------------------------------------------------------- #
+# cloudinit — minimal restore render + machine-id sysprep (D7, F-009)
+# --------------------------------------------------------------------------- #
+class TestMinimalCloudInit(unittest.TestCase):
+    def test_minimal_render_authorizes_key_and_touches_sentinel(self) -> None:
+        out = cloudinit.render_minimal_cloudinit("alice", "ssh-ed25519 RESTOREKEY alice")
+        # operator name + the fresh per-run pubkey are injected
+        self.assertIn("alice", out)
+        self.assertIn("ssh-ed25519 RESTOREKEY alice", out)
+        # the .ssh dir + authorized_keys install (mirrors the base template)
+        self.assertIn('install -d -m 0700 -o "$operator" -g "$operator" "/home/$operator/.ssh"', out)
+        self.assertIn('"/home/$operator/.ssh/authorized_keys"', out)
+        # the readiness sentinel is re-asserted
+        self.assertIn("touch /var/lib/vmlease-ready", out)
+        # hardened header + no unfilled slots
+        self.assertIn("set -Eeuo pipefail", out)
+        self.assertNotIn("@@", out)
+
+    def test_minimal_render_does_nothing_else(self) -> None:
+        # The "nothing else" guarantee: the restore path must carry NONE of the
+        # cold-path prep — package install, system update, sudoers/account
+        # creation or rescue-write machinery (all baked into the snapshot).
+        out = cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 AAAA")
+        for forbidden in (
+            "apt-get",
+            "dnf -y install",
+            "pacman",
+            "useradd",
+            "visudo",
+            "/etc/sudoers.d",
+            "systemctl reboot",
+            "vmlease-ready.service",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, out)
+
+    def test_minimal_render_strips_pubkey_whitespace(self) -> None:
+        # Mirrors render_cloudinit: a trailing newline on the key must not leak
+        # a blank line into the authorized_keys heredoc.
+        out = cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 KEY\n")
+        self.assertIn("ssh-ed25519 KEY\nPUBKEY", out)
+
+    def test_sysprep_resets_machine_id_to_uninitialized_sentinel(self) -> None:
+        # E-012 10.1 (real-host, 2026-06-12), two findings, both proven by
+        # build→restore-x3 runs: (1) the reset VALUE is systemd's golden-image
+        # sentinel ``uninitialized`` (a present file regenerated on first boot), not
+        # truncate (empty) or rm (absent); (2) ``sync`` is LOAD-BEARING — without it
+        # the reset is not durable on the snapshot and every restore reads the
+        # builder's id (dropping sync → 3 hosts shared one id; with it → 3 distinct).
+        self.assertIn("uninitialized", cloudinit.SYSPREP_COMMAND)
+        self.assertIn("/etc/machine-id", cloudinit.SYSPREP_COMMAND)
+        self.assertNotIn("truncate", cloudinit.SYSPREP_COMMAND)
+        # the dbus copy/symlink is cleared so it re-derives from the regenerated id
+        self.assertIn("/var/lib/dbus/machine-id", cloudinit.SYSPREP_COMMAND)
+        # sync is load-bearing: the reset must be flushed before the snapshot
+        self.assertIn("sync", cloudinit.SYSPREP_COMMAND)
 
 
 # --------------------------------------------------------------------------- #
@@ -2584,6 +2962,68 @@ class TestCliRun(unittest.TestCase):
                     ])
             self.assertEqual(rc, 2)
 
+    def test_run_arch_refusal_message_mentions_cache_miss_rescue_write(self) -> None:
+        # D11: the improved message explains the key is required because a cache
+        # miss may still rescue-write.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    rc = cli.main([
+                        "run", "--battery", self._write_battery(d), "--distros", "arch",
+                        "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                        "--run-token", "cli-run", "--yes",
+                    ])
+            self.assertEqual(rc, 2)
+            self.assertIn("cache miss may still rescue-write", buf.getvalue())
+
+    def test_run_reap_bad_cache_image_threads_to_execute(self) -> None:
+        # --reap-bad-cache-image is parsed and threaded into execute().
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        def _capture_execute(*a: object, **k: object) -> list[model.HostRun]:
+            captured.update(k)
+            return []
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 mock.patch.object(cli, "execute", _capture_execute):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                    "--run-token", "cli-run", "--yes", "--reap-bad-cache-image",
+                ])
+            self.assertTrue(captured.get("reap_bad_cache_image"))
+            self.assertIn("resolve_deps", captured)
+
+    def test_run_cache_hit_restores_via_cli(self) -> None:
+        # end-to-end CLI: a matching cache image → the host is created from the
+        # snapshot id (the wiring carries resolve_deps through to a real hit).
+        from unittest import mock
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(prov.created[0].image, "img-cache")
+            self.assertEqual(prov.created_images, [])  # run never builds
+
     def test_run_success_writes_results(self) -> None:
         # stub the provider + keypair + ssh so the run path executes end-to-end
         # with no network. --yes skips the confirm prompt.
@@ -3498,6 +3938,1256 @@ class TestDistroRescue(unittest.TestCase):
             profile = distro.get_profile(key)
             self.assertFalse(profile.needs_rescue_write)
             self.assertIsNone(profile.rescue_image)
+
+
+def _null_deps() -> rescue_image.ResolveDeps:
+    """A ResolveDeps whose seams all raise — for native paths that never resolve.
+
+    A native distro's base fingerprint is the arch-blind slug; it must NEVER
+    touch a resolve seam, so make every seam fail loudly if it does.
+    """
+    from vmlease.rescue_image import ResolveDeps
+
+    def boom_text(_u: str) -> str:
+        raise AssertionError("native path must not call text_fetcher")
+
+    def boom_bytes(_u: str) -> bytes:
+        raise AssertionError("native path must not call fetcher")
+
+    def boom_gpg(_argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("native path must not invoke gpg")
+
+    return ResolveDeps(
+        text_fetcher=boom_text, fetcher=boom_bytes, gpg_runner=boom_gpg,
+        write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+    )
+
+
+class _FakeResolveSpec:
+    """A fake RescueImageSpec returning a fixed sha (or raising) — no network."""
+
+    def __init__(self, *, sha: str = "", raises: BaseException | None = None) -> None:
+        self._sha = sha
+        self._raises = raises
+
+    def resolve_and_verify(self, deps: rescue_image.ResolveDeps, /) -> rescue_image.ResolvedRescueImage:
+        if self._raises is not None:
+            raise self._raises
+        from vmlease.rescue_image import RemoteUrl, ResolvedRescueImage
+        return ResolvedRescueImage(expected_sha256=self._sha, source=RemoteUrl("https://m/x.qcow2"))
+
+
+def _rescue_profile(spec: object) -> distro.DistroProfile:
+    """A minimal rescue-write profile carrying an injected fake spec."""
+    from vmlease.rescue_image import RescueImageSpec
+    assert isinstance(spec, RescueImageSpec)
+    base = distro.get_profile("arch")
+    return distro.DistroProfile(
+        key=base.key, default_image=base.default_image, package_manager=base.package_manager,
+        packages=base.packages, docker_repo_slug=base.docker_repo_slug, extra_setup=base.extra_setup,
+        system_update_override=base.system_update_override, rescue_image=spec, notes=base.notes,
+    )
+
+
+def _cache_image(*, distro_key: str, arch: str, key: str, img_id: str = "img-1") -> Image:
+    """A cache Image carrying the supersession-relevant labels."""
+    return Image(
+        id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
+        labels={
+            imagecache.LABEL_DISTRO: distro_key,
+            imagecache.LABEL_ARCH: arch,
+            imagecache.LABEL_CACHE_KEY: key,
+        },
+    )
+
+
+class TestImageCacheBaseFingerprint(unittest.TestCase):
+    def test_native_returns_arch_blind_slug(self) -> None:
+        # ubuntu is native — the fingerprint is its provider slug, no resolve seam touched.
+        ubuntu = distro.get_profile("ubuntu")
+        fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
+        self.assertEqual(fp, "ubuntu-24.04")
+
+    def test_rescue_write_returns_resolved_digest(self) -> None:
+        # an Arch-shaped rescue-write profile resolves to the spec's qcow2 sha.
+        prof = _rescue_profile(_FakeResolveSpec(sha="deadbeef" * 8))
+        fp = imagecache.base_fingerprint(prof, "x86", _null_deps())
+        self.assertEqual(fp, "deadbeef" * 8)
+
+    def test_golden_returns_pinned_sha(self) -> None:
+        # a golden spec's resolve returns its pinned sha — same uniform call.
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        sha = hashlib.sha256(b"golden").hexdigest()
+        prof = _rescue_profile(GoldenRescueImageSpec(sha256=sha, url="https://m/golden.qcow2"))
+
+        from vmlease.rescue_image import ResolveDeps
+        deps = ResolveDeps(
+            text_fetcher=lambda _u: "", fetcher=lambda _u: b"golden",
+            gpg_runner=_fake_subprocess(0, ""), write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+        )
+        self.assertEqual(imagecache.base_fingerprint(prof, "x86", deps), sha)
+
+
+class TestImageCacheContentKey(unittest.TestCase):
+    def test_same_recipe_same_key(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        k1 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        k2 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        self.assertEqual(k1, k2)
+        self.assertTrue(k1.startswith("v1-ubuntu-"))
+        self.assertEqual(len(k1), len("v1-ubuntu-") + 32)
+
+    def test_recipe_change_changes_key(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        mutated = distro.DistroProfile(
+            key=ubuntu.key, default_image=ubuntu.default_image, package_manager=ubuntu.package_manager,
+            packages=(*ubuntu.packages, "htop"),  # a recipe change
+            docker_repo_slug=ubuntu.docker_repo_slug,
+        )
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(mutated, "x86", "probe", _null_deps()),
+        )
+
+    def test_different_arch_changes_key(self) -> None:
+        # native's slug is arch-blind, so the arch-fold is what makes the key vary.
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "arm", "probe", _null_deps()),
+        )
+
+    def test_operator_changes_key(self) -> None:
+        # operator is part of the canonical render (baked user), so it is in the key.
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "alice", _null_deps()),
+        )
+
+    def test_pinned_algorithm_exact_key(self) -> None:
+        # A pinned exact-key assertion: this goes RED if the algorithm (SHA-256,
+        # [:32], arch-fold, \0 separators, sentinel) or the sentinel value drifts.
+        ubuntu = distro.get_profile("ubuntu")
+        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY)
+        expected_payload = f"x86\0ubuntu-24.04\0{canonical}".encode()
+        expected_digest = hashlib.sha256(expected_payload).hexdigest()[:32]
+        expected = f"v1-ubuntu-{expected_digest}"
+        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", _null_deps()), expected)
+
+    def test_sentinel_value_is_pinned(self) -> None:
+        self.assertEqual(imagecache._CACHE_KEY_CANONICAL_PUBKEY, "vmlease-cache-key-canonical-pubkey")
+
+
+def _cached_run_image(
+    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache"
+) -> Image:
+    """A purpose-labelled cache Image for the run-restore lookup (key + arch + disk)."""
+    return Image(
+        id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=disk_size, arch=arch,
+        labels={
+            imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
+            imagecache.LABEL_CACHE_KEY: key,
+            imagecache.LABEL_DISTRO: "ubuntu",
+            imagecache.LABEL_ARCH: arch,
+        },
+    )
+
+
+class TestLookupCacheImage(unittest.TestCase):
+    """runner._lookup_cache_image: hit | miss | oversized | wrong-arch | graceful.
+
+    The thin cache-lookup helper returns the matched ``Image`` on a hit, ``None`` on
+    a miss (no match / oversized / wrong arch / wrong key) or a graceful lookup
+    failure. It renders NO cloud-init — the run path renders the right one on the
+    branch that needs it.
+    """
+
+    def _ubuntu(self) -> distro.DistroProfile:
+        return distro.get_profile("ubuntu")
+
+    def _key(self, arch: str = "x86") -> str:
+        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+
+    def _call(self, prov: providers.Provider, *, arch: str = "x86", target_disk: float = 40.0,
+              warn: Callable[[str], None] | None = None) -> Image | None:
+        warns: list[str] = []
+        return runner._lookup_cache_image(
+            self._ubuntu(),
+            operator="probe", arch=arch, target_disk=target_disk,
+            provider=prov, deps=_null_deps(),
+            warn=warn if warn is not None else warns.append,
+        )
+
+    def test_hit_returns_the_matched_image(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        match = self._call(prov)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.id, "img-cache")
+
+    def test_miss_no_image_returns_none(self) -> None:
+        prov = FakeProvider()  # no images at all
+        self.assertIsNone(self._call(prov))
+
+    def test_oversized_image_is_a_miss(self) -> None:
+        # disk_size (50) > target_disk (40): the snapshot can't restore here → miss.
+        prov = FakeProvider()
+        prov.images["img-big"] = _cached_run_image(key=self._key(), disk_size=50.0, img_id="img-big")
+        self.assertIsNone(self._call(prov, target_disk=40.0))
+
+    def test_equal_disk_is_a_hit(self) -> None:
+        # the bound is <=: a snapshot whose disk equals the target restores.
+        prov = FakeProvider()
+        prov.images["img-eq"] = _cached_run_image(key=self._key(), disk_size=40.0, img_id="img-eq")
+        match = self._call(prov, target_disk=40.0)
+        assert match is not None
+        self.assertEqual(match.id, "img-eq")
+
+    def test_wrong_arch_image_is_a_miss(self) -> None:
+        # the image's arch (arm) != the target arch (x86) → miss even if labelled.
+        prov = FakeProvider()
+        prov.images["img-arm"] = _cached_run_image(key=self._key("x86"), arch="arm", img_id="img-arm")
+        self.assertIsNone(self._call(prov, arch="x86"))
+
+    def test_wrong_key_image_is_a_miss(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-other"] = _cached_run_image(key="v1-ubuntu-NOTOURKEY", img_id="img-other")
+        self.assertIsNone(self._call(prov))
+
+    def test_list_images_failure_is_graceful_miss_and_warns(self) -> None:
+        # a list_images that raises → warn + miss (None) (the cache is advisory).
+        class _ListBoom(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise providers.ProviderError("hcloud image list exploded")
+
+        warns: list[str] = []
+        self.assertIsNone(self._call(_ListBoom(), warn=warns.append))
+        self.assertEqual(len(warns), 1)
+        self.assertIn("cache lookup failed", warns[0])
+
+
+class TestRunCacheConsumption(unittest.TestCase):
+    """execute() cache consumption (group 8): hit-restore, G3 cold-fallback, G4 host-failure."""
+
+    def _ubuntu(self) -> distro.DistroProfile:
+        return distro.get_profile("ubuntu")
+
+    def _key(self, arch: str = "x86") -> str:
+        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+
+    def _matrix(self) -> runner.Matrix:
+        return runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
+
+    def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
+        return lambda _op, _kp: ssh_runner
+
+    def _exec(
+        self,
+        prov: providers.Provider,
+        ssh_runner: ssh.SshRunner | None = None,
+        *,
+        resolve_deps: rescue_image.ResolveDeps | None = None,
+        reap_bad_cache_image: bool = False,
+    ) -> list[model.HostRun]:
+        with tempfile.TemporaryDirectory() as d:
+            return runner.execute(
+                self._matrix(), prov, self._factory(ssh_runner or FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe",
+                resolve_deps=resolve_deps if resolve_deps is not None else _null_deps(),
+                reap_bad_cache_image=reap_bad_cache_image,
+            )
+
+    def test_hit_restores_from_snapshot_skips_rescue_workload_runs(self) -> None:
+        # a cache hit creates from the snapshot id with the MINIMAL cloud-init and
+        # the workload runs; run NEVER builds.
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        fssh = FakeSshRunner()
+        runs = self._exec(prov, fssh)
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].results)  # workload ran
+        self.assertEqual(len(prov.created), 1)
+        self.assertEqual(prov.created[0].image, "img-cache")  # created from snapshot
+        # minimal restore cloud-init (re-authorize the per-run key only)
+        self.assertEqual(
+            prov.cloud_inits[0],
+            cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 AAAA probe"),
+        )
+        self.assertEqual(len(prov.destroyed), 1)  # torn down
+        self.assertEqual(prov.created_images, [])  # run NEVER builds (D3)
+
+    def test_miss_uses_cold_path(self) -> None:
+        # no cached image → cold default image, full cloud-init.
+        prov = FakeProvider()
+        runs = self._exec(prov)
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertTrue(runs[0].results)
+        self.assertEqual(prov.created_images, [])
+
+    def test_g3_create_from_image_failure_falls_back_to_cold(self) -> None:
+        # G3: a hit whose create-from-image fails (image gone) → cold path; the run
+        # does NOT fail; the host is provisioned cold.
+        class _RestoreCreateBoom(FakeProvider):
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                if spec.image == "img-cache":
+                    raise providers.ProviderError("image not found (pruned mid-flight)")
+                return super().create_with_cloudinit(spec, cloud_init)
+
+        prov = _RestoreCreateBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov)
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].results)  # ran cold, did NOT fail
+        # exactly one host created — the COLD one (the restore create raised first)
+        self.assertEqual([s.image for s in prov.created], [self._ubuntu().default_image])
+        self.assertEqual(len(prov.destroyed), 1)  # cold host torn down
+        self.assertEqual(prov.created_images, [])
+
+    def test_g4_restored_host_readiness_failure_is_host_failure_naming_image(self) -> None:
+        # G4: a restored host that fails readiness → host failure naming the source
+        # image, NOT cold-retried (only ONE host created — the restore).
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom())
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].results, ())  # host failure
+        self.assertTrue(runs[0].detail.startswith("ERROR:"))
+        self.assertIn("img-cache", runs[0].detail)  # names the source image
+        # NOT cold-retried: only the restore host was created (no second cold host)
+        self.assertEqual([s.image for s in prov.created], ["img-cache"])
+        self.assertEqual(len(prov.destroyed), 1)  # restored host torn down
+
+    def test_g4_default_keeps_the_image_hint_only(self) -> None:
+        # default (no --reap-bad-cache-image): the image is named but KEPT.
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom())
+        self.assertEqual(prov.deleted_images, [])  # image survives
+        self.assertIn("the image was KEPT", runs[0].detail)
+        self.assertIn("img-cache", runs[0].detail)
+
+    def test_g4_reap_flag_reaps_the_source_image(self) -> None:
+        # --reap-bad-cache-image set: the source image is reaped on readiness failure.
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom(), reap_bad_cache_image=True)
+        self.assertEqual(prov.deleted_images, ["img-cache"])  # reaped
+        self.assertIn("reaped the bad cache image img-cache", runs[0].detail)
+
+    def test_g4_reap_failure_is_noted_not_raised(self) -> None:
+        # the reap of the bad image itself failing is a NOTE in the detail, never a
+        # raise (still a recorded host failure).
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("unreachable")
+
+        class _DeleteBoom(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                raise providers.ProviderError("image delete exploded")
+
+        prov = _DeleteBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom(), reap_bad_cache_image=True)
+        self.assertEqual(runs[0].results, ())
+        self.assertIn("reap of the bad cache image img-cache FAILED", runs[0].detail)
+
+    def test_cutoff_create_fail_cold_vs_readiness_fail_host_failure(self) -> None:
+        # the load-bearing distinction: a create-from-image fail → cold success; a
+        # readiness fail on the restored host → host failure (no cold retry).
+        class _RestoreCreateBoom(FakeProvider):
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                if spec.image == "img-cache":
+                    raise providers.ProviderError("image gone")
+                return super().create_with_cloudinit(spec, cloud_init)
+
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("unreachable")
+
+        prov_a = _RestoreCreateBoom()
+        prov_a.images["img-cache"] = _cached_run_image(key=self._key())
+        runs_a = self._exec(prov_a)
+        # create-fail → cold success (workload ran, one cold host)
+        self.assertTrue(runs_a[0].results)
+        self.assertEqual([s.image for s in prov_a.created], [self._ubuntu().default_image])
+
+        prov_b = FakeProvider()
+        prov_b.images["img-cache"] = _cached_run_image(key=self._key())
+        runs_b = self._exec(prov_b, _ReadinessBoom())
+        # readiness-fail → host failure (no cold retry, names the image)
+        self.assertEqual(runs_b[0].results, ())
+        self.assertEqual([s.image for s in prov_b.created], ["img-cache"])
+
+    def test_server_type_disk_failure_is_graceful_miss_cold(self) -> None:
+        # G9: a server_type_disk failure → warn + cache miss → cold path (the host
+        # is provisioned cold, never failed).
+        class _DiskBoom(FakeProvider):
+            def server_type_disk(self, server_type: str) -> float:
+                raise providers.ProviderError("server-type describe exploded")
+
+        prov = _DiskBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov)
+        self.assertTrue(runs[0].results)  # ran cold
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertEqual(prov.created_images, [])
+
+    def test_resolve_deps_none_is_pure_cold_no_disk_call(self) -> None:
+        # resolve_deps=None → pure cold path: no lookup, no server_type_disk call.
+        class _NoDiskAllowed(FakeProvider):
+            def server_type_disk(self, server_type: str) -> float:
+                raise AssertionError("cold path must not call server_type_disk")
+
+            def list_images(self, selector: str) -> list[Image]:
+                raise AssertionError("cold path must not call list_images")
+
+        prov = _NoDiskAllowed()
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                self._matrix(), prov, self._factory(FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe", resolve_deps=None,
+            )
+        self.assertTrue(runs[0].results)
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+
+    def test_run_makes_zero_create_image_calls_on_hit_and_miss(self) -> None:
+        # D3: run NEVER builds — zero create_image calls on both a hit and a miss.
+        hit = FakeProvider()
+        hit.images["img-cache"] = _cached_run_image(key=self._key())
+        self._exec(hit)
+        self.assertEqual(hit.created_images, [])
+
+        miss = FakeProvider()
+        self._exec(miss)
+        self.assertEqual(miss.created_images, [])
+
+
+class TestPlanZeroProviderCalls(unittest.TestCase):
+    """plan() makes ZERO provider calls even with caching available (D3/8.3)."""
+
+    def test_plan_makes_zero_provider_calls(self) -> None:
+        class _NoCallProvider(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise AssertionError("plan must not call list_images")
+
+            def server_type_disk(self, server_type: str) -> float:
+                raise AssertionError("plan must not call server_type_disk")
+
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                raise AssertionError("plan must not create")
+
+        prov = _NoCallProvider()
+        prov.images["img-cache"] = _cached_run_image(
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        )
+        # plan takes no provider at all — it is call-free by construction. Asserting
+        # the matrix plans without touching the provider object is the guarantee.
+        items = runner.plan(runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-plan"))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(prov.created, [])
+        self.assertEqual(prov.created_images, [])
+
+
+class TestImageCacheLabels(unittest.TestCase):
+    def test_full_label_set(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="v1-ubuntu-abc", source_fp="ubuntu-24.04", run_token="run-xyz",
+        )
+        self.assertEqual(labels, {
+            "vmlease-purpose": "image-cache",
+            "vmlease-cache-key": "v1-ubuntu-abc",
+            "vmlease-schema": "v1",
+            "vmlease-distro": "ubuntu",
+            "vmlease-arch": "x86",
+            "vmlease-source-fp": "ubuntu-24.04",
+            "vmlease-built": "run-xyz",
+        })
+
+    def test_no_per_run_reap_label(self) -> None:
+        # the data-loss guard: a persistent cache image must NOT carry vmlease=<run-id>.
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp="fp", run_token="run-1")
+        self.assertNotIn("vmlease", labels)
+
+    def test_long_value_truncated_to_63(self) -> None:
+        # a 64-hex sha source-fp would overflow the provider's ≤63-char limit.
+        ubuntu = distro.get_profile("ubuntu")
+        sha = "f" * 64
+        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp=sha, run_token="run-1")
+        self.assertEqual(len(labels["vmlease-source-fp"]), 63)
+        self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
+
+
+class TestImageCacheSupersession(unittest.TestCase):
+    def test_superseded_subset(self) -> None:
+        current = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-CUR", img_id="cur")
+        old = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD", img_id="old")
+        result = imagecache.superseded([current, old], "v1-ubuntu-CUR")
+        self.assertEqual([img.id for img in result], ["old"])
+
+    def test_accept_a_no_current_image_all_superseded(self) -> None:
+        # accept-(a): current image absent ⇒ every image in the group is superseded.
+        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD1", img_id="a")
+        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD2", img_id="b")
+        result = imagecache.superseded([a, b], "v1-ubuntu-CUR")
+        self.assertEqual({img.id for img in result}, {"a", "b"})
+
+    def test_resolve_current_keys_native(self) -> None:
+        img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-anything")
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys(
+            [img], distro.get_profile, "probe", _null_deps(), warnings.append,
+        )
+        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        self.assertEqual(keys, {("ubuntu", "x86"): expected})
+        self.assertEqual(warnings, [])
+
+    def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
+        # a raising resolve (mirror down) ⇒ group skipped + warned, never deleted.
+        from vmlease.archbuild import ArchBuildError
+        raising_spec = _FakeResolveSpec(raises=ArchBuildError("mirror down"))
+
+        def profile_for(key: str) -> distro.DistroProfile:
+            if key == "arch":
+                return _rescue_profile(raising_spec)
+            return distro.get_profile(key)
+
+        arch_img = _cache_image(distro_key="arch", arch="x86", key="v1-arch-OLD", img_id="arch1")
+        ubuntu_img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-X", img_id="ub1")
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys(
+            [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
+        )
+        # ubuntu resolved; arch skipped (kept) with a warning.
+        self.assertIn(("ubuntu", "x86"), keys)
+        self.assertNotIn(("arch", "x86"), keys)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("arch", warnings[0])
+
+    def test_resolve_current_keys_dedups_group(self) -> None:
+        # two images of the same group ⇒ the key is resolved once.
+        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-A", img_id="a")
+        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-B", img_id="b")
+        keys = imagecache.resolve_current_keys(
+            [a, b], distro.get_profile, "probe", _null_deps(), lambda _m: None,
+        )
+        self.assertEqual(len(keys), 1)
+
+
+class TestWaitUntilOff(unittest.TestCase):
+    def test_returns_when_off(self) -> None:
+        prov = FakeProvider()
+        prov.power_off("9")  # flips state to "off"
+        slept: list[float] = []
+        runner._wait_until_off(prov, "9", attempts=5, sleep=slept.append)
+        self.assertEqual(slept, [])  # off on the first poll → no sleep
+
+    def test_polls_then_returns_when_it_turns_off(self) -> None:
+        # status "running" for the first two polls, then "off".
+        class _Slow(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self._polls = 0
+
+            def server_status(self, server_id: str) -> str:
+                self._polls += 1
+                return "off" if self._polls >= 3 else "running"
+
+        slept: list[float] = []
+        runner._wait_until_off(_Slow(), "9", attempts=5, sleep=slept.append)
+        self.assertEqual(len(slept), 2)  # slept between the first two running polls
+
+    def test_timeout_raises(self) -> None:
+        # never off → exhausts the attempt budget → raises (G2), no real clock.
+        prov = FakeProvider()  # default status "running"
+        slept: list[float] = []
+        with self.assertRaises(runner.PoweroffTimeoutError):
+            runner._wait_until_off(prov, "9", attempts=3, sleep=slept.append)
+        self.assertEqual(len(slept), 2)  # slept between polls but not after the last
+
+
+class TestBuildOneImage(unittest.TestCase):
+    def _spec(self, distro_key: str = "ubuntu") -> HostSpec:
+        return HostSpec(
+            name=f"vmlease-build-{distro_key}",
+            image=distro.get_profile(distro_key).default_image,
+            server_type="cpx22",
+            distro_key=distro_key,
+            labels={"vmlease": "build-run"},
+        )
+
+    def _build(
+        self,
+        prov: providers.Provider,
+        fssh: ssh.SshRunner,
+        *,
+        description: str = "v1-ubuntu-key",
+        labels: dict[str, str] | None = None,
+        distro_key: str = "ubuntu",
+    ) -> tuple[Image, list[str]]:
+        labels = labels if labels is not None else {"vmlease-cache-key": "v1-ubuntu-key"}
+        note_sink: list[str] = []
+        on_ready = runner.make_snapshot_on_ready(
+            description, labels, sleep=lambda _s: None, poweroff_attempts=5
+        )
+        with tempfile.TemporaryDirectory() as d:
+            image = runner.build_one_image(
+                self._spec(distro_key),
+                distro.get_profile(distro_key),
+                prov,
+                lambda _o, _k: fssh,
+                _fake_keypair(Path(d)),
+                "probe",
+                None,
+                on_ready=on_ready,
+                note_sink=note_sink,
+            )
+        return image, note_sink
+
+    def test_happy_build_returns_labelled_image_and_tears_down(self) -> None:
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        image, note_sink = self._build(prov, fssh)
+        # returns an Image carrying the supplied labels (atomic create)
+        self.assertEqual(image.labels.get("vmlease-cache-key"), "v1-ubuntu-key")
+        self.assertEqual(len(prov.created_images), 1)
+        # the builder went off, then was torn down
+        self.assertEqual(prov.powered_off, ["id-vmlease-build-ubuntu"])
+        self.assertEqual(prov.server_status("id-vmlease-build-ubuntu"), "off")
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])
+        self.assertEqual(note_sink, [])  # clean teardown → no note
+        # sysprep ran first over SSH
+        self.assertEqual(fssh.ran[0], "_sysprep")
+
+    def test_sysprep_failure_aborts_before_snapshot_and_tears_down(self) -> None:
+        # G1: a non-zero sysprep exit raises, NO create_image, builder destroyed.
+        prov = FakeProvider()
+        fssh = FakeSshRunner(fail_on="_sysprep")
+        with self.assertRaises(RuntimeError):
+            self._build(prov, fssh)
+        self.assertEqual(prov.created_images, [])  # never snapshotted
+        self.assertEqual(prov.powered_off, [])  # never even powered off
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])  # torn down
+
+    def test_poweroff_never_off_aborts_before_snapshot_and_tears_down(self) -> None:
+        # G2: the host never reaches off → wait-for-off raises, no create_image.
+        class _NeverOff(FakeProvider):
+            def power_off(self, server_id: str) -> None:
+                self.powered_off.append(server_id)  # records, but stays "running"
+
+        prov = _NeverOff()
+        fssh = FakeSshRunner()
+        with self.assertRaises(runner.PoweroffTimeoutError):
+            self._build(prov, fssh)
+        self.assertEqual(prov.created_images, [])  # never snapshotted
+        self.assertEqual(len(prov.powered_off), 1)  # poweroff was attempted
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])  # torn down
+
+    def test_teardown_failure_surfaces_note_for_next_milestone(self) -> None:
+        # a failing builder teardown is surfaced via note_sink (not swallowed,
+        # not raised) so _cmd_build_image can route it to a non-zero exit.
+        class _DestroyFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                super().destroy(host)
+                raise providers.ProviderError("request timeout")
+
+        prov = _DestroyFails()
+        image, note_sink = self._build(prov, FakeSshRunner())
+        self.assertEqual(image.labels.get("vmlease-cache-key"), "v1-ubuntu-key")  # image kept
+        self.assertEqual(len(note_sink), 1)
+        self.assertIn(runner.TEARDOWN_WARNING_PREFIX, note_sink[0])
+
+
+class TestServerTypeArch(unittest.TestCase):
+    def test_x86_for_cpx(self) -> None:
+        self.assertEqual(safety.server_type_arch("cpx22"), "x86")
+
+    def test_arm_for_cax(self) -> None:
+        self.assertEqual(safety.server_type_arch("cax11"), "arm")
+
+    def test_x86_for_other_families(self) -> None:
+        self.assertEqual(safety.server_type_arch("cx23"), "x86")
+        self.assertEqual(safety.server_type_arch("ccx13"), "x86")
+
+
+class TestBuildLiveResolveDeps(unittest.TestCase):
+    def test_returns_resolve_deps_with_keyring_and_wired_seams(self) -> None:
+        observed: dict[str, object] = {}
+
+        def fake_run(argv: list[str], stdin: str | None) -> tuple[int, str, str]:
+            observed["run"] = argv
+            return 0, "ok", ""
+
+        def fake_text(url: str) -> str:
+            observed["text"] = url
+            return "T"
+
+        def fake_bytes(url: str) -> bytes:
+            observed["bytes"] = url
+            return b"B"
+
+        deps = archbuild.build_live_resolve_deps(
+            "/keyring/arch-boxes.gpg", run=fake_run, fetch_text=fake_text, fetch_bytes=fake_bytes,
+        )
+        self.assertIsInstance(deps, rescue_image.ResolveDeps)
+        self.assertEqual(deps.keyring_path, "/keyring/arch-boxes.gpg")
+        # the gpg_runner wraps `run` into a CompletedProcess, observing the seam.
+        cp = deps.gpg_runner(["gpg", "--verify"])
+        self.assertEqual(cp.returncode, 0)
+        self.assertEqual(observed["run"], ["gpg", "--verify"])
+        # the fetchers are wired straight through.
+        self.assertEqual(deps.text_fetcher("u1"), "T")
+        self.assertEqual(deps.fetcher("u2"), b"B")
+        self.assertEqual(observed["text"], "u1")
+        self.assertEqual(observed["bytes"], "u2")
+
+
+class TestContentKeyFromBaseFp(unittest.TestCase):
+    def test_matches_content_key(self) -> None:
+        # the split derivation hashes the SAME bytes as content_key.
+        ubuntu = distro.get_profile("ubuntu")
+        base_fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
+        derived = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe")
+        whole = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        self.assertEqual(derived, whole)
+
+
+class TestCliBuildImage(unittest.TestCase):
+    """``vmlease build-image`` lifecycle (tasks 6.2-6.6), fully mocked (no network)."""
+
+    def _key(self, distro_key: str = "ubuntu", arch: str = "x86", operator: str = "probe") -> str:
+        prof = distro.get_profile(distro_key)
+        base_fp = imagecache.base_fingerprint(prof, arch, _null_deps())
+        return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator)
+
+    def _cache_img(
+        self, *, key: str, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
+        created: str = "2024-01-01T00:00:00+00:00",
+    ) -> Image:
+        return Image(
+            id=img_id, created=created, disk_size=40.0, arch=arch,
+            labels={
+                imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
+                imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_ARCH: arch,
+                imagecache.LABEL_CACHE_KEY: key,
+            },
+        )
+
+    def _run(
+        self, prov: FakeProvider, argv: list[str], *, tmp: str,
+        reader: Callable[[str], str] = lambda _p: "y",
+    ) -> tuple[int, str, str]:
+        from unittest import mock
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+             mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(tmp))), \
+             mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+             redirect_stdout(out), redirect_stderr(err):
+            ns = cli.build_parser().parse_args(argv)
+            rc = cli._cmd_build_image(ns, reader=reader)
+        return rc, out.getvalue(), err.getvalue()
+
+    # --- 6.2 ---------------------------------------------------------------- #
+    def test_build_provisions_builder_with_run_label(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(prov.created), 1)
+        spec = prov.created[0]
+        self.assertEqual(spec.labels.get("vmlease"), "bird")  # builder carries the reap label
+        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu")
+        # the image was created and carries the cache key (NOT vmlease=<run-id>).
+        self.assertEqual(len(prov.created_images), 1)
+        img_labels = prov.created_images[0][2]
+        self.assertEqual(img_labels.get(imagecache.LABEL_CACHE_KEY), self._key())
+        self.assertNotIn("vmlease", img_labels)
+
+    def test_unknown_distro_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "nope", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+        self.assertIn("error:", err)
+
+    def test_non_allowlisted_server_type_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--server-type", "ccx33", "--run-token", "bird", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+
+    def test_rescue_write_without_ssh_key_exits_2_no_provision(self) -> None:
+        # D11: the rescue-key gate fires BEFORE any keypair/provisioning.
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "arch", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])  # zero hosts
+        self.assertEqual(prov.created_images, [])
+        self.assertIn("--ssh-key", err)
+
+    # --- 6.3 ---------------------------------------------------------------- #
+    def test_already_cached_is_noop_exit_0_zero_hosts(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-cur"] = self._cache_img(key=self._key(), img_id="img-cur")
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.created, [])  # no builder
+        self.assertEqual(prov.created_images, [])  # no new image
+        self.assertIn("already cached", out)
+
+    def test_at_cap_s_empty_refuses_exit_1_no_builder(self) -> None:
+        # max-images=1, one cached image of a DIFFERENT group/key (not superseded
+        # of THIS group, since this group is absent ⇒ S of this group is empty).
+        prov = FakeProvider()
+        prov.images["img-other"] = self._cache_img(
+            key="v1-fedora-X", img_id="img-other", distro_key="fedora",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--max-images", "1", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(prov.created, [])  # no builder
+        self.assertIn("image quota", err)
+
+    # --- 6.4 ---------------------------------------------------------------- #
+    def test_not_at_cap_builds_then_prunes_s(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-old"] = self._cache_img(key=self._key()[:-1] + "Z", img_id="img-old")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(prov.created_images), 1)  # built
+        self.assertIn("img-old", prov.deleted_images)  # then pruned S
+
+    def test_at_cap_s_nonempty_prunes_then_builds(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-old"] = self._cache_img(key=self._key()[:-1] + "Z", img_id="img-old")
+        order: list[str] = []
+        real_delete = prov.delete_image
+        real_create = prov.create_with_cloudinit
+
+        def track_delete(image_id: str) -> None:
+            order.append(f"delete:{image_id}")
+            real_delete(image_id)
+
+        def track_create(spec: HostSpec, cloud_init: str) -> Host:
+            order.append("create")
+            return real_create(spec, cloud_init)
+
+        prov.delete_image = track_delete  # type: ignore[method-assign]
+        prov.create_with_cloudinit = track_create  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--max-images", "1", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        # prune-then-build: the S delete happened before the builder create.
+        self.assertEqual(order, ["delete:img-old", "create"])
+
+    def test_post_build_prune_failure_still_succeeds(self) -> None:
+        # G7: a not-at-cap post-build prune failure warns, build still succeeds.
+        class _PruneFails(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                raise providers.ProviderError("delete exploded")
+
+        prov = _PruneFails()
+        prov.images["img-old"] = self._cache_img(key=self._key()[:-1] + "Z", img_id="img-old")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)  # build NOT failed
+        self.assertEqual(len(prov.created_images), 1)
+        self.assertIn("warning", err)
+
+    def test_at_cap_pre_build_prune_failure_aborts_before_provisioning(self) -> None:
+        class _PruneFails(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                raise providers.ProviderError("delete exploded")
+
+        prov = _PruneFails()
+        prov.images["img-old"] = self._cache_img(key=self._key()[:-1] + "Z", img_id="img-old")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--max-images", "1", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(prov.created, [])  # no builder
+        self.assertIn("pre-build prune", err)
+
+    # --- 6.5 ---------------------------------------------------------------- #
+    def test_rebuild_drops_only_older_same_key_image(self) -> None:
+        # an EXISTING same-key image, older than the freshly-built one (which the
+        # FakeProvider stamps "2024-01-01..."), is dropped; a same-key image with a
+        # LATER created stamp would survive. Use an older existing image.
+        prov = FakeProvider()
+        prov.images["img-prev"] = self._cache_img(
+            key=self._key(), img_id="img-prev", created="2023-01-01T00:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--rebuild", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(prov.created_images), 1)  # rebuilt
+        self.assertIn("img-prev", prov.deleted_images)  # older same-key dropped
+        # the just-built image (newest) survives.
+        self.assertEqual(len(prov.images), 1)
+        self.assertNotIn("img-prev", prov.images)
+
+    def test_rebuild_keeps_newer_same_key_image(self) -> None:
+        # a same-key image created AFTER the just-built one must NOT be dropped
+        # (never "all other same-key").
+        prov = FakeProvider()
+        prov.images["img-newer"] = self._cache_img(
+            key=self._key(), img_id="img-newer", created="2999-01-01T00:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--rebuild", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("img-newer", prov.deleted_images)  # newer survives
+        self.assertIn("img-newer", prov.images)
+
+    # --- 6.6 ---------------------------------------------------------------- #
+    def test_provider_quota_error_exits_1_with_reap_hint(self) -> None:
+        class _QuotaFails(FakeProvider):
+            def create_image(self, server_id: str, description: str, labels: dict[str, str]) -> Image:
+                raise providers.ProviderQuotaError("snapshot limit (resource_limit_exceeded)")
+
+        prov = _QuotaFails()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("reap-images", err)
+        # the builder was torn down by the scaffold's finally.
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+
+    def test_builder_teardown_failure_exits_nonzero_keeps_image(self) -> None:
+        # G8: a builder-teardown failure → reap attempted, image KEPT, non-zero exit.
+        class _DestroyFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                super().destroy(host)
+                raise providers.ProviderError("request timeout")
+
+        prov = _DestroyFails()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(prov.created_images), 1)  # image kept (reap is server-only)
+        self.assertIn("teardown failed", err)
+        self.assertIn("image kept", err)
+
+    def test_ctrl_c_during_build_backstop_reaps_and_reraises(self) -> None:
+        # KeyboardInterrupt mid-build → reap the builder by label (image kept),
+        # then re-raise so the interrupt still exits.
+        from unittest import mock
+
+        class _Interrupting(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt
+
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+             mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+             mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _Interrupting()), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            ns = cli.build_parser().parse_args(
+                ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"]
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                cli._cmd_build_image(ns, reader=lambda _p: "y")
+        # the builder was reaped by run-label (list_labeled then destroy).
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+
+    def test_generic_provider_error_during_build_exits_1(self) -> None:
+        # a sysprep failure raises RuntimeError inside the build → exit 1, no traceback.
+        from unittest import mock
+
+        prov = FakeProvider()
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+             mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+             mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner(fail_on="_sysprep")), \
+             redirect_stdout(out), redirect_stderr(err):
+            ns = cli.build_parser().parse_args(
+                ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"]
+            )
+            rc = cli._cmd_build_image(ns, reader=lambda _p: "y")
+        self.assertEqual(rc, 1)
+        self.assertEqual(prov.created_images, [])  # never snapshotted
+        self.assertIn("error:", err.getvalue())
+
+    def test_confirm_no_aborts_before_provisioning(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird"], tmp=d, reader=lambda _p: "n",
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.created, [])
+        self.assertIn("aborted", out)
+
+
+class TestCliReapImages(unittest.TestCase):
+    """``vmlease reap-images`` (tasks 7.1), fully mocked (no network)."""
+
+    def _img(
+        self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
+        key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
+    ) -> Image:
+        return Image(
+            id=img_id, created=created, disk_size=40.0, arch=arch,
+            labels={
+                imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
+                imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_ARCH: arch,
+                imagecache.LABEL_CACHE_KEY: key,
+            },
+        )
+
+    def _run(
+        self, prov: FakeProvider, argv: list[str], *,
+        resolve_current_keys: Callable[..., dict[tuple[str, str], str]] | None = None,
+    ) -> tuple[int, str, str]:
+        from contextlib import ExitStack
+        from unittest import mock
+
+        out, err = io.StringIO(), io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cli, "HetznerProvider", lambda: prov))
+            stack.enter_context(redirect_stdout(out))
+            stack.enter_context(redirect_stderr(err))
+            if resolve_current_keys is not None:
+                stack.enter_context(mock.patch.object(cli, "resolve_current_keys", resolve_current_keys))
+            ns = cli.build_parser().parse_args(argv)
+            rc = cli._cmd_reap_images(ns)
+        return rc, out.getvalue(), err.getvalue()
+
+    # --- bare call refuses --------------------------------------------------- #
+    def test_bare_no_filter_refuses_exit_2_no_provider_call(self) -> None:
+        prov = FakeProvider()
+        rc, _o, err = self._run(prov, ["reap-images"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("at least one of", err)
+
+    # --- --distro scope ------------------------------------------------------ #
+    def test_distro_scope_reaps_only_that_distro(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu")
+        prov.images["f1"] = self._img(img_id="f1", distro_key="fedora", key="v1-fedora-X")
+        rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["u1"])  # fedora untouched
+
+    # --- --older-than -------------------------------------------------------- #
+    def test_older_than_selects_only_older(self) -> None:
+        prov = FakeProvider()
+        prov.images["old"] = self._img(img_id="old", created="2023-01-01T00:00:00+00:00")
+        prov.images["new"] = self._img(img_id="new", created="2025-12-31T00:00:00+00:00")
+        rc, _o, _e = self._run(prov, ["reap-images", "--older-than", "2024-06-01T00:00:00+00:00"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # the newer one survives
+
+    def test_older_than_keeps_image_with_blank_or_unparseable_created(self) -> None:
+        # a cache image with a blank/garbled `created` fails the age predicate (kept
+        # — never reaped on an age check we cannot verify).
+        prov = FakeProvider()
+        prov.images["blank"] = self._img(img_id="blank", created="")
+        prov.images["junk"] = self._img(img_id="junk", created="not-a-timestamp")
+        prov.images["old"] = self._img(img_id="old", created="2023-01-01T00:00:00+00:00")
+        rc, _o, _e = self._run(prov, ["reap-images", "--older-than", "2024-06-01T00:00:00+00:00"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # only the parseable-older one
+
+    def test_malformed_older_than_exits_2_no_provider_call(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1")
+        # a list_images call would record nothing observable here; assert no delete
+        # AND that the validation happens before any provider call by tracking it.
+        listed: list[str] = []
+        real_list = prov.list_images
+
+        def track_list(selector: str) -> list[Image]:
+            listed.append(selector)
+            return real_list(selector)
+
+        prov.list_images = track_list  # type: ignore[method-assign]
+        rc, _o, err = self._run(prov, ["reap-images", "--older-than", "not-a-date"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(listed, [])  # validated fail-closed BEFORE any provider call
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("--older-than", err)
+
+    # --- --dry-run ----------------------------------------------------------- #
+    def test_dry_run_deletes_nothing(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1")
+        rc, out, _e = self._run(prov, ["reap-images", "--distro", "ubuntu", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, [])  # ZERO deletes
+        self.assertIn("DRY-RUN", out)
+        self.assertIn("u1", out)
+
+    # --- --superseded -------------------------------------------------------- #
+    def test_superseded_reaps_off_key_keeps_current(self) -> None:
+        prov = FakeProvider()
+        prov.images["cur"] = self._img(img_id="cur", key="v1-ubuntu-CUR")
+        prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # current key kept
+
+    def test_superseded_fail_safe_keeps_unresolvable_group_and_warns(self) -> None:
+        prov = FakeProvider()
+        prov.images["a1"] = self._img(img_id="a1", distro_key="arch", key="v1-arch-OLD")
+        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu", key="v1-ubuntu-OLD")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
+            warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+
+        rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["u1"])  # arch group KEPT (fail-safe)
+        self.assertIn("arch", err)
+
+    def test_superseded_accept_a_reaps_group_with_no_current_image(self) -> None:
+        # accept-(a): the group's current key resolves but no cached image carries
+        # it ⇒ every image in the group is superseded and reaped.
+        prov = FakeProvider()
+        prov.images["o1"] = self._img(img_id="o1", key="v1-ubuntu-OLD1")
+        prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}  # no image carries CUR
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(prov.deleted_images), ["o1", "o2"])
+
+    # --- list failure -------------------------------------------------------- #
+    def test_list_images_failure_exits_1(self) -> None:
+        class _ListBoom(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise providers.ProviderError("list exploded")
+
+        prov = _ListBoom()
+        rc, _o, err = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", err)
+
+    # --- partial-success report ---------------------------------------------- #
+    def test_per_image_delete_failure_partial_report_exit_1(self) -> None:
+        class _DeleteFailsOne(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                if image_id == "bad":
+                    raise providers.ProviderError("delete exploded")
+                super().delete_image(image_id)
+
+        prov = _DeleteFailsOne()
+        prov.images["good"] = self._img(img_id="good")
+        prov.images["bad"] = self._img(img_id="bad")
+        rc, out, err = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 1)  # a real delete failed
+        self.assertIn("good", prov.deleted_images)  # the other delete still happened
+        self.assertIn("FAILED", err)
+        self.assertIn("reaped 1", out)
+
+
+class TestCacheImagePerRunReapIsolation(unittest.TestCase):
+    """Task 7.2 — the data-loss guard: cache images vs the per-run reap (no network)."""
+
+    def test_cache_image_carries_content_labels_not_run_label(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird")
+        # content-addressed labels present...
+        self.assertEqual(labels[imagecache.LABEL_PURPOSE], imagecache.PURPOSE_IMAGE_CACHE)
+        self.assertEqual(labels[imagecache.LABEL_CACHE_KEY], "v1-ubuntu-K")
+        self.assertEqual(labels[imagecache.LABEL_DISTRO], "ubuntu")
+        # ...and the ephemeral per-run reap label is ABSENT.
+        self.assertNotIn(safety.LABEL_KEY, labels)
+
+    def test_per_run_reap_leaves_cache_image_intact(self) -> None:
+        prov = FakeProvider()
+        run_id = safety.make_run_id("bird")
+        # a cache image carrying ONLY content labels (no vmlease=<run-id>).
+        cache_labels = imagecache.cache_labels(
+            distro.get_profile("ubuntu"), "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird",
+        )
+        cache_img = Image(
+            id="cache-1", created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch="x86", labels=cache_labels,
+        )
+        prov.images["cache-1"] = cache_img
+        # a labelled run host (the ephemeral reap target).
+        spec = HostSpec(
+            name="vmlease-bird-host", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", labels=safety.run_label(run_id),
+        )
+        host = prov.create_with_cloudinit(spec, "#cloud-config")
+
+        reaped = safety.reap(prov, run_id)
+
+        # the run host is gone; the cache image survives untouched.
+        self.assertEqual([h.name for h in reaped], ["vmlease-bird-host"])
+        self.assertEqual(prov.destroyed, [host])
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("cache-1", prov.images)
 
 
 if __name__ == "__main__":

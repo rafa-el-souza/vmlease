@@ -26,6 +26,28 @@ if TYPE_CHECKING:
 
 _TEMPLATES_PKG = "vmlease.templates"
 _BASE_TEMPLATE = "cloudinit.sh.tmpl"
+_MINIMAL_TEMPLATE = "cloudinit-minimal.sh.tmpl"
+
+# Sysprep run over SSH as the (NOPASSWD-sudo) operator on the build host BEFORE
+# poweroff/snapshot. A snapshot freezes /etc/machine-id into the image, so every
+# host restored from it would otherwise share one machine-id — breaking systemd,
+# journald and dbus (which key state off it) across restored hosts (F-009). TWO
+# real-host findings (E-012 10.1, 2026-06-12) shape the exact command — both proven
+# by build→restore-x3 runs:
+#   1. ``sync`` is LOAD-BEARING. The reset write is not durable on the snapshot
+#      unless explicitly synced: the fast poweroff→create-image otherwise captures
+#      the stale on-disk block and the snapshot keeps the BUILDER's id, which every
+#      restore inherits. (Dropping ``sync`` → 3 distinct hosts all read one shared
+#      id; with it → 3 distinct ids.) A clean ACPI poweroff does NOT reliably flush
+#      it in time.
+#   2. The reset VALUE is systemd's golden-image sentinel ``uninitialized\n`` (a
+#      PRESENT file that systemd regenerates a fresh, unique id from on first boot),
+#      not ``truncate -s0`` (empty) or ``rm`` (absent).
+# The dbus copy/symlink is cleared so it re-derives from the regenerated id.
+SYSPREP_COMMAND: str = (
+    "printf 'uninitialized\\n' | sudo tee /etc/machine-id >/dev/null"
+    " ; sudo rm -f /var/lib/dbus/machine-id ; sync"
+)
 
 
 class CloudInitError(ValueError):
@@ -123,3 +145,18 @@ def render_cloudinit(profile: DistroProfile, operator: str, operator_pubkey: str
         "package_manager": profile.package_manager,
     }
     return _render_subset(base, candidates)
+
+
+def render_minimal_cloudinit(operator: str, pubkey: str) -> str:
+    """Render the restore-path (cache-hit) cloud-init for ``operator``.
+
+    The operator account, sudoers, docker prerequisites and all prep are baked
+    into the snapshot (F-009); cloud-init re-runs per-instance on a snapshot
+    boot, so this re-authorizes ONLY the fresh per-run ``pubkey`` for the baked
+    operator and re-asserts the ``/var/lib/vmlease-ready`` sentinel — no system
+    update, package install, account creation or rescue-write. ``pubkey`` is the
+    throwaway probe public key authorized for the restored host's run.
+    """
+    template_text = _read_template(_MINIMAL_TEMPLATE)
+    candidates = {"operator": operator, "operator_pubkey": pubkey.strip()}
+    return _render_subset(template_text, candidates)

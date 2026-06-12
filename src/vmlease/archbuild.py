@@ -329,6 +329,41 @@ def _live_write_temp(data: bytes) -> str:
     return path
 
 
+def build_live_resolve_deps(
+    keyring_path: str,
+    *,
+    run: Callable[[list[str], str | None], tuple[int, str, str]] = live_subprocess_run,
+    fetch_text: Callable[[str], str] = _live_urlopen_text,
+    fetch_bytes: Callable[[str], bytes] = _live_urlopen_bytes,
+    write_temp: Callable[[bytes], str] = _live_write_temp,
+) -> ResolveDeps:
+    """Assemble the live :class:`~vmlease.rescue_image.ResolveDeps` trust-gate seam.
+
+    The single source of the resolve-side IO bundle the profile's
+    ``RescueImageSpec.resolve_and_verify`` verifies against: the URL fetchers, the
+    temp-staging seam, and the gpg verify runner (a thin wrapper that maps the
+    2-tuple ``run`` seam into the ``CompletedProcess`` the gpg path expects). The
+    stdlib seams default to live implementations but are injectable, so the wiring
+    stays unit-testable without real network/gpg. Both ``build_live_rescue_writer``
+    (the rescue-write path) and ``build-image`` (the cache key derivation) build
+    their ``ResolveDeps`` through here, so the trust-gate wiring can't drift.
+
+    ``keyring_path`` is the gpg keyring holding the pinned ``arch-boxes`` key (set
+    up by the caller); a native distro never touches these seams, so an unused
+    keyring path is fine on that path.
+    """
+    import subprocess
+
+    def _gpg_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        rc, out, err = run(argv, None)
+        return subprocess.CompletedProcess(argv, rc, out, err)
+
+    return ResolveDeps(
+        text_fetcher=fetch_text, fetcher=fetch_bytes, gpg_runner=_gpg_runner,
+        write_temp=write_temp, keyring_path=keyring_path,
+    )
+
+
 def build_live_rescue_writer(
     private_key_path: str,
     ssh_key_name: str,
@@ -351,17 +386,12 @@ def build_live_rescue_writer(
     key (set up by the caller), passed through to the Arch spec's signature check.
     The orchestration LOGIC lives in the already-tested :func:`rescue_write_host`.
     """
-    import subprocess
     import time
 
     _sleep = sleep if sleep is not None else time.sleep
 
     def _cli(argv: list[str]) -> tuple[int, str, str]:
         return run(argv, None)
-
-    def _gpg_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        rc, out, err = run(argv, None)
-        return subprocess.CompletedProcess(argv, rc, out, err)
 
     def _ssh_root(ipv4: str, script: str) -> tuple[int, str]:
         # fresh host key each OS swap → don't pin known_hosts; feed the script on stdin.
@@ -401,9 +431,8 @@ def build_live_rescue_writer(
         if rc != 0:
             raise ArchBuildError(f"scp of {local} to root@{ipv4}:{remote} failed (rc={rc}): {err[:200]!r}")
 
-    resolve_deps = ResolveDeps(
-        text_fetcher=fetch_text, fetcher=fetch_bytes, gpg_runner=_gpg_runner,
-        write_temp=write_temp, keyring_path=keyring_path,
+    resolve_deps = build_live_resolve_deps(
+        keyring_path, run=run, fetch_text=fetch_text, fetch_bytes=fetch_bytes, write_temp=write_temp,
     )
 
     deps = RescueWriteDeps(
