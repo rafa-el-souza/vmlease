@@ -32,10 +32,10 @@ if TYPE_CHECKING:
 # bound its delete so a wedged ``hcloud`` CLI cannot stall teardown forever.
 SubprocessRunner = Callable[[list[str], "float | None"], "subprocess.CompletedProcess[str]"]
 
-# Default wall-clock bound (seconds) on the delete subprocess: generous enough
-# for a real ``hcloud server delete`` round-trip, short enough that a wedged CLI
-# becomes a reap-able teardown failure rather than an indefinite hang.
-DEFAULT_DELETE_TIMEOUT = 120.0
+# Default wall-clock bound (seconds) on a bounded hcloud subprocess (delete,
+# power-off, status/describe): generous enough for a real round-trip, short enough
+# that a wedged CLI becomes a reap-able failure rather than an indefinite hang.
+DEFAULT_OP_TIMEOUT = 120.0
 
 
 class ProviderError(RuntimeError):
@@ -391,10 +391,10 @@ class HetznerProvider:
         self,
         runner: SubprocessRunner | None = None,
         *,
-        delete_timeout: float = DEFAULT_DELETE_TIMEOUT,
+        op_timeout: float = DEFAULT_OP_TIMEOUT,
     ) -> None:
         self._run: SubprocessRunner = runner or _default_runner
-        self._delete_timeout = delete_timeout
+        self._op_timeout = op_timeout
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         with tempfile.NamedTemporaryFile("w", suffix=".cloudinit", delete=True) as fh:
@@ -413,7 +413,7 @@ class HetznerProvider:
         server-side anyway — so retry with a short backoff rather than fail the
         run. Only a persistent non-timeout error raises :class:`ProviderError`.
 
-        The delete subprocess is wall-clock-bounded (``delete_timeout``): a wedged
+        The delete subprocess is wall-clock-bounded (``op_timeout``): a wedged
         ``hcloud`` CLI that never returns is killed and surfaced as a
         :class:`ProviderError` (a failed, reap-able teardown) so it can never stall
         the per-host ``finally`` forever. A *subprocess* timeout is NOT the same as
@@ -425,10 +425,10 @@ class HetznerProvider:
         _sleep = sleep if sleep is not None else time.sleep
         for attempt in range(attempts):
             try:
-                proc = self._run(build_delete_argv(host), self._delete_timeout)
+                proc = self._run(build_delete_argv(host), self._op_timeout)
             except subprocess.TimeoutExpired as exc:
                 raise ProviderError(
-                    f"hcloud server delete timed out after {self._delete_timeout}s "
+                    f"hcloud server delete timed out after {self._op_timeout}s "
                     f"(killed): {host.name} ({host.id})"
                 ) from exc
             err = (proc.stderr or "").lower()
@@ -484,7 +484,7 @@ class HetznerProvider:
 
     def delete_image(self, image_id: str) -> None:
         """Delete an image. Idempotent: a not-found delete (already reaped) is success."""
-        proc = self._run(build_delete_image_argv(image_id), self._delete_timeout)
+        proc = self._run(build_delete_image_argv(image_id), self._op_timeout)
         err = (proc.stderr or "").lower()
         if proc.returncode == 0 or "not found" in err:
             return
@@ -492,7 +492,7 @@ class HetznerProvider:
 
     def power_off(self, server_id: str) -> None:
         """Power a server off. Idempotent: an already-off host is success."""
-        proc = self._run(build_poweroff_argv(server_id), self._delete_timeout)
+        proc = self._run(build_poweroff_argv(server_id), self._op_timeout)
         err = (proc.stderr or "").lower()
         if proc.returncode == 0 or "already off" in err or "is off" in err or "not found" in err:
             return
@@ -500,14 +500,14 @@ class HetznerProvider:
 
     def server_status(self, server_id: str) -> str:
         """Describe a server and return its power ``status``; raise on non-zero exit."""
-        proc = self._run(build_describe_server_argv(server_id), self._delete_timeout)
+        proc = self._run(build_describe_server_argv(server_id), self._op_timeout)
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server describe failed ({proc.returncode}): {proc.stderr}")
         return parse_server_status(proc.stdout)
 
     def server_type_disk(self, server_type: str) -> float:
         """Describe a server type and return its primary disk GB; raise on non-zero exit."""
-        proc = self._run(build_describe_server_type_argv(server_type), self._delete_timeout)
+        proc = self._run(build_describe_server_type_argv(server_type), self._op_timeout)
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server-type describe failed ({proc.returncode}): {proc.stderr}")
         return parse_server_type_disk(proc.stdout)

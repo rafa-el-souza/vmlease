@@ -56,8 +56,6 @@ from vmlease.imagecache import (
     LABEL_ARCH,
     LABEL_CACHE_KEY,
     LABEL_DISTRO,
-    LABEL_PURPOSE,
-    PURPOSE_IMAGE_CACHE,
     base_fingerprint,
     cache_labels,
     content_key_from_base_fp,
@@ -85,6 +83,7 @@ from vmlease.safety import (
     ImageQuotaError,
     ImageQuotaGuard,
     UploadError,
+    label_selector_purpose,
     make_run_id,
     reap,
     run_label,
@@ -395,13 +394,18 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     # rescue-write distro) and derive BOTH the content key and the source-fp label
     # from it. A resolve failure (mirror down) raises ArchBuildError → fail fast,
     # no builder.
+    keyring_dir = _NoKeypairDir()
     try:
-        deps = _build_image_resolve_deps(profile, _NoKeypairDir())
+        deps = _build_image_resolve_deps(profile, keyring_dir)
         base_fp = base_fingerprint(profile, arch, deps)
         key = content_key_from_base_fp(base_fp, profile, arch, args.operator)
     except ArchBuildError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # The throwaway keyring is consumed by the resolve above; drop it so a
+        # build never leaks a vmlease-build-keyring-* dir.
+        keyring_dir.cleanup()
 
     try:
         images = provider.list_images(label_selector_purpose())
@@ -421,7 +425,7 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     same_group = [
         img
         for img in images
-        if img.labels.get("vmlease-distro") == profile.key and img.arch == arch
+        if img.labels.get(LABEL_DISTRO) == profile.key and img.arch == arch
     ]
     s_prune = superseded(same_group, key)
     guard = ImageQuotaGuard(max_images=args.max_images)
@@ -551,10 +555,11 @@ class _NoKeypairDir:
 
         self.directory = Path(tempfile.mkdtemp(prefix="vmlease-build-keyring-"))
 
+    def cleanup(self) -> None:
+        """Remove the throwaway keyring dir (best-effort — mirrors ``Keypair.cleanup``)."""
+        import shutil
 
-def label_selector_purpose() -> str:
-    """The label selector for the cache-image query index (``vmlease-purpose=image-cache``)."""
-    return f"{LABEL_PURPOSE}={PURPOSE_IMAGE_CACHE}"
+        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 def _prune_images(provider: Provider, images: list[Image]) -> None:
@@ -647,22 +652,27 @@ def _reap_images_superseded_set(
         if img.labels.get(LABEL_DISTRO, "") in DEFAULT_DISTRO_KEYS
     )
     keyring_dir = _NoKeypairDir()
-    keyring_path = str(keyring_dir.directory / "arch-boxes.gpg")
-    if needs_keyring:
-        ensure_arch_keyring(keyring_path, live_subprocess_run)
-    deps = build_live_resolve_deps(keyring_path)
+    try:
+        keyring_path = str(keyring_dir.directory / "arch-boxes.gpg")
+        if needs_keyring:
+            ensure_arch_keyring(keyring_path, live_subprocess_run)
+        deps = build_live_resolve_deps(keyring_path)
 
-    current_keys = resolve_current_keys(images, get_profile, operator, deps, warn)
-    superseded_ids: set[str] = set()
-    for group, current_key in current_keys.items():
-        group_imgs = [
-            img
-            for img in images
-            if (img.labels.get(LABEL_DISTRO, ""), img.labels.get(LABEL_ARCH, "")) == group
-        ]
-        for img in superseded(group_imgs, current_key):
-            superseded_ids.add(img.id)
-    return superseded_ids
+        current_keys = resolve_current_keys(images, get_profile, operator, deps, warn)
+        superseded_ids: set[str] = set()
+        for group, current_key in current_keys.items():
+            group_imgs = [
+                img
+                for img in images
+                if (img.labels.get(LABEL_DISTRO, ""), img.labels.get(LABEL_ARCH, "")) == group
+            ]
+            for img in superseded(group_imgs, current_key):
+                superseded_ids.add(img.id)
+        return superseded_ids
+    finally:
+        # Drop the throwaway keyring so reap --superseded never leaks a
+        # vmlease-build-keyring-* dir.
+        keyring_dir.cleanup()
 
 
 def _cmd_reap_images(args: argparse.Namespace) -> int:

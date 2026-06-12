@@ -22,6 +22,8 @@ import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vmlease.imagecache import LABEL_PURPOSE, PURPOSE_IMAGE_CACHE
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -195,6 +197,11 @@ def run_label(run_id: str) -> dict[str, str]:
 def label_selector(run_id: str) -> str:
     """The provider label-selector string for ``list``/``reap`` by run."""
     return f"{LABEL_KEY}={run_id}"
+
+
+def label_selector_purpose() -> str:
+    """The label selector for the cache-image query index (``vmlease-purpose=image-cache``)."""
+    return f"{LABEL_PURPOSE}={PURPOSE_IMAGE_CACHE}"
 
 
 @dataclass(frozen=True)

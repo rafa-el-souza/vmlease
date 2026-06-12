@@ -17,12 +17,17 @@ from vmlease.cloudinit import SYSPREP_COMMAND, render_cloudinit, render_minimal_
 from vmlease.distro import get_profile
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
-    LABEL_PURPOSE,
-    PURPOSE_IMAGE_CACHE,
     content_key,
 )
 from vmlease.model import HostRun, HostSpec, PlanItem, Probe, ProbeTag
-from vmlease.safety import CostGuard, make_run_id, run_label, validate_remote_dest, validate_upload_source
+from vmlease.safety import (
+    CostGuard,
+    label_selector_purpose,
+    make_run_id,
+    run_label,
+    validate_remote_dest,
+    validate_upload_source,
+)
 
 if TYPE_CHECKING:
     from vmlease.distro import DistroProfile
@@ -34,8 +39,8 @@ if TYPE_CHECKING:
     from vmlease.workload import Workload
 
 # The result type the ``on_ready`` seam (and therefore the scaffold) produces:
-# ``run`` returns a ``HostRun``; ``build-image`` (group 6) will return an
-# ``Image``. The scaffold is generic over it.
+# ``run`` returns a ``HostRun``; ``build-image`` returns an ``Image``. The scaffold
+# is generic over it.
 R = TypeVar("R")
 
 # The single marker a failed teardown leaves in a host's detail, shared between
@@ -155,14 +160,13 @@ RescueWriter = Callable[["Host", "DistroProfile"], None]
 # - ``PlanCreate`` decides HOW the host is created: it returns the
 #   ``(image, cloud_init, needs_rescue)`` triple. ``run``'s cold path returns the
 #   profile's default image + the full cloud-init + the profile's rescue flag; the
-#   cache-aware variant (:func:`cache_aware_plan_create`) returns a snapshot id +
-#   minimal cloud-init + ``False`` on a hit. ``build-image`` (group 6) is always
-#   cold. ``needs_rescue`` overrides the profile's own flag so a restore can skip
-#   the rescue-write a miss would perform.
+#   cache-restore candidate returns a snapshot id + minimal cloud-init + ``False`` on
+#   a hit. ``build-image`` is always cold. ``needs_rescue`` overrides the profile's
+#   own flag so a restore can skip the rescue-write a miss would perform.
 # - ``OnReady`` is the post-readiness tail, generic over its result ``R``: ``run``
-#   uploads + runs the workload → ``HostRun``; ``build-image`` will sysprep +
-#   poweroff + snapshot → ``Image``. It takes ``provider`` because the snapshot
-#   tail needs it — it is deliberately NOT a ``Workload`` (which stays ssh-only).
+#   uploads + runs the workload → ``HostRun``; ``build-image`` syspreps + powers off
+#   + snapshots → ``Image``. It takes ``provider`` because the snapshot tail needs
+#   it — it is deliberately NOT a ``Workload`` (which stays ssh-only).
 PlanCreate = Callable[["DistroProfile"], "tuple[str, str, bool]"]
 OnReady = Callable[["Host", "SshRunner", "Provider"], R]
 
@@ -348,7 +352,7 @@ def _run_one_host(
     restore_image_id: str | None = None
     if resolve_deps is not None:
         restore_image_id = _resolve_cache_hit_image(
-            spec, profile, provider, keypair, operator, resolve_deps
+            spec, profile, provider, operator, resolve_deps
         )
         if restore_image_id is not None:
             hit_image = restore_image_id
@@ -428,7 +432,6 @@ def _resolve_cache_hit_image(
     spec: HostSpec,
     profile: DistroProfile,
     provider: Provider,
-    keypair: Keypair,
     operator: str,
     deps: ResolveDeps,
 ) -> str | None:
@@ -437,9 +440,10 @@ def _resolve_cache_hit_image(
     Sources the restore arch + disk bound from the server type (D9): a
     ``server_type_disk`` failure is advisory — it warns and degrades to a miss
     (cold), never failing the host (G9). The hit/miss decision itself is
-    :func:`cache_aware_plan_create`, which already degrades a lookup failure to a
-    cold triple. A cold triple (its image equals the profile's default) is reported
-    as ``None`` here; only a real snapshot id is returned.
+    :func:`_lookup_cache_image`, which already degrades a lookup failure to a miss
+    (``None``). On a hit the matched snapshot's id is returned; the minimal restore
+    cloud-init is rendered later, on the restore candidate that needs it (no
+    cloud-init is rendered during the lookup).
     """
     from vmlease.safety import server_type_arch
 
@@ -459,17 +463,51 @@ def _resolve_cache_hit_image(
             f"(treating as a cache miss → cold path): {exc}"
         )
         return None
-    image, _cloud_init, _needs_rescue = cache_aware_plan_create(
+    match = _lookup_cache_image(
         profile,
         operator=operator,
         arch=arch,
         target_disk=target_disk,
         provider=provider,
-        keypair=keypair,
         deps=deps,
         warn=_warn,
     )
-    return image if image != profile.default_image else None
+    return match.id if match is not None else None
+
+
+def _lookup_cache_image(
+    profile: DistroProfile,
+    *,
+    operator: str,
+    arch: str,
+    target_disk: float,
+    provider: Provider,
+    deps: ResolveDeps,
+    warn: Callable[[str], None],
+) -> Image | None:
+    """Find the cached snapshot to restore from for this group, or ``None`` (a miss).
+
+    Pure cache lookup (D6/D9): compute the content key for
+    ``(profile, arch, operator, recipe, upstream)``, ``list_images`` the cache, and
+    pick the first **match** — an image whose ``vmlease-cache-key`` equals the key,
+    whose architecture equals ``arch``, AND whose ``disk_size`` is ``<= target_disk``
+    (the restore disk-bound, D9: a snapshot restores only onto a server whose disk is
+    at least the snapshot's). Renders NO cloud-init — the caller renders the right one
+    on the branch that needs it (cold renders cold; the restore branch renders
+    minimal), so the run-path cache check never renders a cloud-init it discards.
+
+    **Advisory + graceful** (D9, "the cache degrades, never breaks"): ANY exception
+    during the lookup — ``content_key`` raising (e.g. an upstream resolve failure) or
+    ``list_images`` failing — is caught, ``warn``-ed, and reported as a miss
+    (``None``). A cache problem NEVER fails the host.
+    """
+    try:
+        key = content_key(profile, arch, operator, deps)
+        images = provider.list_images(label_selector_purpose())
+    except Exception as exc:  # lookup failure → advisory miss, never a host failure
+        warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
+        return None
+    return _first_matching_image(images, key=key, arch=arch, target_disk=target_disk)
 
 
 def _restore_failure_detail(
@@ -644,58 +682,6 @@ def _best_effort_destroy(provider: Provider, host: Host) -> str:
         return f"{TEARDOWN_WARNING_PREFIX} {host.name} ({host.id}) failed — reap it: {exc}"
 
 
-def cache_aware_plan_create(
-    profile: DistroProfile,
-    *,
-    operator: str,
-    arch: str,
-    target_disk: float,
-    provider: Provider,
-    keypair: Keypair,
-    deps: ResolveDeps,
-    warn: Callable[[str], None],
-) -> tuple[str, str, bool]:
-    """The cache-aware ``plan_create`` for ``run``: restore-on-hit, cold-on-miss (D6/D9).
-
-    Computes the content key for ``(profile, arch, operator, recipe, upstream)``,
-    looks up the cached snapshot images, and picks a **match**: an image whose
-    ``vmlease-cache-key`` equals the key, whose architecture equals ``arch``, AND
-    whose ``disk_size`` is ``<= target_disk`` (the restore disk-bound, D9 — a
-    snapshot restores only onto a server whose disk is at least the snapshot's).
-
-    - **Hit** → ``(match.id, render_minimal_cloudinit(operator, pubkey), False)``:
-      create from the snapshot, re-authorize the fresh per-run key via the minimal
-      cloud-init, and SKIP rescue-write (the prepped/written state is baked in).
-    - **Miss** (no match) → the cold triple
-      ``(profile.default_image, render_cloudinit(...), profile.needs_rescue_write)``.
-
-    **Advisory + graceful** (D9, spec "the cache degrades, never breaks"): ANY
-    exception during the lookup — ``content_key`` raising (e.g. an upstream resolve
-    failure) or ``list_images`` failing — is caught, ``warn``-ed, and falls through
-    to the cold (miss) triple. A cache problem NEVER fails the host.
-
-    This is a standalone function: it is **not yet wired into ``execute``** (group 8
-    sources ``arch`` / ``target_disk`` from the server type). It accepts both as
-    injected parameters; no server-type→disk/arch mapping is performed here.
-    """
-    cold = (
-        profile.default_image,
-        render_cloudinit(profile, operator, keypair.public_key),
-        profile.needs_rescue_write,
-    )
-    try:
-        key = content_key(profile, arch, operator, deps)
-        selector = f"{LABEL_PURPOSE}={PURPOSE_IMAGE_CACHE}"
-        images = provider.list_images(selector)
-    except Exception as exc:  # lookup failure → advisory miss, never a host failure
-        warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
-        return cold
-    match = _first_matching_image(images, key=key, arch=arch, target_disk=target_disk)
-    if match is None:
-        return cold
-    return match.id, render_minimal_cloudinit(operator, keypair.public_key), False
-
-
 def _first_matching_image(
     images: list[Image], *, key: str, arch: str, target_disk: float
 ) -> Image | None:
@@ -770,7 +756,7 @@ def make_snapshot_on_ready(
 ) -> OnReady[Image]:
     """Build the snapshot ``on_ready`` tail: sysprep → poweroff → wait-off → snapshot.
 
-    Returns an ``on_ready(host, ssh, provider) -> Image`` for the group-5 scaffold
+    Returns an ``on_ready(host, ssh, provider) -> Image`` for the per-host scaffold
     (D6). The tail, in order:
 
     1. **Sysprep** (D7/F-009): clear ``/etc/machine-id`` + the dbus id over SSH. A
@@ -781,8 +767,8 @@ def make_snapshot_on_ready(
        wait-for-off timeout raises **before** any ``create_image`` — a running host
        is never captured.
     3. **Snapshot**: ``provider.create_image(host.id, description, labels)`` with the
-       ``labels`` applied **in the create call** (atomic, D1) — the caller (the next
-       milestone) supplies the cache-key description + labels.
+       ``labels`` applied **in the create call** (atomic, D1) — the caller supplies
+       the cache-key description + labels.
 
     ``description`` / ``labels`` are captured here; ``sleep`` is injected so the
     wait stays clock-free.
@@ -827,15 +813,15 @@ def build_one_image(
 
     The ``build-image`` driver (D6): it builds the **cold** ``plan_create`` (the
     full ``render_cloudinit`` prep — ``build-image`` always prepares fully) and
-    runs the group-5 scaffold with the snapshot ``on_ready`` tail. The scaffold's
+    runs the per-host scaffold with the snapshot ``on_ready`` tail. The scaffold's
     teardown-always ``finally`` reaps the builder regardless of how the body left —
     a successful snapshot OR an abort (sysprep G1 / poweroff-or-timeout G2 /
     provider error). Those aborts **propagate as exceptions** (the builder is still
     torn down); they are deliberately NOT caught-and-swallowed into a success.
 
     The teardown note is surfaced via ``note_sink`` (the scaffold appends to it in
-    its real ``finally``) so the next milestone's ``_cmd_build_image`` can route a
-    teardown failure to a non-zero exit + reap hint — exactly as the run adapter
+    its real ``finally``) so ``_cmd_build_image`` can route a teardown failure to a
+    non-zero exit + reap hint — exactly as the run adapter
     folds it into a ``HostRun`` detail.
     """
 

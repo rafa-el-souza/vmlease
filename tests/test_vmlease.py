@@ -631,19 +631,19 @@ class TestHetznerProviderImpl(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             prov.destroy(model.Host(id="9", name="n", ipv4=""), attempts=3, sleep=lambda _s: None)
 
-    def test_destroy_passes_delete_timeout_to_seam(self) -> None:
-        # the delete subprocess is bounded — the ctor's delete_timeout reaches the seam
+    def test_destroy_passes_op_timeout_to_seam(self) -> None:
+        # the delete subprocess is bounded — the ctor's op_timeout reaches the seam
         seen: list[float | None] = []
 
         def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
             seen.append(timeout)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov = providers.HetznerProvider(runner=capture, op_timeout=37.5)
         prov.destroy(model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None)
         self.assertEqual(seen, [37.5])
 
-    def test_destroy_default_delete_timeout_is_the_module_default(self) -> None:
+    def test_destroy_default_op_timeout_is_the_module_default(self) -> None:
         seen: list[float | None] = []
 
         def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
@@ -653,7 +653,7 @@ class TestHetznerProviderImpl(unittest.TestCase):
         providers.HetznerProvider(runner=capture).destroy(
             model.Host(id="9", name="n", ipv4=""), sleep=lambda _s: None
         )
-        self.assertEqual(seen, [providers.DEFAULT_DELETE_TIMEOUT])
+        self.assertEqual(seen, [providers.DEFAULT_OP_TIMEOUT])
 
     def test_destroy_wedged_subprocess_killed_surfaces_as_provider_error(self) -> None:
         # a delete that never returns (TimeoutExpired) is killed and surfaces as a
@@ -791,14 +791,14 @@ class TestHetznerProviderImpl(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             prov.server_type_disk("cpx22")
 
-    def test_image_ops_bounded_by_delete_timeout(self) -> None:
+    def test_image_ops_bounded_by_op_timeout(self) -> None:
         seen: list[float | None] = []
 
         def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
             seen.append(timeout)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov = providers.HetznerProvider(runner=capture, op_timeout=37.5)
         prov.delete_image("7")
         prov.power_off("9")
         self.assertEqual(seen, [37.5, 37.5])
@@ -4089,8 +4089,14 @@ def _cached_run_image(
     )
 
 
-class TestCacheAwarePlanCreate(unittest.TestCase):
-    """runner.cache_aware_plan_create (5.2): hit | miss | oversized | wrong-arch | graceful."""
+class TestLookupCacheImage(unittest.TestCase):
+    """runner._lookup_cache_image: hit | miss | oversized | wrong-arch | graceful.
+
+    The thin cache-lookup helper returns the matched ``Image`` on a hit, ``None`` on
+    a miss (no match / oversized / wrong arch / wrong key) or a graceful lookup
+    failure. It renders NO cloud-init — the run path renders the right one on the
+    branch that needs it.
+    """
 
     def _ubuntu(self) -> distro.DistroProfile:
         return distro.get_profile("ubuntu")
@@ -4098,78 +4104,61 @@ class TestCacheAwarePlanCreate(unittest.TestCase):
     def _key(self, arch: str = "x86") -> str:
         return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
 
-    def _kp(self) -> keypair.Keypair:
-        return keypair.Keypair(
-            directory=Path("/x"), private_key_path=Path("/x/id"),
-            public_key="ssh-ed25519 RUNKEY probe",
-        )
-
     def _call(self, prov: providers.Provider, *, arch: str = "x86", target_disk: float = 40.0,
-              warn: Callable[[str], None] | None = None) -> tuple[str, str, bool]:
+              warn: Callable[[str], None] | None = None) -> Image | None:
         warns: list[str] = []
-        result = runner.cache_aware_plan_create(
+        return runner._lookup_cache_image(
             self._ubuntu(),
             operator="probe", arch=arch, target_disk=target_disk,
-            provider=prov, keypair=self._kp(), deps=_null_deps(),
+            provider=prov, deps=_null_deps(),
             warn=warn if warn is not None else warns.append,
         )
-        return result
 
-    def test_hit_returns_snapshot_id_minimal_cloudinit_no_rescue(self) -> None:
+    def test_hit_returns_the_matched_image(self) -> None:
         prov = FakeProvider()
         prov.images["img-cache"] = _cached_run_image(key=self._key())
-        image, cloud_init, needs_rescue = self._call(prov)
-        self.assertEqual(image, "img-cache")
-        self.assertFalse(needs_rescue)  # restore SKIPS rescue-write
-        # the minimal restore cloud-init re-authorizes the fresh per-run key only.
-        self.assertEqual(cloud_init, cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 RUNKEY probe"))
+        match = self._call(prov)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.id, "img-cache")
 
-    def test_miss_no_image_returns_cold_triple(self) -> None:
+    def test_miss_no_image_returns_none(self) -> None:
         prov = FakeProvider()  # no images at all
-        image, cloud_init, needs_rescue = self._call(prov)
-        ubuntu = self._ubuntu()
-        self.assertEqual(image, ubuntu.default_image)  # cold default image
-        self.assertEqual(needs_rescue, ubuntu.needs_rescue_write)
-        self.assertEqual(cloud_init, cloudinit.render_cloudinit(ubuntu, "probe", "ssh-ed25519 RUNKEY probe"))
+        self.assertIsNone(self._call(prov))
 
     def test_oversized_image_is_a_miss(self) -> None:
-        # disk_size (50) > target_disk (40): the snapshot can't restore here → cold.
+        # disk_size (50) > target_disk (40): the snapshot can't restore here → miss.
         prov = FakeProvider()
         prov.images["img-big"] = _cached_run_image(key=self._key(), disk_size=50.0, img_id="img-big")
-        image, _ci, needs_rescue = self._call(prov, target_disk=40.0)
-        self.assertEqual(image, self._ubuntu().default_image)
-        self.assertEqual(needs_rescue, self._ubuntu().needs_rescue_write)
+        self.assertIsNone(self._call(prov, target_disk=40.0))
 
     def test_equal_disk_is_a_hit(self) -> None:
         # the bound is <=: a snapshot whose disk equals the target restores.
         prov = FakeProvider()
         prov.images["img-eq"] = _cached_run_image(key=self._key(), disk_size=40.0, img_id="img-eq")
-        image, _ci, _nr = self._call(prov, target_disk=40.0)
-        self.assertEqual(image, "img-eq")
+        match = self._call(prov, target_disk=40.0)
+        assert match is not None
+        self.assertEqual(match.id, "img-eq")
 
     def test_wrong_arch_image_is_a_miss(self) -> None:
         # the image's arch (arm) != the target arch (x86) → miss even if labelled.
         prov = FakeProvider()
         prov.images["img-arm"] = _cached_run_image(key=self._key("x86"), arch="arm", img_id="img-arm")
-        image, _ci, _nr = self._call(prov, arch="x86")
-        self.assertEqual(image, self._ubuntu().default_image)
+        self.assertIsNone(self._call(prov, arch="x86"))
 
     def test_wrong_key_image_is_a_miss(self) -> None:
         prov = FakeProvider()
         prov.images["img-other"] = _cached_run_image(key="v1-ubuntu-NOTOURKEY", img_id="img-other")
-        image, _ci, _nr = self._call(prov)
-        self.assertEqual(image, self._ubuntu().default_image)
+        self.assertIsNone(self._call(prov))
 
     def test_list_images_failure_is_graceful_miss_and_warns(self) -> None:
-        # a list_images that raises → warn + cold path (the cache is advisory).
+        # a list_images that raises → warn + miss (None) (the cache is advisory).
         class _ListBoom(FakeProvider):
             def list_images(self, selector: str) -> list[Image]:
                 raise providers.ProviderError("hcloud image list exploded")
 
         warns: list[str] = []
-        image, _ci, needs_rescue = self._call(_ListBoom(), warn=warns.append)
-        self.assertEqual(image, self._ubuntu().default_image)  # degraded to cold
-        self.assertEqual(needs_rescue, self._ubuntu().needs_rescue_write)
+        self.assertIsNone(self._call(_ListBoom(), warn=warns.append))
         self.assertEqual(len(warns), 1)
         self.assertIn("cache lookup failed", warns[0])
 
