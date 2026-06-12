@@ -3934,6 +3934,106 @@ class TestImageCacheContentKey(unittest.TestCase):
         self.assertEqual(imagecache._CACHE_KEY_CANONICAL_PUBKEY, "vmlease-cache-key-canonical-pubkey")
 
 
+def _cached_run_image(
+    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache"
+) -> Image:
+    """A purpose-labelled cache Image for the run-restore lookup (key + arch + disk)."""
+    return Image(
+        id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=disk_size, arch=arch,
+        labels={
+            imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
+            imagecache.LABEL_CACHE_KEY: key,
+            imagecache.LABEL_DISTRO: "ubuntu",
+            imagecache.LABEL_ARCH: arch,
+        },
+    )
+
+
+class TestCacheAwarePlanCreate(unittest.TestCase):
+    """runner.cache_aware_plan_create (5.2): hit | miss | oversized | wrong-arch | graceful."""
+
+    def _ubuntu(self) -> distro.DistroProfile:
+        return distro.get_profile("ubuntu")
+
+    def _key(self, arch: str = "x86") -> str:
+        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+
+    def _kp(self) -> keypair.Keypair:
+        return keypair.Keypair(
+            directory=Path("/x"), private_key_path=Path("/x/id"),
+            public_key="ssh-ed25519 RUNKEY probe",
+        )
+
+    def _call(self, prov: providers.Provider, *, arch: str = "x86", target_disk: float = 40.0,
+              warn: Callable[[str], None] | None = None) -> tuple[str, str, bool]:
+        warns: list[str] = []
+        result = runner.cache_aware_plan_create(
+            self._ubuntu(),
+            operator="probe", arch=arch, target_disk=target_disk,
+            provider=prov, keypair=self._kp(), deps=_null_deps(),
+            warn=warn if warn is not None else warns.append,
+        )
+        return result
+
+    def test_hit_returns_snapshot_id_minimal_cloudinit_no_rescue(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        image, cloud_init, needs_rescue = self._call(prov)
+        self.assertEqual(image, "img-cache")
+        self.assertFalse(needs_rescue)  # restore SKIPS rescue-write
+        # the minimal restore cloud-init re-authorizes the fresh per-run key only.
+        self.assertEqual(cloud_init, cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 RUNKEY probe"))
+
+    def test_miss_no_image_returns_cold_triple(self) -> None:
+        prov = FakeProvider()  # no images at all
+        image, cloud_init, needs_rescue = self._call(prov)
+        ubuntu = self._ubuntu()
+        self.assertEqual(image, ubuntu.default_image)  # cold default image
+        self.assertEqual(needs_rescue, ubuntu.needs_rescue_write)
+        self.assertEqual(cloud_init, cloudinit.render_cloudinit(ubuntu, "probe", "ssh-ed25519 RUNKEY probe"))
+
+    def test_oversized_image_is_a_miss(self) -> None:
+        # disk_size (50) > target_disk (40): the snapshot can't restore here → cold.
+        prov = FakeProvider()
+        prov.images["img-big"] = _cached_run_image(key=self._key(), disk_size=50.0, img_id="img-big")
+        image, _ci, needs_rescue = self._call(prov, target_disk=40.0)
+        self.assertEqual(image, self._ubuntu().default_image)
+        self.assertEqual(needs_rescue, self._ubuntu().needs_rescue_write)
+
+    def test_equal_disk_is_a_hit(self) -> None:
+        # the bound is <=: a snapshot whose disk equals the target restores.
+        prov = FakeProvider()
+        prov.images["img-eq"] = _cached_run_image(key=self._key(), disk_size=40.0, img_id="img-eq")
+        image, _ci, _nr = self._call(prov, target_disk=40.0)
+        self.assertEqual(image, "img-eq")
+
+    def test_wrong_arch_image_is_a_miss(self) -> None:
+        # the image's arch (arm) != the target arch (x86) → miss even if labelled.
+        prov = FakeProvider()
+        prov.images["img-arm"] = _cached_run_image(key=self._key("x86"), arch="arm", img_id="img-arm")
+        image, _ci, _nr = self._call(prov, arch="x86")
+        self.assertEqual(image, self._ubuntu().default_image)
+
+    def test_wrong_key_image_is_a_miss(self) -> None:
+        prov = FakeProvider()
+        prov.images["img-other"] = _cached_run_image(key="v1-ubuntu-NOTOURKEY", img_id="img-other")
+        image, _ci, _nr = self._call(prov)
+        self.assertEqual(image, self._ubuntu().default_image)
+
+    def test_list_images_failure_is_graceful_miss_and_warns(self) -> None:
+        # a list_images that raises → warn + cold path (the cache is advisory).
+        class _ListBoom(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise providers.ProviderError("hcloud image list exploded")
+
+        warns: list[str] = []
+        image, _ci, needs_rescue = self._call(_ListBoom(), warn=warns.append)
+        self.assertEqual(image, self._ubuntu().default_image)  # degraded to cold
+        self.assertEqual(needs_rescue, self._ubuntu().needs_rescue_write)
+        self.assertEqual(len(warns), 1)
+        self.assertIn("cache lookup failed", warns[0])
+
+
 class TestImageCacheLabels(unittest.TestCase):
     def test_full_label_set(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
