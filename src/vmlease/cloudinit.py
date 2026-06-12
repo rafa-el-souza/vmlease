@@ -31,18 +31,21 @@ _MINIMAL_TEMPLATE = "cloudinit-minimal.sh.tmpl"
 # Sysprep run over SSH as the (NOPASSWD-sudo) operator on the build host BEFORE
 # poweroff/snapshot. A snapshot freezes /etc/machine-id into the image, so every
 # host restored from it would otherwise share one machine-id — breaking systemd,
-# journald and dbus (which key state off it) across restored hosts (F-009). We
-# REMOVE it (``rm -f``, leaving it ABSENT): a *missing* /etc/machine-id triggers
-# systemd first-boot regeneration of a fresh, unique id per restored host.
-# Truncating to empty is NOT enough — it was the original bug (E-012 10.1,
-# real-host 2026-06-12): the empty-but-PRESENT file is re-committed with the
-# builder's in-memory id during systemd's graceful-poweroff shutdown, so the
-# snapshot freezes one shared id and every restore inherits it; an ABSENT file
-# gives the shutdown nothing to write back. Validated end-to-end: ``rm`` →
-# distinct machine-ids on distinct hosts; ``truncate`` → all restores shared the
-# builder's id. The dbus copy/symlink is removed too so it re-derives from the new
-# id. ``;`` (not ``&&``) separates the two so neither ``rm -f`` can gate the other.
-SYSPREP_COMMAND: str = "sudo rm -f /etc/machine-id ; sudo rm -f /var/lib/dbus/machine-id"
+# journald and dbus (which key state off it) across restored hosts (F-009). The
+# subtle part (E-012 10.1, real-host 2026-06-12): you CANNOT just empty (truncate)
+# or remove (rm) the file, because systemd RE-COMMITS its in-memory machine-id back
+# into it during the graceful-poweroff shutdown — so the snapshot freezes the
+# builder's id and every restore inherits it (proven: the file is ABSENT right
+# before poweroff, yet the snapshot still carries the builder's id; confirmed
+# across builds with both truncate and rm). The fix is systemd's documented
+# golden-image sentinel: write the literal ``uninitialized\n``. A PRESENT file with
+# that exact content is NOT overwritten during shutdown AND flags systemd to
+# regenerate a fresh, unique id on the next boot. ``sync`` makes the reset durable;
+# the dbus copy/symlink is cleared so it re-derives from the regenerated id.
+SYSPREP_COMMAND: str = (
+    "printf 'uninitialized\\n' | sudo tee /etc/machine-id >/dev/null"
+    " ; sudo rm -f /var/lib/dbus/machine-id ; sync"
+)
 
 
 class CloudInitError(ValueError):
