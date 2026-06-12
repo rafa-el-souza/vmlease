@@ -29,6 +29,8 @@ vmlease run    --battery <battery.toml> --run-token <slug> \    # provision -> p
 vmlease status --run-token <slug>                               # list the live hosts for a run
 vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
+vmlease build-image  --distro <key> --run-token <slug> [--server-type cpx22] [--rebuild]  # opt-in: cache a prepped snapshot
+vmlease reap-images  [--distro <key>] [--older-than <ISO>] [--superseded] [--dry-run]  # prune cached snapshot images
 vmlease summarize <raw-results.json> [--battery <battery.toml>] [--out <s.json>]  # ONE canonical reader -> .summary.json
 ```
 
@@ -71,6 +73,94 @@ deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero ex
 with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) → `PASS_NO_ASSERTIONS`. Pass
 `--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes per host;
 without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
+
+## Caching (snapshot image cache)
+
+The expensive part of a `run` is OS prep: Arch pays the multi-minute **rescue-write** every time, and
+every distro re-installs its base packages via cloud-init. The snapshot image cache does that prep **once**
+and bakes it into a Hetzner snapshot, so later runs start from the prepped disk in ~30s. It is a **speed
+*and* reliability** win — the fragile rescue path then runs only when you build the cache, not on every run.
+
+The cache is **opt-in**: nothing is cached until you run `build-image`. A `run` automatically restores from a
+matching cached image if one exists, and otherwise behaves exactly as it always has.
+
+### `build-image` — the explicit build verb
+
+`build-image` provisions a throwaway builder, runs the full normal OS prep (Arch rescue-write + cloud-init
+package install), **sysprep**s it (wipes `/etc/machine-id` so each restore is unique), powers off, takes a
+content-addressed labelled snapshot, and deletes the builder. Building is **always an explicit verb** — a
+`run` consumes the cache but never builds it.
+
+```
+vmlease build-image --distro <key> --run-token <slug> \
+        [--server-type cpx22] [--operator probe] [--rebuild] [--max-images 10] \
+        [--ssh-key <name> --ssh-key-path <path>] [--firewall <name>] [--yes]
+```
+
+- `--distro` — the distro key to build (e.g. `ubuntu`, `arch`); an unknown key exits 2.
+- `--server-type` — builder instance size; **defaults to `cpx22`** (cost-guard allowlisted).
+- `--rebuild` — replace the existing same-key image (drops the older-created same-key image).
+- `--max-images` — vmlease's own self-cap (default `10`); see *No auto-TTL* below.
+- `--ssh-key` / `--ssh-key-path` — the hcloud-registered key name + matching local private key, **required
+  for rescue-write distros** (e.g. `arch`) and validated *before* any host is provisioned.
+- It is idempotent: if a matching image is already cached, `build-image` is a no-op unless `--rebuild`.
+
+### Restore on `run`
+
+A `run` automatically restores from a cached image when one **matches** — same content key, same
+architecture, and the snapshot fits the chosen server's disk. On a hit, the host is created directly from
+the snapshot with a **minimal key-only cloud-init**, skipping both the rescue-write *and* the package
+install. A `run` **consumes but never builds** — it makes zero `create_image` calls.
+
+The cache is **advisory, never load-bearing**: a miss — no matching image, an oversized image, a vanished
+snapshot, or any cache/lookup failure — is a **graceful fall-back to the cold path**. It just doesn't save
+time; it never breaks a run. (If a *restored* host then fails readiness, that is recorded as a host failure
+naming the source image; the opt-in `--reap-bad-cache-image` flag reaps that image — default is hint-only,
+keeping the image so a real fault is not masked.)
+
+### `reap-images` — pruning the persistent class
+
+Cached images are a **persistent class** — they outlive runs and carry a content-key label, not the
+ephemeral `vmlease=<run-id>` run label. The per-run `vmlease reap` (a server-only selector) never touches
+cache images. To prune the cache, use `reap-images`:
+
+```
+vmlease reap-images [--distro <key>] [--older-than <ISO-8601>] [--superseded] [--dry-run]
+```
+
+- `--distro` — scope to one distro's cached images (an explicit per-distro cache clear).
+- `--older-than <ISO-8601>` — reap images created before the cutoff (validated fail-closed; no clock read).
+- `--superseded` — reap off-current-key images; each group's current key is resolved fail-safe, and any
+  unresolvable group is **kept and warned**, never blindly deleted.
+- `--dry-run` — report what *would* be deleted and delete nothing (the preview/safety gate).
+
+### The content key
+
+Cache validity is keyed on **distro + architecture + the rendered prep recipe + the resolved upstream
+image** — `v1-<distro>-<hash>`, where the hash folds the base-image fingerprint and the canonical
+cloud-init together. So a recipe change or an upstream image change yields a *new* key, and the next
+`build-image` produces a fresh image while a `run` simply misses the stale one and falls back to cold —
+freshness is automatic, with no stale-cache footgun.
+
+### Build small → restore anywhere
+
+A snapshot is **not location-bound**: it restores onto any server whose disk is **≥** the snapshot's. So
+build on a small, cheap type (`build-image --server-type` defaults to `cpx22`) and restore onto whatever a
+`run` provisions. An oversized image (snapshot disk > target disk) is simply a graceful miss → cold path.
+
+### No auto-TTL
+
+There is **no automatic expiry**. Freshness is operator/CI policy via `reap-images --older-than` /
+`--superseded`. The real ceiling is the **account-wide provider snapshot cap** (Hetzner's is ~30) — surfaced
+as a typed `ProviderQuotaError`; vmlease's own `--max-images` self-cap (default `10`) is just a
+self-runaway tidiness limit checked in `build-image` before provisioning.
+
+### Migration / rollback
+
+The cache is **fully backward compatible and opt-in**. Adopting it requires no code change and no battery
+change — a `run` with no matching cached image behaves exactly as before. To **roll back**: stop running
+`build-image`, and/or `reap-images` the existing snapshots — `run` reverts to the cold path automatically,
+with no code change.
 
 ## Development
 
