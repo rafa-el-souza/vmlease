@@ -26,6 +26,18 @@ if TYPE_CHECKING:
 
 _TEMPLATES_PKG = "vmlease.templates"
 _BASE_TEMPLATE = "cloudinit.sh.tmpl"
+_MINIMAL_TEMPLATE = "cloudinit-minimal.sh.tmpl"
+
+# Sysprep run over SSH as the (NOPASSWD-sudo) operator on the build host BEFORE
+# poweroff/snapshot. A snapshot freezes /etc/machine-id into the image, so every
+# host restored from it would otherwise share one machine-id — breaking systemd,
+# journald and dbus (which key state off it) across restored hosts (F-009). We
+# truncate it (NOT delete-and-leave-absent): an empty /etc/machine-id signals
+# systemd to regenerate a fresh, unique id on the next boot. The dbus copy is
+# cleared too so it is re-derived from the new machine-id. ``;`` (not ``&&``)
+# separates the two so a missing dbus file can never fail sysprep (``rm -f`` is
+# already no-fail; the ``;`` keeps the truncate result from gating it).
+SYSPREP_COMMAND: str = "sudo truncate -s 0 /etc/machine-id ; sudo rm -f /var/lib/dbus/machine-id"
 
 
 class CloudInitError(ValueError):
@@ -123,3 +135,18 @@ def render_cloudinit(profile: DistroProfile, operator: str, operator_pubkey: str
         "package_manager": profile.package_manager,
     }
     return _render_subset(base, candidates)
+
+
+def render_minimal_cloudinit(operator: str, pubkey: str) -> str:
+    """Render the restore-path (cache-hit) cloud-init for ``operator``.
+
+    The operator account, sudoers, docker prerequisites and all prep are baked
+    into the snapshot (F-009); cloud-init re-runs per-instance on a snapshot
+    boot, so this re-authorizes ONLY the fresh per-run ``pubkey`` for the baked
+    operator and re-asserts the ``/var/lib/vmlease-ready`` sentinel — no system
+    update, package install, account creation or rescue-write. ``pubkey`` is the
+    throwaway probe public key authorized for the restored host's run.
+    """
+    template_text = _read_template(_MINIMAL_TEMPLATE)
+    candidates = {"operator": operator, "operator_pubkey": pubkey.strip()}
+    return _render_subset(template_text, candidates)

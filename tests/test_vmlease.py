@@ -1636,6 +1636,59 @@ class TestCloudInit(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# cloudinit — minimal restore render + machine-id sysprep (D7, F-009)
+# --------------------------------------------------------------------------- #
+class TestMinimalCloudInit(unittest.TestCase):
+    def test_minimal_render_authorizes_key_and_touches_sentinel(self) -> None:
+        out = cloudinit.render_minimal_cloudinit("alice", "ssh-ed25519 RESTOREKEY alice")
+        # operator name + the fresh per-run pubkey are injected
+        self.assertIn("alice", out)
+        self.assertIn("ssh-ed25519 RESTOREKEY alice", out)
+        # the .ssh dir + authorized_keys install (mirrors the base template)
+        self.assertIn('install -d -m 0700 -o "$operator" -g "$operator" "/home/$operator/.ssh"', out)
+        self.assertIn('"/home/$operator/.ssh/authorized_keys"', out)
+        # the readiness sentinel is re-asserted
+        self.assertIn("touch /var/lib/vmlease-ready", out)
+        # hardened header + no unfilled slots
+        self.assertIn("set -Eeuo pipefail", out)
+        self.assertNotIn("@@", out)
+
+    def test_minimal_render_does_nothing_else(self) -> None:
+        # The "nothing else" guarantee: the restore path must carry NONE of the
+        # cold-path prep — package install, system update, sudoers/account
+        # creation or rescue-write machinery (all baked into the snapshot).
+        out = cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 AAAA")
+        for forbidden in (
+            "apt-get",
+            "dnf -y install",
+            "pacman",
+            "useradd",
+            "visudo",
+            "/etc/sudoers.d",
+            "systemctl reboot",
+            "vmlease-ready.service",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, out)
+
+    def test_minimal_render_strips_pubkey_whitespace(self) -> None:
+        # Mirrors render_cloudinit: a trailing newline on the key must not leak
+        # a blank line into the authorized_keys heredoc.
+        out = cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 KEY\n")
+        self.assertIn("ssh-ed25519 KEY\nPUBKEY", out)
+
+    def test_sysprep_truncates_machine_id_and_clears_dbus(self) -> None:
+        # F-009: truncate (NOT delete-and-leave-absent) /etc/machine-id so
+        # systemd regenerates a unique id per restore; clear the dbus copy too.
+        self.assertIn("truncate -s 0 /etc/machine-id", cloudinit.SYSPREP_COMMAND)
+        self.assertNotIn("rm -f /etc/machine-id", cloudinit.SYSPREP_COMMAND)
+        self.assertIn("/var/lib/dbus/machine-id", cloudinit.SYSPREP_COMMAND)
+        # ``;`` (not ``&&``) so a missing dbus file can't fail sysprep
+        self.assertIn(";", cloudinit.SYSPREP_COMMAND)
+        self.assertNotIn("&&", cloudinit.SYSPREP_COMMAND)
+
+
+# --------------------------------------------------------------------------- #
 # keypair — generate via injected runner; cleanup
 # --------------------------------------------------------------------------- #
 class TestKeypair(unittest.TestCase):
