@@ -28,11 +28,17 @@ import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vmlease.rescue_image import ResolveDeps
 
 from vmlease.archbuild import (
     ArchBuildError,
     build_live_rescue_writer,
+    build_live_resolve_deps,
     ensure_arch_keyring,
+    live_subprocess_run,
 )
 from vmlease.battery import (
     BatteryError,
@@ -44,12 +50,41 @@ from vmlease.battery import (
     shellcheck_battery,
 )
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
+from vmlease.imagecache import (
+    LABEL_CACHE_KEY,
+    LABEL_PURPOSE,
+    PURPOSE_IMAGE_CACHE,
+    base_fingerprint,
+    cache_labels,
+    content_key_from_base_fp,
+    superseded,
+)
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
-from vmlease.model import Battery, HostRun, UploadSpec
-from vmlease.providers import HetznerProvider, ProviderError
+from vmlease.model import Battery, HostRun, HostSpec, Image, UploadSpec
+from vmlease.providers import HetznerProvider, Provider, ProviderError, ProviderQuotaError
 from vmlease.results import IncrementalResultsWriter
-from vmlease.runner import TEARDOWN_WARNING_PREFIX, Matrix, RescueWriter, execute, plan
-from vmlease.safety import DEFAULT_MAX_HOSTS, CostGuard, CostGuardError, UploadError, make_run_id, reap
+from vmlease.runner import (
+    TEARDOWN_WARNING_PREFIX,
+    Matrix,
+    RescueWriter,
+    build_one_image,
+    execute,
+    make_snapshot_on_ready,
+    plan,
+)
+from vmlease.safety import (
+    DEFAULT_MAX_HOSTS,
+    DEFAULT_MAX_IMAGES,
+    CostGuard,
+    CostGuardError,
+    ImageQuotaError,
+    ImageQuotaGuard,
+    UploadError,
+    make_run_id,
+    reap,
+    run_label,
+    server_type_arch,
+)
 from vmlease.ssh import OpenSshRunner
 from vmlease.summary import overall_exit_code, summarize_results, summary_filename, write_summary
 from vmlease.workload import ProbeWorkload, Workload
@@ -253,6 +288,261 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     return 0
 
 
+def _build_image_resolve_deps(profile: object, keyring_dir: _NoKeypairDir) -> ResolveDeps:
+    """Build the resolve-side ``ResolveDeps`` for a build, setting up the keyring.
+
+    A rescue-write distro's base fingerprint resolves through the gpg trust gate,
+    so its pinned ``arch-boxes`` keyring is set up under ``keyring_dir`` first; a
+    native distro never touches the resolve seams (its base_fp is the arch-blind
+    slug), so no gpg keyring is created — an unused keyring path is passed through.
+    This runs BEFORE the per-run keypair exists (D11 — the rescue-key gate gates
+    provisioning), so it uses a throwaway dir, not the keypair's.
+    """
+    from vmlease.distro import DistroProfile
+
+    assert isinstance(profile, DistroProfile)
+    keyring_path = str(keyring_dir.directory / "arch-boxes.gpg")
+    if profile.needs_rescue_write:
+        ensure_arch_keyring(keyring_path, live_subprocess_run)
+    return build_live_resolve_deps(keyring_path)
+
+
+def _backstop_reap_builder(provider: Provider, run_id: str, run_token: str, prefix: str) -> None:
+    """Reap the builder by its run-label after an abort/teardown failure (keeps the image).
+
+    ``reap`` is server-only (it selects ``vmlease=<run-id>``), so a created cache
+    image — which deliberately carries NO per-run reap label — survives. A failing
+    backstop reap is itself surfaced with a manual-reap hint, never a traceback.
+    """
+    try:
+        reaped = reap(provider, run_id)
+        print(f"{prefix} reaped {len(reaped)} builder host(s) labelled vmlease={run_id}", file=sys.stderr)
+        for h in reaped:
+            print(f"  - reaped {h.name} ({h.id})", file=sys.stderr)
+    except ProviderError as exc:
+        print(
+            f"{prefix} backstop reap ALSO failed ({exc}); builder labelled "
+            f"vmlease={run_id} may still be LIVE — run "
+            f"`vmlease reap --run-token {run_token}` to clean up",
+            file=sys.stderr,
+        )
+
+
+def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
+    """Build a content-addressed snapshot cache image (D8/D11 + the G5-G10 paths).
+
+    Resolves the recipe's content key ONCE (one base-fingerprint resolve), no-ops
+    if it is already cached, enforces the image quota with D8(B) at-cap prune
+    ordering, provisions a single billable builder behind a confirm gate, snapshots
+    it, and routes the ProviderQuotaError / teardown-failure / Ctrl-C paths to a
+    reap-the-builder-keep-the-image backstop.
+    """
+    import time
+
+    # D11 + cost guard: resolve the profile, gate the (billable) builder's server
+    # type, and validate the rescue key BEFORE any keypair/provisioning (do NOT copy
+    # run's post-confirm ordering — a rescue-write build with no key creates nothing).
+    try:
+        profile = get_profile(args.distro)
+        CostGuard().check([args.server_type])
+    except (UnknownDistroError, CostGuardError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if profile.needs_rescue_write and not (args.ssh_key and args.ssh_key_path):
+        print(
+            "error: --ssh-key (registered name) AND --ssh-key-path (its local private half) "
+            "are required because a build for a rescue-write distro (e.g. arch) rescue-writes "
+            "the base image before snapshotting",
+            file=sys.stderr,
+        )
+        return 2
+
+    run_id = make_run_id(args.run_token)
+    arch = server_type_arch(args.server_type)
+    provider = HetznerProvider()
+
+    # Resolve the base fingerprint ONCE (the expensive, network/gpg step for a
+    # rescue-write distro) and derive BOTH the content key and the source-fp label
+    # from it. A resolve failure (mirror down) raises ArchBuildError → fail fast,
+    # no builder.
+    try:
+        deps = _build_image_resolve_deps(profile, _NoKeypairDir())
+        base_fp = base_fingerprint(profile, arch, deps)
+        key = content_key_from_base_fp(base_fp, profile, arch, args.operator)
+    except ArchBuildError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        images = provider.list_images(label_selector_purpose())
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # Idempotent no-op (D8): K_new already cached and not --rebuild → no builder, no
+    # spend.
+    already = [img for img in images if img.labels.get(LABEL_CACHE_KEY) == key]
+    if already and not args.rebuild:
+        print(f"already cached (key {key}); nothing to do")
+        return 0
+
+    # Quota + D8(B) prune ordering. S = same-(distro,arch) cache images whose key
+    # differs from K_new (this group's superseded predecessors).
+    same_group = [
+        img
+        for img in images
+        if img.labels.get("vmlease-distro") == profile.key and img.arch == arch
+    ]
+    s_prune = superseded(same_group, key)
+    guard = ImageQuotaGuard(max_images=args.max_images)
+    at_cap = False
+    try:
+        guard.check(len(images))
+    except ImageQuotaError as exc:
+        at_cap = True
+        if not s_prune:
+            # at cap & S empty → refuse before provisioning (no builder).
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if at_cap:
+        # at cap & S non-empty → prune-then-build (free slots first). A pre-build
+        # prune failure aborts before provisioning (no builder).
+        try:
+            _prune_images(provider, s_prune)
+        except ProviderError as exc:
+            print(f"error: pre-build prune failed, aborting before provisioning: {exc}", file=sys.stderr)
+            return 1
+
+    # Confirm-before-create (the builder is billable).
+    print(f"about to PROVISION 1 builder host (billable) for {args.distro} (key {key})")
+    print(f"  - {args.server_type}  {profile.default_image}  arch={arch}")
+    if not _confirm("Proceed with the build? [y/N]: ", assume_yes=args.yes, reader=reader):
+        print("aborted — nothing provisioned.")
+        return 0
+
+    try:
+        keypair = generate_keypair(run_id)
+    except KeypairError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        rescue_writer = None
+        if profile.needs_rescue_write:
+            rescue_writer = _build_rescue_writer(keypair, args.ssh_key, args.ssh_key_path)
+
+        def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
+            return OpenSshRunner(operator, keypair.private_key_path)
+
+        spec = HostSpec(
+            name=f"vmlease-{run_id}-build-{args.distro}",
+            image=profile.default_image,
+            server_type=args.server_type,
+            distro_key=args.distro,
+            labels=run_label(run_id),
+            firewall=args.firewall,
+        )
+        on_ready = make_snapshot_on_ready(
+            description=f"vmlease cache {args.distro} {key}",
+            labels=cache_labels(profile, arch, key, base_fp, args.run_token),
+            sleep=time.sleep,
+        )
+        note_sink: list[str] = []
+        try:
+            image = build_one_image(
+                spec, profile, provider, _ssh_factory, keypair, args.operator,
+                rescue_writer, on_ready=on_ready, note_sink=note_sink,
+            )
+        except ProviderQuotaError as exc:
+            # The account-wide ceiling from create_image — the builder is already
+            # torn down by the scaffold's finally; surface the reap hint.
+            print(
+                f"error: the provider snapshot limit was hit ({exc}); reclaim space with "
+                f"`vmlease reap-images` (or raise the account limit), then retry",
+                file=sys.stderr,
+            )
+            return 1
+        except (KeyboardInterrupt, SystemExit):
+            # Aborted mid-build: backstop-reap the builder by label (KEEPS any image
+            # — reap is server-only), note the abort, then re-raise so the interrupt
+            # still exits.
+            _backstop_reap_builder(provider, run_id, args.run_token, "aborted —")
+            raise
+        except (ProviderError, ArchBuildError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        # G8: a builder-teardown failure is surfaced via note_sink (not raised);
+        # backstop-reap the builder, KEEP the created image, exit non-zero + hint.
+        if note_sink:
+            _backstop_reap_builder(provider, run_id, args.run_token, "ERROR: builder teardown failed —")
+            print(f"  - {note_sink[0]}", file=sys.stderr)
+            print(f"image kept: {image.id} (key {key})", file=sys.stderr)
+            return 1
+
+        # --rebuild: drop ONLY the older-created same-key image (never all other
+        # same-key — that would let concurrent rebuilds delete each other's result).
+        if args.rebuild and already:
+            try:
+                _prune_images(provider, _older_same_key(already, image))
+            except ProviderError as exc:
+                print(f"warning: --rebuild drop of the older same-key image failed: {exc}", file=sys.stderr)
+
+        # not-at-cap post-build prune of S (build-then-prune). A post-build prune
+        # failure WARNS and MUST NOT fail the build (G7) — the new image is the
+        # artifact; leftovers are reap-able.
+        if not at_cap:
+            try:
+                _prune_images(provider, s_prune)
+            except ProviderError as exc:
+                print(f"warning: post-build prune of superseded image(s) failed: {exc}", file=sys.stderr)
+
+        print(f"built image: {image.id}")
+        print(f"  key: {key}")
+        print(f"  labels: {image.labels}")
+        return 0
+    finally:
+        keypair.cleanup()
+
+
+class _NoKeypairDir:
+    """A minimal keypair-shaped stand-in carrying only a temp ``directory``.
+
+    The base-fingerprint resolve needs a keyring path under a writable dir but
+    runs BEFORE the throwaway keypair is generated (D11 — no provisioning before
+    the rescue-key gate). A native build never touches the keyring; a rescue-write
+    build's real keyring is set up here under a throwaway temp dir, separate from
+    the per-run keypair (which is generated only after the confirm gate).
+    """
+
+    def __init__(self) -> None:
+        import tempfile
+
+        self.directory = Path(tempfile.mkdtemp(prefix="vmlease-build-keyring-"))
+
+
+def label_selector_purpose() -> str:
+    """The label selector for the cache-image query index (``vmlease-purpose=image-cache``)."""
+    return f"{LABEL_PURPOSE}={PURPOSE_IMAGE_CACHE}"
+
+
+def _prune_images(provider: Provider, images: list[Image]) -> None:
+    """Best-effort, idempotent delete of each image in ``images`` (``delete_image``)."""
+    for img in images:
+        provider.delete_image(img.id)
+
+
+def _older_same_key(same_key: list[Image], newest: Image) -> list[Image]:
+    """The same-key images created strictly before ``newest`` (ISO-8601 string compare).
+
+    ISO-8601 UTC strings sort lexicographically by instant, so a string compare is
+    a valid age compare. Returns every same-key image whose ``created`` precedes the
+    just-built ``newest``'s — never the newest itself, never a same-instant tie.
+    """
+    return [img for img in same_key if img.id != newest.id and img.created < newest.created]
+
+
 def _cmd_summarize(args: argparse.Namespace) -> int:
     """Read a raw results file, write a versioned summary companion, gate on exit.
 
@@ -422,6 +712,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
     run_p.set_defaults(func=_cmd_run)
+
+    build_p = sub.add_parser(
+        "build-image", help="build a content-addressed snapshot cache image (billable; confirm-gated)"
+    )
+    build_p.add_argument("--distro", required=True, help="distro key to build a cache image for (e.g. ubuntu, arch)")
+    build_p.add_argument("--server-type", default="cpx22", help="builder instance size (default: cpx22)")
+    build_p.add_argument("--operator", default="probe", help="non-root operator account baked into the image")
+    build_p.add_argument("--run-token", required=True, help="determinism seam for the builder run-id / reap label")
+    build_p.add_argument(
+        "--rebuild", action="store_true",
+        help="replace the existing same-key image (drops the older-created same-key image)",
+    )
+    build_p.add_argument(
+        "--max-images", type=int, default=DEFAULT_MAX_IMAGES, help="image quota guard cap (self-runaway tidiness limit)"
+    )
+    build_p.add_argument(
+        "--ssh-key", default="",
+        help="hcloud-registered ssh-key NAME injected into rescue (required for rescue-write distros, e.g. arch)",
+    )
+    build_p.add_argument(
+        "--ssh-key-path", default="",
+        help="local PRIVATE key matching --ssh-key, used for root ssh into the rescue system (rescue-write distros)",
+    )
+    build_p.add_argument("--firewall", default="", help="provider firewall name to attach to the builder (default: none)")
+    build_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
+    build_p.set_defaults(func=_cmd_build_image)
 
     status_p = sub.add_parser("status", help="list live hosts for a run-token")
     status_p.add_argument("--run-token", required=True, help="the run-token whose hosts to list")

@@ -117,6 +117,27 @@ def content_key(
     UTF-8 bytes.
     """
     base_fp = base_fingerprint(profile, arch, deps)
+    return content_key_from_base_fp(base_fp, profile, arch, operator)
+
+
+def content_key_from_base_fp(
+    base_fp: str,
+    profile: DistroProfile,
+    arch: str,
+    operator: str,
+) -> str:
+    """The cache content key given an **already-resolved** base fingerprint.
+
+    The pure key derivation half of :func:`content_key`, split out so a caller that
+    has *already* paid the (network, gpg) :func:`base_fingerprint` resolve can
+    derive the key without resolving twice. ``content_key`` is exactly
+    ``content_key_from_base_fp(base_fingerprint(profile, arch, deps), …)`` — one
+    implementation, so the two can never hash different bytes.
+
+    Hashes the SAME payload as :func:`content_key`: ``arch \\0 base_fp \\0
+    canonical_cloud_init`` (the canonical render uses the real ``operator`` and the
+    pinned :data:`_CACHE_KEY_CANONICAL_PUBKEY`), SHA-256, lowercase hex, first 32.
+    """
     canonical_cloud_init = render_cloudinit(profile, operator, _CACHE_KEY_CANONICAL_PUBKEY)
     payload = f"{arch}\0{base_fp}\0{canonical_cloud_init}".encode()
     digest = hashlib.sha256(payload).hexdigest()[:_KEY_HASH_HEX_WIDTH]

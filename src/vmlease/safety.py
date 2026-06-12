@@ -38,6 +38,17 @@ DEFAULT_ALLOWED_SERVER_TYPES: frozenset[str] = frozenset({"cpx11", "cpx21", "cpx
 # 4-distro battery).
 DEFAULT_MAX_HOSTS = 8
 
+
+def server_type_arch(server_type: str) -> str:
+    """Map a Hetzner server type to its CPU architecture (``"arm"`` / ``"x86"``).
+
+    The Hetzner naming rule: ``cax*`` are Ampere ARM64 boxes; everything else
+    (``cpx*`` / ``cx*`` / ``ccx*``) is x86. The architecture is part of the cache
+    content key and the only hard restore match (D9), so it is derived here — one
+    place — and shared by both ``build-image`` and the ``run`` cache path.
+    """
+    return "arm" if server_type.startswith("cax") else "x86"
+
 # Self-runaway cap on cached images vmlease keeps. This is vmlease's OWN tidiness
 # limit — NOT the provider account-wide snapshot ceiling, which is project-blind
 # and enforced separately by ``ProviderQuotaError`` raised inside the provider.
