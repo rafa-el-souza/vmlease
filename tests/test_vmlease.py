@@ -355,6 +355,33 @@ class TestSafety(unittest.TestCase):
         with self.assertRaises(safety.CostGuardError):
             safety.CostGuard().check(["cpx22", "ccx63"])
 
+    def test_image_quota_guard_passes_under_cap(self) -> None:
+        # Default cap is 10; nine images leaves headroom for one more.
+        safety.ImageQuotaGuard().check(9)  # no raise
+
+    def test_image_quota_guard_at_cap_raises(self) -> None:
+        # At the cap there is no headroom to create one more — refuse.
+        with self.assertRaises(safety.ImageQuotaError):
+            safety.ImageQuotaGuard().check(safety.DEFAULT_MAX_IMAGES)
+
+    def test_image_quota_guard_over_cap_raises(self) -> None:
+        with self.assertRaises(safety.ImageQuotaError):
+            safety.ImageQuotaGuard().check(safety.DEFAULT_MAX_IMAGES + 5)
+
+    def test_image_quota_guard_honors_custom_max(self) -> None:
+        g = safety.ImageQuotaGuard(max_images=2)
+        g.check(1)  # one image, headroom for one more — passes
+        with self.assertRaises(safety.ImageQuotaError):
+            g.check(2)  # at the custom cap — refuse
+
+    def test_image_quota_error_message_is_operator_actionable(self) -> None:
+        with self.assertRaises(safety.ImageQuotaError) as ctx:
+            safety.ImageQuotaGuard(max_images=3).check(3)
+        msg = str(ctx.exception)
+        self.assertIn("reap-images", msg)
+        self.assertIn("--max-images", msg)
+        self.assertIn("3", msg)
+
 
 # --------------------------------------------------------------------------- #
 # providers — argv builders + parsers (pure) + impl via injected runner
