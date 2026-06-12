@@ -30,6 +30,7 @@ from vmlease import (
     cli,
     cloudinit,
     distro,
+    imagecache,
     keypair,
     model,
     providers,
@@ -3712,6 +3713,232 @@ class TestDistroRescue(unittest.TestCase):
             profile = distro.get_profile(key)
             self.assertFalse(profile.needs_rescue_write)
             self.assertIsNone(profile.rescue_image)
+
+
+def _null_deps() -> rescue_image.ResolveDeps:
+    """A ResolveDeps whose seams all raise — for native paths that never resolve.
+
+    A native distro's base fingerprint is the arch-blind slug; it must NEVER
+    touch a resolve seam, so make every seam fail loudly if it does.
+    """
+    from vmlease.rescue_image import ResolveDeps
+
+    def boom_text(_u: str) -> str:
+        raise AssertionError("native path must not call text_fetcher")
+
+    def boom_bytes(_u: str) -> bytes:
+        raise AssertionError("native path must not call fetcher")
+
+    def boom_gpg(_argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("native path must not invoke gpg")
+
+    return ResolveDeps(
+        text_fetcher=boom_text, fetcher=boom_bytes, gpg_runner=boom_gpg,
+        write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+    )
+
+
+class _FakeResolveSpec:
+    """A fake RescueImageSpec returning a fixed sha (or raising) — no network."""
+
+    def __init__(self, *, sha: str = "", raises: BaseException | None = None) -> None:
+        self._sha = sha
+        self._raises = raises
+
+    def resolve_and_verify(self, deps: rescue_image.ResolveDeps, /) -> rescue_image.ResolvedRescueImage:
+        if self._raises is not None:
+            raise self._raises
+        from vmlease.rescue_image import RemoteUrl, ResolvedRescueImage
+        return ResolvedRescueImage(expected_sha256=self._sha, source=RemoteUrl("https://m/x.qcow2"))
+
+
+def _rescue_profile(spec: object) -> distro.DistroProfile:
+    """A minimal rescue-write profile carrying an injected fake spec."""
+    from vmlease.rescue_image import RescueImageSpec
+    assert isinstance(spec, RescueImageSpec)
+    base = distro.get_profile("arch")
+    return distro.DistroProfile(
+        key=base.key, default_image=base.default_image, package_manager=base.package_manager,
+        packages=base.packages, docker_repo_slug=base.docker_repo_slug, extra_setup=base.extra_setup,
+        system_update_override=base.system_update_override, rescue_image=spec, notes=base.notes,
+    )
+
+
+def _cache_image(*, distro_key: str, arch: str, key: str, img_id: str = "img-1") -> Image:
+    """A cache Image carrying the supersession-relevant labels."""
+    return Image(
+        id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
+        labels={
+            imagecache.LABEL_DISTRO: distro_key,
+            imagecache.LABEL_ARCH: arch,
+            imagecache.LABEL_CACHE_KEY: key,
+        },
+    )
+
+
+class TestImageCacheBaseFingerprint(unittest.TestCase):
+    def test_native_returns_arch_blind_slug(self) -> None:
+        # ubuntu is native — the fingerprint is its provider slug, no resolve seam touched.
+        ubuntu = distro.get_profile("ubuntu")
+        fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
+        self.assertEqual(fp, "ubuntu-24.04")
+
+    def test_rescue_write_returns_resolved_digest(self) -> None:
+        # an Arch-shaped rescue-write profile resolves to the spec's qcow2 sha.
+        prof = _rescue_profile(_FakeResolveSpec(sha="deadbeef" * 8))
+        fp = imagecache.base_fingerprint(prof, "x86", _null_deps())
+        self.assertEqual(fp, "deadbeef" * 8)
+
+    def test_golden_returns_pinned_sha(self) -> None:
+        # a golden spec's resolve returns its pinned sha — same uniform call.
+        from vmlease.rescue_image import GoldenRescueImageSpec
+        sha = hashlib.sha256(b"golden").hexdigest()
+        prof = _rescue_profile(GoldenRescueImageSpec(sha256=sha, url="https://m/golden.qcow2"))
+
+        from vmlease.rescue_image import ResolveDeps
+        deps = ResolveDeps(
+            text_fetcher=lambda _u: "", fetcher=lambda _u: b"golden",
+            gpg_runner=_fake_subprocess(0, ""), write_temp=lambda _b: "/tmp/x", keyring_path="/k",
+        )
+        self.assertEqual(imagecache.base_fingerprint(prof, "x86", deps), sha)
+
+
+class TestImageCacheContentKey(unittest.TestCase):
+    def test_same_recipe_same_key(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        k1 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        k2 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        self.assertEqual(k1, k2)
+        self.assertTrue(k1.startswith("v1-ubuntu-"))
+        self.assertEqual(len(k1), len("v1-ubuntu-") + 32)
+
+    def test_recipe_change_changes_key(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        mutated = distro.DistroProfile(
+            key=ubuntu.key, default_image=ubuntu.default_image, package_manager=ubuntu.package_manager,
+            packages=(*ubuntu.packages, "htop"),  # a recipe change
+            docker_repo_slug=ubuntu.docker_repo_slug,
+        )
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(mutated, "x86", "probe", _null_deps()),
+        )
+
+    def test_different_arch_changes_key(self) -> None:
+        # native's slug is arch-blind, so the arch-fold is what makes the key vary.
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "arm", "probe", _null_deps()),
+        )
+
+    def test_operator_changes_key(self) -> None:
+        # operator is part of the canonical render (baked user), so it is in the key.
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "alice", _null_deps()),
+        )
+
+    def test_pinned_algorithm_exact_key(self) -> None:
+        # A pinned exact-key assertion: this goes RED if the algorithm (SHA-256,
+        # [:32], arch-fold, \0 separators, sentinel) or the sentinel value drifts.
+        ubuntu = distro.get_profile("ubuntu")
+        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY)
+        expected_payload = f"x86\0ubuntu-24.04\0{canonical}".encode()
+        expected_digest = hashlib.sha256(expected_payload).hexdigest()[:32]
+        expected = f"v1-ubuntu-{expected_digest}"
+        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", _null_deps()), expected)
+
+    def test_sentinel_value_is_pinned(self) -> None:
+        self.assertEqual(imagecache._CACHE_KEY_CANONICAL_PUBKEY, "vmlease-cache-key-canonical-pubkey")
+
+
+class TestImageCacheLabels(unittest.TestCase):
+    def test_full_label_set(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="v1-ubuntu-abc", source_fp="ubuntu-24.04", run_token="run-xyz",
+        )
+        self.assertEqual(labels, {
+            "vmlease-purpose": "image-cache",
+            "vmlease-cache-key": "v1-ubuntu-abc",
+            "vmlease-schema": "v1",
+            "vmlease-distro": "ubuntu",
+            "vmlease-arch": "x86",
+            "vmlease-source-fp": "ubuntu-24.04",
+            "vmlease-built": "run-xyz",
+        })
+
+    def test_no_per_run_reap_label(self) -> None:
+        # the data-loss guard: a persistent cache image must NOT carry vmlease=<run-id>.
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp="fp", run_token="run-1")
+        self.assertNotIn("vmlease", labels)
+
+    def test_long_value_truncated_to_63(self) -> None:
+        # a 64-hex sha source-fp would overflow the provider's ≤63-char limit.
+        ubuntu = distro.get_profile("ubuntu")
+        sha = "f" * 64
+        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp=sha, run_token="run-1")
+        self.assertEqual(len(labels["vmlease-source-fp"]), 63)
+        self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
+
+
+class TestImageCacheSupersession(unittest.TestCase):
+    def test_superseded_subset(self) -> None:
+        current = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-CUR", img_id="cur")
+        old = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD", img_id="old")
+        result = imagecache.superseded([current, old], "v1-ubuntu-CUR")
+        self.assertEqual([img.id for img in result], ["old"])
+
+    def test_accept_a_no_current_image_all_superseded(self) -> None:
+        # accept-(a): current image absent ⇒ every image in the group is superseded.
+        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD1", img_id="a")
+        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD2", img_id="b")
+        result = imagecache.superseded([a, b], "v1-ubuntu-CUR")
+        self.assertEqual({img.id for img in result}, {"a", "b"})
+
+    def test_resolve_current_keys_native(self) -> None:
+        img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-anything")
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys(
+            [img], distro.get_profile, "probe", _null_deps(), warnings.append,
+        )
+        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        self.assertEqual(keys, {("ubuntu", "x86"): expected})
+        self.assertEqual(warnings, [])
+
+    def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
+        # a raising resolve (mirror down) ⇒ group skipped + warned, never deleted.
+        from vmlease.archbuild import ArchBuildError
+        raising_spec = _FakeResolveSpec(raises=ArchBuildError("mirror down"))
+
+        def profile_for(key: str) -> distro.DistroProfile:
+            if key == "arch":
+                return _rescue_profile(raising_spec)
+            return distro.get_profile(key)
+
+        arch_img = _cache_image(distro_key="arch", arch="x86", key="v1-arch-OLD", img_id="arch1")
+        ubuntu_img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-X", img_id="ub1")
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys(
+            [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
+        )
+        # ubuntu resolved; arch skipped (kept) with a warning.
+        self.assertIn(("ubuntu", "x86"), keys)
+        self.assertNotIn(("arch", "x86"), keys)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("arch", warnings[0])
+
+    def test_resolve_current_keys_dedups_group(self) -> None:
+        # two images of the same group ⇒ the key is resolved once.
+        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-A", img_id="a")
+        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-B", img_id="b")
+        keys = imagecache.resolve_current_keys(
+            [a, b], distro.get_profile, "probe", _null_deps(), lambda _m: None,
+        )
+        self.assertEqual(len(keys), 1)
 
 
 if __name__ == "__main__":
