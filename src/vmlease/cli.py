@@ -119,6 +119,22 @@ def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: s
     return build_live_rescue_writer(rescue_key_path, ssh_key_name, keyring_path)
 
 
+def _build_run_resolve_deps(matrix: Matrix, keypair: Keypair) -> ResolveDeps:
+    """Build the run's cache-lookup ``ResolveDeps`` (the keyring only when needed).
+
+    Mirrors ``build-image``'s deps construction but keyed on the matrix: the pinned
+    ``arch-boxes`` keyring is set up ONLY when the matrix contains a rescue-write
+    distro (a native-only matrix never touches gpg). The keyring lives under the
+    per-run keypair's directory (it exists by now — the cache lookup is
+    provision-time, after the keypair is generated). The deps feed the advisory
+    cache lookup; a resolve failure inside it degrades to the cold path (G9).
+    """
+    keyring_path = str(keypair.directory / "arch-boxes.gpg")
+    if _matrix_has_rescue_write(matrix):
+        ensure_arch_keyring(keyring_path, live_subprocess_run)
+    return build_live_resolve_deps(keyring_path)
+
+
 def _parse_upload(value: str) -> UploadSpec:
     """Parse one ``--upload LOCAL[:REMOTE]`` value into an :class:`UploadSpec`.
 
@@ -216,12 +232,20 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         if not args.ssh_key or not args.ssh_key_path:
             print(
                 "error: a rescue-write distro (e.g. arch) requires --ssh-key "
-                "(registered name) AND --ssh-key-path (its local private half)",
+                "(registered name) AND --ssh-key-path (its local private half) — "
+                "required because a cache miss may still rescue-write (hit/miss is "
+                "only known after provisioning)",
                 file=sys.stderr,
             )
             keypair.cleanup()
             return 2
         rescue_writer = _build_rescue_writer(keypair, args.ssh_key, args.ssh_key_path)
+
+    # The cache is ADVISORY: build the run's resolve deps (sets up the pinned arch
+    # keyring only when the matrix has a rescue-write distro — a native-only matrix
+    # never touches gpg) and let execute() try a cached snapshot per host, falling
+    # back to the cold path on any miss/failure. run NEVER builds (D3).
+    resolve_deps = _build_run_resolve_deps(matrix, keypair)
 
     writer = IncrementalResultsWriter(Path(args.results_dir), run_id, args.timestamp)
 
@@ -234,6 +258,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             matrix, provider, _ssh_factory, keypair, args.operator,
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
             max_parallel=args.parallel, on_host_complete=_persist,
+            resolve_deps=resolve_deps, reap_bad_cache_image=args.reap_bad_cache_image,
         )
     except (KeyboardInterrupt, SystemExit):
         # Aborted mid-run: the per-host hosts that finished are already on disk
@@ -860,6 +885,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="default per-probe ssh timeout in seconds (a probe's own timeout overrides; default 600)",
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
+    run_p.add_argument(
+        "--reap-bad-cache-image", action="store_true",
+        help="if a restored host fails readiness, reap the source cache image (default: hint only — "
+        "the image is named in the failure but kept, so a real fault is not masked)",
+    )
     run_p.set_defaults(func=_cmd_run)
 
     build_p = sub.add_parser(

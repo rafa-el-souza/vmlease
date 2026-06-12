@@ -99,6 +99,16 @@ class Provider(Protocol):
         """
         ...
 
+    def server_type_disk(self, server_type: str) -> float:
+        """Return a server type's primary disk size in GB.
+
+        The restore disk-bound source (D9/G9): the ``run`` cache path needs the
+        target server's disk to reject an oversized snapshot. It is a provider
+        query (no hardcoded disk map), so a new server type works without a code
+        change. Raises :class:`ProviderError` on failure.
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # Hetzner argv builders (pure — unit-tested without any subprocess)
@@ -272,6 +282,33 @@ def build_describe_server_argv(server_id: str) -> list[str]:
     (to read its power ``status``), not an image.
     """
     return ["hcloud", "server", "describe", server_id, "--output", "json"]
+
+
+def build_describe_server_type_argv(server_type: str) -> list[str]:
+    """argv for ``hcloud server-type describe <type> --output json`` (the disk-bound source).
+
+    Distinct from :func:`build_describe_server_argv` — this describes a *server
+    type* (a catalog entry, to read its primary ``disk`` GB), not a live server.
+    """
+    return ["hcloud", "server-type", "describe", server_type, "--output", "json"]
+
+
+def parse_server_type_disk(stdout: str) -> float:
+    """Parse the ``disk`` field (GB) from ``hcloud server-type describe -o json``.
+
+    Mirrors :func:`parse_server_status`: malformed JSON, a non-object document, or
+    a missing/non-numeric ``disk`` field raises :class:`ProviderError`.
+    """
+    try:
+        doc = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"unparseable server-type describe output: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ProviderError(f"server-type describe output is not a JSON object: {stdout[:200]!r}")
+    disk = doc.get("disk")
+    if not isinstance(disk, (int, float)):
+        raise ProviderError(f"server-type describe output missing numeric disk: {stdout[:200]!r}")
+    return float(disk)
 
 
 def parse_image_list(stdout: str) -> list[Image]:
@@ -467,6 +504,13 @@ class HetznerProvider:
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server describe failed ({proc.returncode}): {proc.stderr}")
         return parse_server_status(proc.stdout)
+
+    def server_type_disk(self, server_type: str) -> float:
+        """Describe a server type and return its primary disk GB; raise on non-zero exit."""
+        proc = self._run(build_describe_server_type_argv(server_type), self._delete_timeout)
+        if proc.returncode != 0:
+            raise ProviderError(f"hcloud server-type describe failed ({proc.returncode}): {proc.stderr}")
+        return parse_server_type_disk(proc.stdout)
 
 
 def _scrape_image_id(stdout: str) -> str | None:

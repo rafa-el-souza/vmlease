@@ -66,6 +66,9 @@ class FakeProvider:
         self._image_seq = 0
         # per-server power state (default "running"; power_off flips it to "off").
         self._power: dict[str, str] = {}
+        # per-server-type primary disk GB (default 40.0; set entries to override).
+        self.server_type_disks: dict[str, float] = {}
+        self.default_server_type_disk: float = 40.0
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         # each host gets a DISTINCT ip so a parallel run mirrors reality.
@@ -126,6 +129,11 @@ class FakeProvider:
         # default "running"; power_off flips it to "off".
         with self._lock:
             return self._power.get(server_id, "running")
+
+    def server_type_disk(self, server_type: str) -> float:
+        # a settable per-type disk; defaults to default_server_type_disk.
+        with self._lock:
+            return self.server_type_disks.get(server_type, self.default_server_type_disk)
 
 
 def _fake_subprocess(
@@ -511,6 +519,28 @@ class TestProviderArgv(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             providers.parse_server_status(json.dumps({"id": 9}))
 
+    def test_build_describe_server_type_argv(self) -> None:
+        self.assertEqual(
+            providers.build_describe_server_type_argv("cpx22"),
+            ["hcloud", "server-type", "describe", "cpx22", "--output", "json"],
+        )
+
+    def test_parse_server_type_disk(self) -> None:
+        self.assertEqual(providers.parse_server_type_disk(json.dumps({"disk": 80})), 80.0)
+        self.assertEqual(providers.parse_server_type_disk(json.dumps({"disk": 40.5})), 40.5)
+
+    def test_parse_server_type_disk_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk("{not json")
+
+    def test_parse_server_type_disk_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk(json.dumps([1, 2]))
+
+    def test_parse_server_type_disk_missing_disk_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_type_disk(json.dumps({"name": "cpx22"}))
+
     def test_parse_image_list(self) -> None:
         out = json.dumps([
             {"id": 11, "labels": {"vmlease-cache-key": "k1"}, "created": "2024-04-25T13:26:27+00:00",
@@ -751,6 +781,15 @@ class TestHetznerProviderImpl(unittest.TestCase):
         prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
         with self.assertRaises(providers.ProviderError):
             prov.server_status("9")
+
+    def test_server_type_disk_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, json.dumps({"disk": 80})))
+        self.assertEqual(prov.server_type_disk("cpx22"), 80.0)
+
+    def test_server_type_disk_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.server_type_disk("cpx22")
 
     def test_image_ops_bounded_by_delete_timeout(self) -> None:
         seen: list[float | None] = []
@@ -2918,6 +2957,68 @@ class TestCliRun(unittest.TestCase):
                     ])
             self.assertEqual(rc, 2)
 
+    def test_run_arch_refusal_message_mentions_cache_miss_rescue_write(self) -> None:
+        # D11: the improved message explains the key is required because a cache
+        # miss may still rescue-write.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    rc = cli.main([
+                        "run", "--battery", self._write_battery(d), "--distros", "arch",
+                        "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                        "--run-token", "cli-run", "--yes",
+                    ])
+            self.assertEqual(rc, 2)
+            self.assertIn("cache miss may still rescue-write", buf.getvalue())
+
+    def test_run_reap_bad_cache_image_threads_to_execute(self) -> None:
+        # --reap-bad-cache-image is parsed and threaded into execute().
+        from unittest import mock
+
+        captured: dict[str, object] = {}
+
+        def _capture_execute(*a: object, **k: object) -> list[model.HostRun]:
+            captured.update(k)
+            return []
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                 mock.patch.object(cli, "execute", _capture_execute):
+                cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                    "--run-token", "cli-run", "--yes", "--reap-bad-cache-image",
+                ])
+            self.assertTrue(captured.get("reap_bad_cache_image"))
+            self.assertIn("resolve_deps", captured)
+
+    def test_run_cache_hit_restores_via_cli(self) -> None:
+        # end-to-end CLI: a matching cache image → the host is created from the
+        # snapshot id (the wiring carries resolve_deps through to a real hit).
+        from unittest import mock
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", self._write_battery(d), "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(prov.created[0].image, "img-cache")
+            self.assertEqual(prov.created_images, [])  # run never builds
+
     def test_run_success_writes_results(self) -> None:
         # stub the provider + keypair + ssh so the run path executes end-to-end
         # with no network. --yes skips the confirm prompt.
@@ -4071,6 +4172,240 @@ class TestCacheAwarePlanCreate(unittest.TestCase):
         self.assertEqual(needs_rescue, self._ubuntu().needs_rescue_write)
         self.assertEqual(len(warns), 1)
         self.assertIn("cache lookup failed", warns[0])
+
+
+class TestRunCacheConsumption(unittest.TestCase):
+    """execute() cache consumption (group 8): hit-restore, G3 cold-fallback, G4 host-failure."""
+
+    def _ubuntu(self) -> distro.DistroProfile:
+        return distro.get_profile("ubuntu")
+
+    def _key(self, arch: str = "x86") -> str:
+        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+
+    def _matrix(self) -> runner.Matrix:
+        return runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
+
+    def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
+        return lambda _op, _kp: ssh_runner
+
+    def _exec(
+        self,
+        prov: providers.Provider,
+        ssh_runner: ssh.SshRunner | None = None,
+        *,
+        resolve_deps: rescue_image.ResolveDeps | None = None,
+        reap_bad_cache_image: bool = False,
+    ) -> list[model.HostRun]:
+        with tempfile.TemporaryDirectory() as d:
+            return runner.execute(
+                self._matrix(), prov, self._factory(ssh_runner or FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe",
+                resolve_deps=resolve_deps if resolve_deps is not None else _null_deps(),
+                reap_bad_cache_image=reap_bad_cache_image,
+            )
+
+    def test_hit_restores_from_snapshot_skips_rescue_workload_runs(self) -> None:
+        # a cache hit creates from the snapshot id with the MINIMAL cloud-init and
+        # the workload runs; run NEVER builds.
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        fssh = FakeSshRunner()
+        runs = self._exec(prov, fssh)
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].results)  # workload ran
+        self.assertEqual(len(prov.created), 1)
+        self.assertEqual(prov.created[0].image, "img-cache")  # created from snapshot
+        # minimal restore cloud-init (re-authorize the per-run key only)
+        self.assertEqual(
+            prov.cloud_inits[0],
+            cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 AAAA probe"),
+        )
+        self.assertEqual(len(prov.destroyed), 1)  # torn down
+        self.assertEqual(prov.created_images, [])  # run NEVER builds (D3)
+
+    def test_miss_uses_cold_path(self) -> None:
+        # no cached image → cold default image, full cloud-init.
+        prov = FakeProvider()
+        runs = self._exec(prov)
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertTrue(runs[0].results)
+        self.assertEqual(prov.created_images, [])
+
+    def test_g3_create_from_image_failure_falls_back_to_cold(self) -> None:
+        # G3: a hit whose create-from-image fails (image gone) → cold path; the run
+        # does NOT fail; the host is provisioned cold.
+        class _RestoreCreateBoom(FakeProvider):
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                if spec.image == "img-cache":
+                    raise providers.ProviderError("image not found (pruned mid-flight)")
+                return super().create_with_cloudinit(spec, cloud_init)
+
+        prov = _RestoreCreateBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov)
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].results)  # ran cold, did NOT fail
+        # exactly one host created — the COLD one (the restore create raised first)
+        self.assertEqual([s.image for s in prov.created], [self._ubuntu().default_image])
+        self.assertEqual(len(prov.destroyed), 1)  # cold host torn down
+        self.assertEqual(prov.created_images, [])
+
+    def test_g4_restored_host_readiness_failure_is_host_failure_naming_image(self) -> None:
+        # G4: a restored host that fails readiness → host failure naming the source
+        # image, NOT cold-retried (only ONE host created — the restore).
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom())
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].results, ())  # host failure
+        self.assertTrue(runs[0].detail.startswith("ERROR:"))
+        self.assertIn("img-cache", runs[0].detail)  # names the source image
+        # NOT cold-retried: only the restore host was created (no second cold host)
+        self.assertEqual([s.image for s in prov.created], ["img-cache"])
+        self.assertEqual(len(prov.destroyed), 1)  # restored host torn down
+
+    def test_g4_default_keeps_the_image_hint_only(self) -> None:
+        # default (no --reap-bad-cache-image): the image is named but KEPT.
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom())
+        self.assertEqual(prov.deleted_images, [])  # image survives
+        self.assertIn("the image was KEPT", runs[0].detail)
+        self.assertIn("img-cache", runs[0].detail)
+
+    def test_g4_reap_flag_reaps_the_source_image(self) -> None:
+        # --reap-bad-cache-image set: the source image is reaped on readiness failure.
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("never became reachable")
+
+        prov = FakeProvider()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom(), reap_bad_cache_image=True)
+        self.assertEqual(prov.deleted_images, ["img-cache"])  # reaped
+        self.assertIn("reaped the bad cache image img-cache", runs[0].detail)
+
+    def test_g4_reap_failure_is_noted_not_raised(self) -> None:
+        # the reap of the bad image itself failing is a NOTE in the detail, never a
+        # raise (still a recorded host failure).
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("unreachable")
+
+        class _DeleteBoom(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                raise providers.ProviderError("image delete exploded")
+
+        prov = _DeleteBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov, _ReadinessBoom(), reap_bad_cache_image=True)
+        self.assertEqual(runs[0].results, ())
+        self.assertIn("reap of the bad cache image img-cache FAILED", runs[0].detail)
+
+    def test_cutoff_create_fail_cold_vs_readiness_fail_host_failure(self) -> None:
+        # the load-bearing distinction: a create-from-image fail → cold success; a
+        # readiness fail on the restored host → host failure (no cold retry).
+        class _RestoreCreateBoom(FakeProvider):
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                if spec.image == "img-cache":
+                    raise providers.ProviderError("image gone")
+                return super().create_with_cloudinit(spec, cloud_init)
+
+        class _ReadinessBoom(FakeSshRunner):
+            def wait_until_ready(self, host: Host) -> None:
+                raise ssh.SshError("unreachable")
+
+        prov_a = _RestoreCreateBoom()
+        prov_a.images["img-cache"] = _cached_run_image(key=self._key())
+        runs_a = self._exec(prov_a)
+        # create-fail → cold success (workload ran, one cold host)
+        self.assertTrue(runs_a[0].results)
+        self.assertEqual([s.image for s in prov_a.created], [self._ubuntu().default_image])
+
+        prov_b = FakeProvider()
+        prov_b.images["img-cache"] = _cached_run_image(key=self._key())
+        runs_b = self._exec(prov_b, _ReadinessBoom())
+        # readiness-fail → host failure (no cold retry, names the image)
+        self.assertEqual(runs_b[0].results, ())
+        self.assertEqual([s.image for s in prov_b.created], ["img-cache"])
+
+    def test_server_type_disk_failure_is_graceful_miss_cold(self) -> None:
+        # G9: a server_type_disk failure → warn + cache miss → cold path (the host
+        # is provisioned cold, never failed).
+        class _DiskBoom(FakeProvider):
+            def server_type_disk(self, server_type: str) -> float:
+                raise providers.ProviderError("server-type describe exploded")
+
+        prov = _DiskBoom()
+        prov.images["img-cache"] = _cached_run_image(key=self._key())
+        runs = self._exec(prov)
+        self.assertTrue(runs[0].results)  # ran cold
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertEqual(prov.created_images, [])
+
+    def test_resolve_deps_none_is_pure_cold_no_disk_call(self) -> None:
+        # resolve_deps=None → pure cold path: no lookup, no server_type_disk call.
+        class _NoDiskAllowed(FakeProvider):
+            def server_type_disk(self, server_type: str) -> float:
+                raise AssertionError("cold path must not call server_type_disk")
+
+            def list_images(self, selector: str) -> list[Image]:
+                raise AssertionError("cold path must not call list_images")
+
+        prov = _NoDiskAllowed()
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(
+                self._matrix(), prov, self._factory(FakeSshRunner()),
+                _fake_keypair(Path(d)), "probe", resolve_deps=None,
+            )
+        self.assertTrue(runs[0].results)
+        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+
+    def test_run_makes_zero_create_image_calls_on_hit_and_miss(self) -> None:
+        # D3: run NEVER builds — zero create_image calls on both a hit and a miss.
+        hit = FakeProvider()
+        hit.images["img-cache"] = _cached_run_image(key=self._key())
+        self._exec(hit)
+        self.assertEqual(hit.created_images, [])
+
+        miss = FakeProvider()
+        self._exec(miss)
+        self.assertEqual(miss.created_images, [])
+
+
+class TestPlanZeroProviderCalls(unittest.TestCase):
+    """plan() makes ZERO provider calls even with caching available (D3/8.3)."""
+
+    def test_plan_makes_zero_provider_calls(self) -> None:
+        class _NoCallProvider(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise AssertionError("plan must not call list_images")
+
+            def server_type_disk(self, server_type: str) -> float:
+                raise AssertionError("plan must not call server_type_disk")
+
+            def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
+                raise AssertionError("plan must not create")
+
+        prov = _NoCallProvider()
+        prov.images["img-cache"] = _cached_run_image(
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+        )
+        # plan takes no provider at all — it is call-free by construction. Asserting
+        # the matrix plans without touching the provider object is the guarantee.
+        items = runner.plan(runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-plan"))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(prov.created, [])
+        self.assertEqual(prov.created_images, [])
 
 
 class TestImageCacheLabels(unittest.TestCase):
