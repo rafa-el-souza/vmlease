@@ -4649,5 +4649,217 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertIn("aborted", out)
 
 
+class TestCliReapImages(unittest.TestCase):
+    """``vmlease reap-images`` (tasks 7.1), fully mocked (no network)."""
+
+    def _img(
+        self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
+        key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
+    ) -> Image:
+        return Image(
+            id=img_id, created=created, disk_size=40.0, arch=arch,
+            labels={
+                imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
+                imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_ARCH: arch,
+                imagecache.LABEL_CACHE_KEY: key,
+            },
+        )
+
+    def _run(
+        self, prov: FakeProvider, argv: list[str], *,
+        resolve_current_keys: Callable[..., dict[tuple[str, str], str]] | None = None,
+    ) -> tuple[int, str, str]:
+        from contextlib import ExitStack
+        from unittest import mock
+
+        out, err = io.StringIO(), io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cli, "HetznerProvider", lambda: prov))
+            stack.enter_context(redirect_stdout(out))
+            stack.enter_context(redirect_stderr(err))
+            if resolve_current_keys is not None:
+                stack.enter_context(mock.patch.object(cli, "resolve_current_keys", resolve_current_keys))
+            ns = cli.build_parser().parse_args(argv)
+            rc = cli._cmd_reap_images(ns)
+        return rc, out.getvalue(), err.getvalue()
+
+    # --- bare call refuses --------------------------------------------------- #
+    def test_bare_no_filter_refuses_exit_2_no_provider_call(self) -> None:
+        prov = FakeProvider()
+        rc, _o, err = self._run(prov, ["reap-images"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("at least one of", err)
+
+    # --- --distro scope ------------------------------------------------------ #
+    def test_distro_scope_reaps_only_that_distro(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu")
+        prov.images["f1"] = self._img(img_id="f1", distro_key="fedora", key="v1-fedora-X")
+        rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["u1"])  # fedora untouched
+
+    # --- --older-than -------------------------------------------------------- #
+    def test_older_than_selects_only_older(self) -> None:
+        prov = FakeProvider()
+        prov.images["old"] = self._img(img_id="old", created="2023-01-01T00:00:00+00:00")
+        prov.images["new"] = self._img(img_id="new", created="2025-12-31T00:00:00+00:00")
+        rc, _o, _e = self._run(prov, ["reap-images", "--older-than", "2024-06-01T00:00:00+00:00"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # the newer one survives
+
+    def test_older_than_keeps_image_with_blank_or_unparseable_created(self) -> None:
+        # a cache image with a blank/garbled `created` fails the age predicate (kept
+        # — never reaped on an age check we cannot verify).
+        prov = FakeProvider()
+        prov.images["blank"] = self._img(img_id="blank", created="")
+        prov.images["junk"] = self._img(img_id="junk", created="not-a-timestamp")
+        prov.images["old"] = self._img(img_id="old", created="2023-01-01T00:00:00+00:00")
+        rc, _o, _e = self._run(prov, ["reap-images", "--older-than", "2024-06-01T00:00:00+00:00"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # only the parseable-older one
+
+    def test_malformed_older_than_exits_2_no_provider_call(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1")
+        # a list_images call would record nothing observable here; assert no delete
+        # AND that the validation happens before any provider call by tracking it.
+        listed: list[str] = []
+        real_list = prov.list_images
+
+        def track_list(selector: str) -> list[Image]:
+            listed.append(selector)
+            return real_list(selector)
+
+        prov.list_images = track_list  # type: ignore[method-assign]
+        rc, _o, err = self._run(prov, ["reap-images", "--older-than", "not-a-date"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(listed, [])  # validated fail-closed BEFORE any provider call
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("--older-than", err)
+
+    # --- --dry-run ----------------------------------------------------------- #
+    def test_dry_run_deletes_nothing(self) -> None:
+        prov = FakeProvider()
+        prov.images["u1"] = self._img(img_id="u1")
+        rc, out, _e = self._run(prov, ["reap-images", "--distro", "ubuntu", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, [])  # ZERO deletes
+        self.assertIn("DRY-RUN", out)
+        self.assertIn("u1", out)
+
+    # --- --superseded -------------------------------------------------------- #
+    def test_superseded_reaps_off_key_keeps_current(self) -> None:
+        prov = FakeProvider()
+        prov.images["cur"] = self._img(img_id="cur", key="v1-ubuntu-CUR")
+        prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["old"])  # current key kept
+
+    def test_superseded_fail_safe_keeps_unresolvable_group_and_warns(self) -> None:
+        prov = FakeProvider()
+        prov.images["a1"] = self._img(img_id="a1", distro_key="arch", key="v1-arch-OLD")
+        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu", key="v1-ubuntu-OLD")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
+            warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+
+        rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.deleted_images, ["u1"])  # arch group KEPT (fail-safe)
+        self.assertIn("arch", err)
+
+    def test_superseded_accept_a_reaps_group_with_no_current_image(self) -> None:
+        # accept-(a): the group's current key resolves but no cached image carries
+        # it ⇒ every image in the group is superseded and reaped.
+        prov = FakeProvider()
+        prov.images["o1"] = self._img(img_id="o1", key="v1-ubuntu-OLD1")
+        prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}  # no image carries CUR
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(prov.deleted_images), ["o1", "o2"])
+
+    # --- list failure -------------------------------------------------------- #
+    def test_list_images_failure_exits_1(self) -> None:
+        class _ListBoom(FakeProvider):
+            def list_images(self, selector: str) -> list[Image]:
+                raise providers.ProviderError("list exploded")
+
+        prov = _ListBoom()
+        rc, _o, err = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error:", err)
+
+    # --- partial-success report ---------------------------------------------- #
+    def test_per_image_delete_failure_partial_report_exit_1(self) -> None:
+        class _DeleteFailsOne(FakeProvider):
+            def delete_image(self, image_id: str) -> None:
+                if image_id == "bad":
+                    raise providers.ProviderError("delete exploded")
+                super().delete_image(image_id)
+
+        prov = _DeleteFailsOne()
+        prov.images["good"] = self._img(img_id="good")
+        prov.images["bad"] = self._img(img_id="bad")
+        rc, out, err = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 1)  # a real delete failed
+        self.assertIn("good", prov.deleted_images)  # the other delete still happened
+        self.assertIn("FAILED", err)
+        self.assertIn("reaped 1", out)
+
+
+class TestCacheImagePerRunReapIsolation(unittest.TestCase):
+    """Task 7.2 — the data-loss guard: cache images vs the per-run reap (no network)."""
+
+    def test_cache_image_carries_content_labels_not_run_label(self) -> None:
+        ubuntu = distro.get_profile("ubuntu")
+        labels = imagecache.cache_labels(ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird")
+        # content-addressed labels present...
+        self.assertEqual(labels[imagecache.LABEL_PURPOSE], imagecache.PURPOSE_IMAGE_CACHE)
+        self.assertEqual(labels[imagecache.LABEL_CACHE_KEY], "v1-ubuntu-K")
+        self.assertEqual(labels[imagecache.LABEL_DISTRO], "ubuntu")
+        # ...and the ephemeral per-run reap label is ABSENT.
+        self.assertNotIn(safety.LABEL_KEY, labels)
+
+    def test_per_run_reap_leaves_cache_image_intact(self) -> None:
+        prov = FakeProvider()
+        run_id = safety.make_run_id("bird")
+        # a cache image carrying ONLY content labels (no vmlease=<run-id>).
+        cache_labels = imagecache.cache_labels(
+            distro.get_profile("ubuntu"), "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird",
+        )
+        cache_img = Image(
+            id="cache-1", created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch="x86", labels=cache_labels,
+        )
+        prov.images["cache-1"] = cache_img
+        # a labelled run host (the ephemeral reap target).
+        spec = HostSpec(
+            name="vmlease-bird-host", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", labels=safety.run_label(run_id),
+        )
+        host = prov.create_with_cloudinit(spec, "#cloud-config")
+
+        reaped = safety.reap(prov, run_id)
+
+        # the run host is gone; the cache image survives untouched.
+        self.assertEqual([h.name for h in reaped], ["vmlease-bird-host"])
+        self.assertEqual(prov.destroyed, [host])
+        self.assertEqual(prov.deleted_images, [])
+        self.assertIn("cache-1", prov.images)
+
+
 if __name__ == "__main__":
     unittest.main()

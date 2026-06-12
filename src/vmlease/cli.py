@@ -7,6 +7,8 @@
 - ``status`` list the live hosts carrying a run's label.
 - ``lint``   shellcheck every probe in a battery bundle; severity-gated exit code.
 - ``reap``   destroy every host carrying a run's label (the orphan backstop).
+- ``reap-images`` reap cached snapshot images by ``--distro`` / ``--older-than`` /
+             ``--superseded`` (best-effort + idempotent; ``--dry-run`` previews).
 
 A battery is a **TOML bundle** (a ``battery.toml`` manifest plus optional
 co-located ``.sh`` scripts); the ``--battery`` flag points at the manifest.
@@ -51,12 +53,15 @@ from vmlease.battery import (
 )
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.imagecache import (
+    LABEL_ARCH,
     LABEL_CACHE_KEY,
+    LABEL_DISTRO,
     LABEL_PURPOSE,
     PURPOSE_IMAGE_CACHE,
     base_fingerprint,
     cache_labels,
     content_key_from_base_fp,
+    resolve_current_keys,
     superseded,
 )
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
@@ -595,6 +600,150 @@ def _cmd_reap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reap_images_superseded_set(
+    images: list[Image], operator: str, warn: Callable[[str], None]
+) -> set[str]:
+    """The ids of cache images that are superseded across all present groups (D10).
+
+    Mirrors ``build-image``'s deps construction: sets up the pinned arch keyring
+    ONLY if a listed image's distro group ``needs_rescue_write`` (so a native-only
+    cache never touches gpg), builds the live ``ResolveDeps`` once, then resolves
+    each present ``(distro, arch)`` group's current key via
+    :func:`resolve_current_keys` (the mirror-down **fail-safe** — an unresolvable
+    group is omitted from the mapping and so KEPT, never reaped). Within each
+    resolved group, an image is superseded iff its ``vmlease-cache-key`` differs
+    from that group's current key (the :func:`superseded` primitive) — which also
+    yields **accept-(a)**: a group whose current key resolves but has no matching
+    cached image has *every* image superseded.
+    """
+    needs_keyring = any(
+        get_profile(img.labels.get(LABEL_DISTRO, "")).needs_rescue_write
+        for img in images
+        if img.labels.get(LABEL_DISTRO, "") in DEFAULT_DISTRO_KEYS
+    )
+    keyring_dir = _NoKeypairDir()
+    keyring_path = str(keyring_dir.directory / "arch-boxes.gpg")
+    if needs_keyring:
+        ensure_arch_keyring(keyring_path, live_subprocess_run)
+    deps = build_live_resolve_deps(keyring_path)
+
+    current_keys = resolve_current_keys(images, get_profile, operator, deps, warn)
+    superseded_ids: set[str] = set()
+    for group, current_key in current_keys.items():
+        group_imgs = [
+            img
+            for img in images
+            if (img.labels.get(LABEL_DISTRO, ""), img.labels.get(LABEL_ARCH, "")) == group
+        ]
+        for img in superseded(group_imgs, current_key):
+            superseded_ids.add(img.id)
+    return superseded_ids
+
+
+def _cmd_reap_images(args: argparse.Namespace) -> int:
+    """Reap cached snapshot images as a persistent class (D10 — the ``reap-images`` verb).
+
+    Filters (AND of every *given* predicate, within the ``--distro`` scope):
+    ``--distro`` scopes to one distro's cache; ``--older-than`` selects images whose
+    ``Image.created`` parses to before the supplied ISO-8601 cutoff (validated
+    fail-closed BEFORE any provider call — the GIVEN string is parsed, never the
+    current clock); ``--superseded`` selects off-current-key images, resolving each
+    present group's current key with the mirror-down fail-safe (an unresolvable group
+    is KEPT + warned) and accept-(a) (a resolved group with no matching image → all
+    superseded). A bare call with no predicate is REFUSED (never an implicit
+    whole-cache wipe). Deletes are best-effort + idempotent with a partial-success
+    report; ``--dry-run`` issues zero deletes. Exit 0 on full success / dry-run; 1 if
+    any real delete failed (or a ``list_images`` failure); 2 on a usage/validation
+    refusal.
+    """
+    has_distro = bool(args.distro)
+    has_older = bool(args.older_than)
+    if not (has_distro or has_older or args.superseded):
+        print(
+            "error: specify at least one of --distro / --older-than / --superseded",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validate --older-than fail-closed BEFORE any provider call. Parse the GIVEN
+    # string only (never read the current clock).
+    cutoff = None
+    if has_older:
+        from datetime import datetime
+
+        try:
+            cutoff = datetime.fromisoformat(args.older_than)
+        except ValueError as exc:
+            print(f"error: --older-than {args.older_than!r} is not a valid ISO-8601 cutoff: {exc}", file=sys.stderr)
+            return 2
+
+    provider = HetznerProvider()
+    try:
+        images = provider.list_images(label_selector_purpose())
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    # --distro scopes the candidate set; every other predicate is AND-ed within it.
+    scoped = [img for img in images if img.labels.get(LABEL_DISTRO, "") == args.distro] if has_distro else images
+
+    def _warn(msg: str) -> None:
+        print(f"warning: {msg}", file=sys.stderr)
+
+    superseded_ids: set[str] = set()
+    if args.superseded:
+        superseded_ids = _reap_images_superseded_set(scoped, args.operator, _warn)
+
+    selected: list[Image] = []
+    for img in scoped:
+        if has_older and not _created_before(img, cutoff):
+            continue
+        if args.superseded and img.id not in superseded_ids:
+            continue
+        selected.append(img)
+
+    if args.dry_run:
+        print(f"DRY-RUN: would delete {len(selected)} cache image(s) — NOTHING deleted")
+        for img in selected:
+            print(f"  - {img.id}  {img.labels.get(LABEL_CACHE_KEY, '?')}  [{img.labels.get(LABEL_DISTRO, '?')}]")
+        return 0
+
+    deleted: list[str] = []
+    failures: list[tuple[str, str]] = []
+    for img in selected:
+        try:
+            provider.delete_image(img.id)
+            deleted.append(img.id)
+        except ProviderError as exc:
+            failures.append((img.id, str(exc)))
+
+    print(f"reaped {len(deleted)} cache image(s); {len(failures)} failed")
+    for img_id in deleted:
+        print(f"  - deleted {img_id}")
+    for img_id, reason in failures:
+        print(f"  - FAILED {img_id}: {reason}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+def _created_before(image: Image, cutoff: object) -> bool:
+    """``True`` iff ``image.created`` parses to an instant before ``cutoff``.
+
+    A cache image's ``created`` is a provider ISO-8601 string. A blank/unparseable
+    ``created`` fails the predicate (kept — never reaped on an age check we cannot
+    verify). ``cutoff`` is the already-parsed ``--older-than`` datetime.
+    """
+    from datetime import datetime
+
+    if not image.created:
+        return False
+    try:
+        created = datetime.fromisoformat(image.created)
+    except ValueError:
+        return False
+    assert isinstance(cutoff, datetime)
+    return created < cutoff
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     run_id = make_run_id(args.run_token)
     try:
@@ -772,6 +921,29 @@ def build_parser() -> argparse.ArgumentParser:
     reap_p = sub.add_parser("reap", help="destroy all hosts for a run-token (orphan backstop)")
     reap_p.add_argument("--run-token", required=True, help="the run-token whose hosts to destroy")
     reap_p.set_defaults(func=_cmd_reap)
+
+    reap_images_p = sub.add_parser(
+        "reap-images", help="reap cached snapshot images by --distro / --older-than / --superseded (best-effort)"
+    )
+    reap_images_p.add_argument(
+        "--distro", default="", help="scope to cached images of this distro key (an explicit per-distro cache clear)"
+    )
+    reap_images_p.add_argument(
+        "--older-than", default="",
+        help="ISO-8601 cutoff: reap images whose creation parses to before it (validated fail-closed; no clock read)",
+    )
+    reap_images_p.add_argument(
+        "--superseded", action="store_true",
+        help="reap off-current-key images (resolves each group's current key; unresolvable groups are kept + warned)",
+    )
+    reap_images_p.add_argument(
+        "--operator", default="probe",
+        help="operator the cache key is derived from; MUST match the build-time --operator (default: probe)",
+    )
+    reap_images_p.add_argument(
+        "--dry-run", action="store_true", help="report what WOULD be deleted and delete nothing (the preview/safety gate)"
+    )
+    reap_images_p.set_defaults(func=_cmd_reap_images)
     return p
 
 
