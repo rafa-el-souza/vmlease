@@ -21,7 +21,7 @@ import tempfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from vmlease.model import Host
+from vmlease.model import Host, Image
 
 if TYPE_CHECKING:
     from vmlease.model import HostSpec
@@ -42,6 +42,16 @@ class ProviderError(RuntimeError):
     """A provider operation failed (non-zero CLI exit, unparseable output)."""
 
 
+class ProviderQuotaError(ProviderError):
+    """The provider refused an image create because its snapshot limit is reached.
+
+    The agnostic signal (D1): ``create_image`` translates the provider's
+    resource-limit error into this typed subclass so layers above the seam catch
+    it generically — the Hetzner ``resource_limit_exceeded`` stderr match stays
+    impl-internal and no provider string escapes.
+    """
+
+
 @runtime_checkable
 class Provider(Protocol):
     """The cloud seam the runner depends on. Mock this in tests."""
@@ -56,6 +66,28 @@ class Provider(Protocol):
 
     def list_labeled(self, run_id: str) -> list[Host]:
         """Return every live VM carrying this run's ``vmlease=<run-id>`` label."""
+        ...
+
+    def create_image(self, server_id: str, description: str, labels: dict[str, str]) -> Image:
+        """Snapshot ``server_id`` into an :class:`Image`; ``labels`` applied atomically.
+
+        Labels MUST be applied in the create call so a CLI-timeout orphan is
+        still labelled and reap-findable. Raises :class:`ProviderQuotaError` when
+        the provider's snapshot limit is reached, :class:`ProviderError` on any
+        other failure.
+        """
+        ...
+
+    def list_images(self, selector: str) -> list[Image]:
+        """Return every snapshot :class:`Image` matching ``selector`` (a label query)."""
+        ...
+
+    def delete_image(self, image_id: str) -> None:
+        """Delete one image. MUST be idempotent (a not-found delete is success)."""
+        ...
+
+    def power_off(self, server_id: str) -> None:
+        """Power a server off. MUST be idempotent (an already-off host is success)."""
         ...
 
 
@@ -169,6 +201,109 @@ def _host_from_server(server: dict[str, object]) -> Host:
 
 
 # --------------------------------------------------------------------------- #
+# Snapshot image argv builders (pure — unit-tested without any subprocess)
+# --------------------------------------------------------------------------- #
+def build_create_image_argv(server_id: str, description: str, labels: dict[str, str]) -> list[str]:
+    """argv for ``hcloud server create-image --type snapshot`` from a live server.
+
+    Pure: builds the command without running it. The labels are applied **in the
+    create call** (atomic per D1's error rule): a CLI-timeout orphan image is
+    still labelled and so ``reap-images``-findable — only an unlabelled image
+    would be a true leak. ``create-image`` has NO ``--output json`` (like
+    ``server create``); the impl scrapes the new image id from stdout text, then
+    describes it for the full :class:`Image`.
+    """
+    return [
+        "hcloud",
+        "server",
+        "create-image",
+        "--type",
+        "snapshot",
+        "--description",
+        description,
+        *_labels_args(labels),
+        server_id,
+    ]
+
+
+def build_list_images_argv(selector: str) -> list[str]:
+    """argv for ``hcloud image list`` filtered to a label selector, snapshots only."""
+    return [
+        "hcloud",
+        "image",
+        "list",
+        "--selector",
+        selector,
+        "--type",
+        "snapshot",
+        "--output",
+        "json",
+    ]
+
+
+def build_describe_image_argv(image_id: str) -> list[str]:
+    """argv for ``hcloud image describe <id> --output json`` (the create follow-up)."""
+    return ["hcloud", "image", "describe", image_id, "--output", "json"]
+
+
+def build_delete_image_argv(image_id: str) -> list[str]:
+    """argv for ``hcloud image delete`` by image id."""
+    return ["hcloud", "image", "delete", image_id]
+
+
+def build_poweroff_argv(server_id: str) -> list[str]:
+    """argv for ``hcloud server poweroff`` by server id."""
+    return ["hcloud", "server", "poweroff", server_id]
+
+
+def parse_image_list(stdout: str) -> list[Image]:
+    """Parse ``hcloud image list --output json`` into :class:`Image` objects.
+
+    Mirrors :func:`parse_list_output`: malformed JSON or a non-array document
+    raises :class:`ProviderError`; non-dict array elements are skipped.
+    """
+    try:
+        doc = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"unparseable image list output: {exc}") from exc
+    if not isinstance(doc, list):
+        raise ProviderError(f"image list output is not a JSON array: {stdout[:200]!r}")
+    return [_image_from_dict(i) for i in doc if isinstance(i, dict)]
+
+
+def parse_image_describe(stdout: str) -> Image:
+    """Parse ``hcloud image describe --output json`` (a single object) into an :class:`Image`."""
+    try:
+        doc = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"unparseable image describe output: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ProviderError(f"image describe output is not a JSON object: {stdout[:200]!r}")
+    return _image_from_dict(doc)
+
+
+def _image_from_dict(image: dict[str, object]) -> Image:
+    """Extract the ``(id, labels, created, disk_size, arch)`` shape from an hcloud image dict.
+
+    Defensive about field naming/absence: the disk bound prefers ``disk_size``
+    (the restore-onto rule, D9) and falls back to ``image_size`` (billable GB);
+    ``architecture`` is the arch; both default safely when absent or malformed.
+    """
+    image_id = image.get("id")
+    if image_id is None:
+        raise ProviderError(f"image object missing id: {image!r}")
+    raw_labels = image.get("labels")
+    labels = {str(k): str(v) for k, v in raw_labels.items()} if isinstance(raw_labels, dict) else {}
+    created = str(image.get("created") or "")
+    size_raw = image.get("disk_size")
+    if not isinstance(size_raw, (int, float)):
+        size_raw = image.get("image_size")
+    disk_size = float(size_raw) if isinstance(size_raw, (int, float)) else 0.0
+    arch = str(image.get("architecture") or "")
+    return Image(id=str(image_id), created=created, disk_size=disk_size, arch=arch, labels=labels)
+
+
+# --------------------------------------------------------------------------- #
 # The Hetzner implementation (subprocess; exercised via an injected fake runner)
 # --------------------------------------------------------------------------- #
 class HetznerProvider:
@@ -236,6 +371,75 @@ class HetznerProvider:
         if proc.returncode != 0:
             raise ProviderError(f"hcloud server list failed ({proc.returncode}): {proc.stderr}")
         return parse_list_output(proc.stdout)
+
+    def create_image(self, server_id: str, description: str, labels: dict[str, str]) -> Image:
+        """Snapshot a server, labels applied atomically; describe the result.
+
+        ``create-image`` has no ``--output json`` (like ``server create``), so the
+        new image id is scraped from stdout text and the full :class:`Image` is
+        populated by a follow-up ``hcloud image describe <id> -o json``. The
+        provider snapshot-limit error is matched on the **code**
+        ``resource_limit_exceeded`` in stderr (hcloud-go formats
+        ``"<msg> (resource_limit_exceeded)"`` — the human ``<msg>`` varies by
+        resource, so we never match it) and raised as :class:`ProviderQuotaError`.
+        """
+        proc = self._run(build_create_image_argv(server_id, description, labels), None)
+        if proc.returncode != 0:
+            stderr = proc.stderr or ""
+            if "resource_limit_exceeded" in stderr:
+                raise ProviderQuotaError(
+                    f"hcloud server create-image hit the snapshot limit: {stderr}"
+                )
+            raise ProviderError(f"hcloud server create-image failed ({proc.returncode}): {stderr}")
+        image_id = _scrape_image_id(proc.stdout)
+        if image_id is None:
+            raise ProviderError(
+                f"could not parse image id from create-image output: {proc.stdout[:200]!r}"
+            )
+        describe = self._run(build_describe_image_argv(image_id), None)
+        if describe.returncode != 0:
+            raise ProviderError(
+                f"hcloud image describe failed ({describe.returncode}): {describe.stderr}"
+            )
+        return parse_image_describe(describe.stdout)
+
+    def list_images(self, selector: str) -> list[Image]:
+        proc = self._run(build_list_images_argv(selector), None)
+        if proc.returncode != 0:
+            raise ProviderError(f"hcloud image list failed ({proc.returncode}): {proc.stderr}")
+        return parse_image_list(proc.stdout)
+
+    def delete_image(self, image_id: str) -> None:
+        """Delete an image. Idempotent: a not-found delete (already reaped) is success."""
+        proc = self._run(build_delete_image_argv(image_id), self._delete_timeout)
+        err = (proc.stderr or "").lower()
+        if proc.returncode == 0 or "not found" in err:
+            return
+        raise ProviderError(f"hcloud image delete failed ({proc.returncode}): {proc.stderr}")
+
+    def power_off(self, server_id: str) -> None:
+        """Power a server off. Idempotent: an already-off host is success."""
+        proc = self._run(build_poweroff_argv(server_id), self._delete_timeout)
+        err = (proc.stderr or "").lower()
+        if proc.returncode == 0 or "already off" in err or "is off" in err or "not found" in err:
+            return
+        raise ProviderError(f"hcloud server poweroff failed ({proc.returncode}): {proc.stderr}")
+
+
+def _scrape_image_id(stdout: str) -> str | None:
+    """Scrape the new image id from ``hcloud server create-image`` plain-text output.
+
+    ``create-image`` prints (observed on a real host)::
+
+        Image 12345678 created from server 9 (...)
+
+    The first standalone run of digits is the image id; ``None`` if absent.
+    """
+    match = re.search(r"Image\s+(\d+)\s+created", stdout)
+    if match:
+        return match.group(1)
+    fallback = re.search(r"\b(\d+)\b", stdout)
+    return fallback.group(1) if fallback else None
 
 
 def _default_runner(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:

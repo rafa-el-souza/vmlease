@@ -148,6 +148,41 @@ class Host:
 
 
 @dataclass(frozen=True)
+class Image:
+    """A provider snapshot image as the provider reports it back.
+
+    The provider-agnostic cache artifact (D1): everything above the provider
+    (``imagecache`` / ``safety`` / ``cli`` / ``runner``) speaks only this type,
+    never ``hcloud`` JSON. Frozen pure data, no I/O, no clock.
+
+    Attributes:
+        id: Provider-unique image id (the restore selector — ``server create
+            --image <id>``).
+        labels: Key/value labels on the image (the query index over the hashed
+            cache key — ``vmlease-purpose=image-cache``, ``vmlease-cache-key``,
+            etc.). The persistent image deliberately does NOT carry the
+            ephemeral ``vmlease=<run-id>`` reap label.
+        created: The provider's creation timestamp as an **ISO-8601 UTC string**
+            verbatim (e.g. ``"2024-04-25T13:26:27+00:00"``). Stored as text, not
+            a :class:`datetime`: age comparisons (``reap-images --older-than``)
+            parse it on demand, so the library reads no clock and stays
+            deterministic.
+        disk_size: The snapshot's disk size in GB. The restore disk-bound (D9):
+            a snapshot restores only onto a server whose disk ≥ this value (a
+            mismatch is a graceful cache miss, never an error).
+        arch: The CPU architecture the image targets (e.g. ``"x86"`` /
+            ``"arm"``). The only hard restore match — already captured in the
+            content key via the base image id.
+    """
+
+    id: str
+    created: str
+    disk_size: float
+    arch: str
+    labels: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     """The captured outcome of one probe on one host.
 

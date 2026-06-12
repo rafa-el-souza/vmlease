@@ -42,7 +42,7 @@ from vmlease import (
     workload,
 )
 from vmlease import battery as battery_mod
-from vmlease.model import Host, HostSpec, Probe, ProbeResult, ProbeTag
+from vmlease.model import Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
 
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +57,12 @@ class FakeProvider:
         self.destroyed: list[Host] = []
         self._live: dict[str, Host] = {}
         self._lock = threading.Lock()
+        # snapshot ops (downstream milestones drive the cache through these):
+        self.images: dict[str, Image] = {}
+        self.created_images: list[tuple[str, str, dict[str, str]]] = []
+        self.deleted_images: list[str] = []
+        self.powered_off: list[str] = []
+        self._image_seq = 0
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         # each host gets a DISTINCT ip so a parallel run mirrors reality.
@@ -75,6 +81,42 @@ class FakeProvider:
     def list_labeled(self, run_id: str) -> list[Host]:
         sel = f"{safety.LABEL_KEY}={run_id}"
         return [h for h in self._live.values() if f"{safety.LABEL_KEY}={h.labels.get(safety.LABEL_KEY)}" == sel]
+
+    def create_image(self, server_id: str, description: str, labels: dict[str, str]) -> Image:
+        # labels applied atomically (mirrors the real provider): the returned
+        # Image carries exactly the labels the caller passed, indexed in-memory.
+        with self._lock:
+            self._image_seq += 1
+            image_id = f"img-{self._image_seq}"
+            image = Image(
+                id=image_id,
+                created="2024-01-01T00:00:00+00:00",
+                disk_size=40.0,  # a plausible default builder disk (GB)
+                arch="x86",
+                labels=dict(labels),
+            )
+            self.images[image_id] = image
+            self.created_images.append((server_id, description, dict(labels)))
+        return image
+
+    def list_images(self, selector: str) -> list[Image]:
+        # selector is "k=v"; match images whose label k equals v (the query index).
+        with self._lock:
+            if "=" not in selector:
+                return list(self.images.values())
+            key, _, value = selector.partition("=")
+            return [img for img in self.images.values() if img.labels.get(key) == value]
+
+    def delete_image(self, image_id: str) -> None:
+        # idempotent: deleting an absent image is success (concurrent prune/reap race).
+        with self._lock:
+            self.deleted_images.append(image_id)
+            self.images.pop(image_id, None)
+
+    def power_off(self, server_id: str) -> None:
+        # idempotent: powering off an already-off (or absent) host is success.
+        with self._lock:
+            self.powered_off.append(server_id)
 
 
 def _fake_subprocess(
@@ -388,6 +430,75 @@ class TestProviderArgv(unittest.TestCase):
         with self.assertRaises(providers.ProviderError):
             providers.parse_list_output("{not json")
 
+    # --- snapshot image argv builders (pure) --------------------------------
+    def test_build_create_image_argv_shape_and_atomic_labels(self) -> None:
+        argv = providers.build_create_image_argv("99", "v1-arch-snap", {"vmlease-cache-key": "k", "a": "b"})
+        self.assertEqual(argv[:5], ["hcloud", "server", "create-image", "--type", "snapshot"])
+        self.assertEqual(argv[argv.index("--description") + 1], "v1-arch-snap")
+        # labels in the create call (atomic), sorted, server id last
+        self.assertLess(argv.index("a=b"), argv.index("vmlease-cache-key=k"))
+        self.assertEqual(argv[-1], "99")
+        self.assertIn("--label", argv)
+
+    def test_build_list_images_argv_snapshot_json(self) -> None:
+        argv = providers.build_list_images_argv("vmlease-purpose=image-cache")
+        self.assertEqual(
+            argv,
+            ["hcloud", "image", "list", "--selector", "vmlease-purpose=image-cache",
+             "--type", "snapshot", "--output", "json"],
+        )
+
+    def test_build_describe_delete_poweroff_argv(self) -> None:
+        self.assertEqual(providers.build_describe_image_argv("7"), ["hcloud", "image", "describe", "7", "--output", "json"])
+        self.assertEqual(providers.build_delete_image_argv("7"), ["hcloud", "image", "delete", "7"])
+        self.assertEqual(providers.build_poweroff_argv("7"), ["hcloud", "server", "poweroff", "7"])
+
+    def test_parse_image_list(self) -> None:
+        out = json.dumps([
+            {"id": 11, "labels": {"vmlease-cache-key": "k1"}, "created": "2024-04-25T13:26:27+00:00",
+             "disk_size": 40, "architecture": "x86"},
+            "garbage",
+            {"id": 12, "labels": {}, "created": "2024-05-01T00:00:00+00:00", "image_size": 1.5, "architecture": "arm"},
+        ])
+        images = providers.parse_image_list(out)
+        self.assertEqual([i.id for i in images], ["11", "12"])
+        self.assertEqual(images[0].created, "2024-04-25T13:26:27+00:00")
+        self.assertEqual(images[0].disk_size, 40.0)
+        self.assertEqual(images[0].arch, "x86")
+        self.assertEqual(images[0].labels, {"vmlease-cache-key": "k1"})
+        # disk_size falls back to image_size when disk_size is absent
+        self.assertEqual(images[1].disk_size, 1.5)
+        self.assertEqual(images[1].arch, "arm")
+
+    def test_parse_image_list_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list("{not json")
+
+    def test_parse_image_list_not_array_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list(json.dumps({"id": 1}))
+
+    def test_parse_image_describe(self) -> None:
+        out = json.dumps({"id": 5, "labels": {"a": "b"}, "created": "2024-01-02T03:04:05+00:00", "disk_size": 80, "architecture": "x86"})
+        img = providers.parse_image_describe(out)
+        self.assertEqual((img.id, img.disk_size, img.arch), ("5", 80.0, "x86"))
+
+    def test_parse_image_describe_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_describe(json.dumps([1, 2]))
+
+    def test_parse_image_describe_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_describe("{not json")
+
+    def test_image_from_dict_missing_id_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_image_list(json.dumps([{"created": "2024-01-01T00:00:00+00:00"}]))
+
+    def test_image_defaults_when_fields_absent(self) -> None:
+        img = providers.parse_image_list(json.dumps([{"id": 9}]))[0]
+        self.assertEqual((img.created, img.disk_size, img.arch, img.labels), ("", 0.0, "", {}))
+
 
 class TestHetznerProviderImpl(unittest.TestCase):
     def _spec(self) -> model.HostSpec:
@@ -482,6 +593,109 @@ class TestHetznerProviderImpl(unittest.TestCase):
 
     def test_provider_protocol_satisfied(self) -> None:
         self.assertIsInstance(FakeProvider(), providers.Provider)
+
+    # --- snapshot image ops -------------------------------------------------
+    def test_create_image_scrapes_id_then_describes(self) -> None:
+        describe = json.dumps({"id": 42, "labels": {"vmlease-cache-key": "k"}, "created": "2024-04-25T13:26:27+00:00", "disk_size": 40, "architecture": "x86"})
+        seen: list[list[str]] = []
+
+        def scripted(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            if argv[1:3] == ["server", "create-image"]:
+                return subprocess.CompletedProcess(argv, 0, "Image 42 created from server 9\n", "")
+            return subprocess.CompletedProcess(argv, 0, describe, "")
+
+        prov = providers.HetznerProvider(runner=scripted)
+        img = prov.create_image("9", "v1-snap", {"vmlease-cache-key": "k"})
+        self.assertEqual((img.id, img.disk_size, img.arch), ("42", 40.0, "x86"))
+        # labels were applied in the create-image call (atomic), and a describe followed
+        self.assertIn("--label", seen[0])
+        self.assertEqual(seen[1][:4], ["hcloud", "image", "describe", "42"])
+
+    def test_create_image_quota_error_matches_code_not_message(self) -> None:
+        # the human message varies; the CODE resource_limit_exceeded is what's matched
+        stderr = "primary IP limit reached (resource_limit_exceeded, abc-123)"
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", stderr))
+        with self.assertRaises(providers.ProviderQuotaError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_create_image_quota_error_is_provider_error_subclass(self) -> None:
+        self.assertTrue(issubclass(providers.ProviderQuotaError, providers.ProviderError))
+
+    def test_create_image_other_failure_raises_plain_provider_error(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError) as ctx:
+            prov.create_image("9", "v1-snap", {})
+        self.assertNotIsInstance(ctx.exception, providers.ProviderQuotaError)
+
+    def test_create_image_unparseable_id_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "no digits here\n"))
+        with self.assertRaises(providers.ProviderError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_create_image_describe_failure_raises(self) -> None:
+        def scripted(argv: list[str], _timeout: float | None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == ["server", "create-image"]:
+                return subprocess.CompletedProcess(argv, 0, "Image 42 created\n", "")
+            return subprocess.CompletedProcess(argv, 1, "", "describe boom")
+
+        prov = providers.HetznerProvider(runner=scripted)
+        with self.assertRaises(providers.ProviderError):
+            prov.create_image("9", "v1-snap", {})
+
+    def test_list_images_success(self) -> None:
+        out = json.dumps([{"id": 1, "labels": {"vmlease-purpose": "image-cache"}, "created": "2024-01-01T00:00:00+00:00", "disk_size": 40, "architecture": "x86"}])
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, out))
+        images = prov.list_images("vmlease-purpose=image-cache")
+        self.assertEqual([i.id for i in images], ["1"])
+
+    def test_list_images_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.list_images("vmlease-purpose=image-cache")
+
+    def test_list_images_malformed_json_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "{not json"))
+        with self.assertRaises(providers.ProviderError):
+            prov.list_images("vmlease-purpose=image-cache")
+
+    def test_delete_image_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "Image 7 deleted"))
+        prov.delete_image("7")  # no raise
+
+    def test_delete_image_idempotent_on_not_found(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "image not found"))
+        prov.delete_image("7")  # not-found = success, no raise
+
+    def test_delete_image_other_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError):
+            prov.delete_image("7")
+
+    def test_power_off_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, "Server 9 powered off"))
+        prov.power_off("9")  # no raise
+
+    def test_power_off_idempotent_when_already_off(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "server is already off"))
+        prov.power_off("9")  # already-off = success, no raise
+
+    def test_power_off_other_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
+        with self.assertRaises(providers.ProviderError):
+            prov.power_off("9")
+
+    def test_image_ops_bounded_by_delete_timeout(self) -> None:
+        seen: list[float | None] = []
+
+        def capture(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess[str]:
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        prov = providers.HetznerProvider(runner=capture, delete_timeout=37.5)
+        prov.delete_image("7")
+        prov.power_off("9")
+        self.assertEqual(seen, [37.5, 37.5])
 
 
 # --------------------------------------------------------------------------- #
