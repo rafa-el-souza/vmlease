@@ -41,9 +41,9 @@ its resources can be re-found for status/reap.
 The system SHALL apply the `vmlease=<run-id>` label to every provisioned **run host** — the ephemeral,
 billable servers of a run, **including the throwaway builder a `build-image` provisions** — and SHALL
 expose that label as the selector used to list and reap a run's hosts. **Persistent cache images are NOT
-run hosts**: they are content-addressed and carry their own `vmlease-image=…` label set instead of the
-ephemeral per-run label, and so are excluded from per-run reap (see "Cached images are reaped as a
-persistent class").
+run hosts**: they are content-addressed and carry their own image-class label set (`vmlease-purpose=image-cache`,
+`vmlease-cache-key`, …) instead of the ephemeral per-run label, and so are excluded from per-run reap (see
+"Cached images are reaped as a persistent class").
 
 #### Scenario: Run hosts are reap-discoverable by label
 
