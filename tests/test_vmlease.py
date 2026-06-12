@@ -1755,13 +1755,16 @@ class TestMinimalCloudInit(unittest.TestCase):
         out = cloudinit.render_minimal_cloudinit("probe", "ssh-ed25519 KEY\n")
         self.assertIn("ssh-ed25519 KEY\nPUBKEY", out)
 
-    def test_sysprep_truncates_machine_id_and_clears_dbus(self) -> None:
-        # F-009: truncate (NOT delete-and-leave-absent) /etc/machine-id so
-        # systemd regenerates a unique id per restore; clear the dbus copy too.
-        self.assertIn("truncate -s 0 /etc/machine-id", cloudinit.SYSPREP_COMMAND)
-        self.assertNotIn("rm -f /etc/machine-id", cloudinit.SYSPREP_COMMAND)
+    def test_sysprep_removes_machine_id_and_clears_dbus(self) -> None:
+        # E-012 10.1 (real-host, 2026-06-12): REMOVE (rm -f, leave ABSENT), NOT
+        # truncate. An empty-but-present /etc/machine-id is re-committed with the
+        # builder's id during the graceful-poweroff shutdown, so every restore
+        # shared it; an absent file regenerates a unique id per restore (validated:
+        # distinct machine-ids on distinct hosts). Clear the dbus copy/symlink too.
+        self.assertIn("rm -f /etc/machine-id", cloudinit.SYSPREP_COMMAND)
+        self.assertNotIn("truncate", cloudinit.SYSPREP_COMMAND)
         self.assertIn("/var/lib/dbus/machine-id", cloudinit.SYSPREP_COMMAND)
-        # ``;`` (not ``&&``) so a missing dbus file can't fail sysprep
+        # ``;`` (not ``&&``) so neither ``rm -f`` can gate the other
         self.assertIn(";", cloudinit.SYSPREP_COMMAND)
         self.assertNotIn("&&", cloudinit.SYSPREP_COMMAND)
 

@@ -32,12 +32,17 @@ _MINIMAL_TEMPLATE = "cloudinit-minimal.sh.tmpl"
 # poweroff/snapshot. A snapshot freezes /etc/machine-id into the image, so every
 # host restored from it would otherwise share one machine-id — breaking systemd,
 # journald and dbus (which key state off it) across restored hosts (F-009). We
-# truncate it (NOT delete-and-leave-absent): an empty /etc/machine-id signals
-# systemd to regenerate a fresh, unique id on the next boot. The dbus copy is
-# cleared too so it is re-derived from the new machine-id. ``;`` (not ``&&``)
-# separates the two so a missing dbus file can never fail sysprep (``rm -f`` is
-# already no-fail; the ``;`` keeps the truncate result from gating it).
-SYSPREP_COMMAND: str = "sudo truncate -s 0 /etc/machine-id ; sudo rm -f /var/lib/dbus/machine-id"
+# REMOVE it (``rm -f``, leaving it ABSENT): a *missing* /etc/machine-id triggers
+# systemd first-boot regeneration of a fresh, unique id per restored host.
+# Truncating to empty is NOT enough — it was the original bug (E-012 10.1,
+# real-host 2026-06-12): the empty-but-PRESENT file is re-committed with the
+# builder's in-memory id during systemd's graceful-poweroff shutdown, so the
+# snapshot freezes one shared id and every restore inherits it; an ABSENT file
+# gives the shutdown nothing to write back. Validated end-to-end: ``rm`` →
+# distinct machine-ids on distinct hosts; ``truncate`` → all restores shared the
+# builder's id. The dbus copy/symlink is removed too so it re-derives from the new
+# id. ``;`` (not ``&&``) separates the two so neither ``rm -f`` can gate the other.
+SYSPREP_COMMAND: str = "sudo rm -f /etc/machine-id ; sudo rm -f /var/lib/dbus/machine-id"
 
 
 class CloudInitError(ValueError):
