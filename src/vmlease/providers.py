@@ -90,6 +90,15 @@ class Provider(Protocol):
         """Power a server off. MUST be idempotent (an already-off host is success)."""
         ...
 
+    def server_status(self, server_id: str) -> str:
+        """Return a server's power status (e.g. ``"running"`` / ``"off"``).
+
+        The wait-for-off seam (D6/G2): ``build-image`` polls this after
+        ``power_off`` until the host reaches ``"off"`` before snapshotting, so a
+        running host is never captured. Raises :class:`ProviderError` on failure.
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # Hetzner argv builders (pure — unit-tested without any subprocess)
@@ -256,6 +265,15 @@ def build_poweroff_argv(server_id: str) -> list[str]:
     return ["hcloud", "server", "poweroff", server_id]
 
 
+def build_describe_server_argv(server_id: str) -> list[str]:
+    """argv for ``hcloud server describe <id> --output json`` (the wait-for-off poll).
+
+    Distinct from :func:`build_describe_image_argv` — this describes a *server*
+    (to read its power ``status``), not an image.
+    """
+    return ["hcloud", "server", "describe", server_id, "--output", "json"]
+
+
 def parse_image_list(stdout: str) -> list[Image]:
     """Parse ``hcloud image list --output json`` into :class:`Image` objects.
 
@@ -280,6 +298,24 @@ def parse_image_describe(stdout: str) -> Image:
     if not isinstance(doc, dict):
         raise ProviderError(f"image describe output is not a JSON object: {stdout[:200]!r}")
     return _image_from_dict(doc)
+
+
+def parse_server_status(stdout: str) -> str:
+    """Parse the ``status`` field from ``hcloud server describe -o json``.
+
+    Mirrors :func:`parse_list_output`: malformed JSON, a non-object document, or a
+    missing ``status`` field raises :class:`ProviderError`.
+    """
+    try:
+        doc = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"unparseable server describe output: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ProviderError(f"server describe output is not a JSON object: {stdout[:200]!r}")
+    status = doc.get("status")
+    if not isinstance(status, str):
+        raise ProviderError(f"server describe output missing status: {stdout[:200]!r}")
+    return status
 
 
 def _image_from_dict(image: dict[str, object]) -> Image:
@@ -424,6 +460,13 @@ class HetznerProvider:
         if proc.returncode == 0 or "already off" in err or "is off" in err or "not found" in err:
             return
         raise ProviderError(f"hcloud server poweroff failed ({proc.returncode}): {proc.stderr}")
+
+    def server_status(self, server_id: str) -> str:
+        """Describe a server and return its power ``status``; raise on non-zero exit."""
+        proc = self._run(build_describe_server_argv(server_id), self._delete_timeout)
+        if proc.returncode != 0:
+            raise ProviderError(f"hcloud server describe failed ({proc.returncode}): {proc.stderr}")
+        return parse_server_status(proc.stdout)
 
 
 def _scrape_image_id(stdout: str) -> str | None:

@@ -64,6 +64,8 @@ class FakeProvider:
         self.deleted_images: list[str] = []
         self.powered_off: list[str] = []
         self._image_seq = 0
+        # per-server power state (default "running"; power_off flips it to "off").
+        self._power: dict[str, str] = {}
 
     def create_with_cloudinit(self, spec: HostSpec, cloud_init: str) -> Host:
         # each host gets a DISTINCT ip so a parallel run mirrors reality.
@@ -118,6 +120,12 @@ class FakeProvider:
         # idempotent: powering off an already-off (or absent) host is success.
         with self._lock:
             self.powered_off.append(server_id)
+            self._power[server_id] = "off"
+
+    def server_status(self, server_id: str) -> str:
+        # default "running"; power_off flips it to "off".
+        with self._lock:
+            return self._power.get(server_id, "running")
 
 
 def _fake_subprocess(
@@ -481,6 +489,28 @@ class TestProviderArgv(unittest.TestCase):
         self.assertEqual(providers.build_delete_image_argv("7"), ["hcloud", "image", "delete", "7"])
         self.assertEqual(providers.build_poweroff_argv("7"), ["hcloud", "server", "poweroff", "7"])
 
+    def test_build_describe_server_argv(self) -> None:
+        self.assertEqual(
+            providers.build_describe_server_argv("7"),
+            ["hcloud", "server", "describe", "7", "--output", "json"],
+        )
+
+    def test_parse_server_status(self) -> None:
+        self.assertEqual(providers.parse_server_status(json.dumps({"status": "off"})), "off")
+        self.assertEqual(providers.parse_server_status(json.dumps({"status": "running"})), "running")
+
+    def test_parse_server_status_bad_json_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status("{not json")
+
+    def test_parse_server_status_not_object_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status(json.dumps([1, 2]))
+
+    def test_parse_server_status_missing_status_raises(self) -> None:
+        with self.assertRaises(providers.ProviderError):
+            providers.parse_server_status(json.dumps({"id": 9}))
+
     def test_parse_image_list(self) -> None:
         out = json.dumps([
             {"id": 11, "labels": {"vmlease-cache-key": "k1"}, "created": "2024-04-25T13:26:27+00:00",
@@ -712,6 +742,15 @@ class TestHetznerProviderImpl(unittest.TestCase):
         prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "forbidden"))
         with self.assertRaises(providers.ProviderError):
             prov.power_off("9")
+
+    def test_server_status_success(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(0, json.dumps({"status": "off"})))
+        self.assertEqual(prov.server_status("9"), "off")
+
+    def test_server_status_failure_raises(self) -> None:
+        prov = providers.HetznerProvider(runner=_fake_provider_runner(1, "", "boom"))
+        with self.assertRaises(providers.ProviderError):
+            prov.server_status("9")
 
     def test_image_ops_bounded_by_delete_timeout(self) -> None:
         seen: list[float | None] = []
@@ -4119,6 +4158,130 @@ class TestImageCacheSupersession(unittest.TestCase):
             [a, b], distro.get_profile, "probe", _null_deps(), lambda _m: None,
         )
         self.assertEqual(len(keys), 1)
+
+
+class TestWaitUntilOff(unittest.TestCase):
+    def test_returns_when_off(self) -> None:
+        prov = FakeProvider()
+        prov.power_off("9")  # flips state to "off"
+        slept: list[float] = []
+        runner._wait_until_off(prov, "9", attempts=5, sleep=slept.append)
+        self.assertEqual(slept, [])  # off on the first poll → no sleep
+
+    def test_polls_then_returns_when_it_turns_off(self) -> None:
+        # status "running" for the first two polls, then "off".
+        class _Slow(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self._polls = 0
+
+            def server_status(self, server_id: str) -> str:
+                self._polls += 1
+                return "off" if self._polls >= 3 else "running"
+
+        slept: list[float] = []
+        runner._wait_until_off(_Slow(), "9", attempts=5, sleep=slept.append)
+        self.assertEqual(len(slept), 2)  # slept between the first two running polls
+
+    def test_timeout_raises(self) -> None:
+        # never off → exhausts the attempt budget → raises (G2), no real clock.
+        prov = FakeProvider()  # default status "running"
+        slept: list[float] = []
+        with self.assertRaises(runner.PoweroffTimeoutError):
+            runner._wait_until_off(prov, "9", attempts=3, sleep=slept.append)
+        self.assertEqual(len(slept), 2)  # slept between polls but not after the last
+
+
+class TestBuildOneImage(unittest.TestCase):
+    def _spec(self, distro_key: str = "ubuntu") -> HostSpec:
+        return HostSpec(
+            name=f"vmlease-build-{distro_key}",
+            image=distro.get_profile(distro_key).default_image,
+            server_type="cpx22",
+            distro_key=distro_key,
+            labels={"vmlease": "build-run"},
+        )
+
+    def _build(
+        self,
+        prov: providers.Provider,
+        fssh: ssh.SshRunner,
+        *,
+        description: str = "v1-ubuntu-key",
+        labels: dict[str, str] | None = None,
+        distro_key: str = "ubuntu",
+    ) -> tuple[Image, list[str]]:
+        labels = labels if labels is not None else {"vmlease-cache-key": "v1-ubuntu-key"}
+        note_sink: list[str] = []
+        on_ready = runner.make_snapshot_on_ready(
+            description, labels, sleep=lambda _s: None, poweroff_attempts=5
+        )
+        with tempfile.TemporaryDirectory() as d:
+            image = runner.build_one_image(
+                self._spec(distro_key),
+                distro.get_profile(distro_key),
+                prov,
+                lambda _o, _k: fssh,
+                _fake_keypair(Path(d)),
+                "probe",
+                None,
+                on_ready=on_ready,
+                note_sink=note_sink,
+            )
+        return image, note_sink
+
+    def test_happy_build_returns_labelled_image_and_tears_down(self) -> None:
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        image, note_sink = self._build(prov, fssh)
+        # returns an Image carrying the supplied labels (atomic create)
+        self.assertEqual(image.labels.get("vmlease-cache-key"), "v1-ubuntu-key")
+        self.assertEqual(len(prov.created_images), 1)
+        # the builder went off, then was torn down
+        self.assertEqual(prov.powered_off, ["id-vmlease-build-ubuntu"])
+        self.assertEqual(prov.server_status("id-vmlease-build-ubuntu"), "off")
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])
+        self.assertEqual(note_sink, [])  # clean teardown → no note
+        # sysprep ran first over SSH
+        self.assertEqual(fssh.ran[0], "_sysprep")
+
+    def test_sysprep_failure_aborts_before_snapshot_and_tears_down(self) -> None:
+        # G1: a non-zero sysprep exit raises, NO create_image, builder destroyed.
+        prov = FakeProvider()
+        fssh = FakeSshRunner(fail_on="_sysprep")
+        with self.assertRaises(RuntimeError):
+            self._build(prov, fssh)
+        self.assertEqual(prov.created_images, [])  # never snapshotted
+        self.assertEqual(prov.powered_off, [])  # never even powered off
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])  # torn down
+
+    def test_poweroff_never_off_aborts_before_snapshot_and_tears_down(self) -> None:
+        # G2: the host never reaches off → wait-for-off raises, no create_image.
+        class _NeverOff(FakeProvider):
+            def power_off(self, server_id: str) -> None:
+                self.powered_off.append(server_id)  # records, but stays "running"
+
+        prov = _NeverOff()
+        fssh = FakeSshRunner()
+        with self.assertRaises(runner.PoweroffTimeoutError):
+            self._build(prov, fssh)
+        self.assertEqual(prov.created_images, [])  # never snapshotted
+        self.assertEqual(len(prov.powered_off), 1)  # poweroff was attempted
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])  # torn down
+
+    def test_teardown_failure_surfaces_note_for_next_milestone(self) -> None:
+        # a failing builder teardown is surfaced via note_sink (not swallowed,
+        # not raised) so _cmd_build_image can route it to a non-zero exit.
+        class _DestroyFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                super().destroy(host)
+                raise providers.ProviderError("request timeout")
+
+        prov = _DestroyFails()
+        image, note_sink = self._build(prov, FakeSshRunner())
+        self.assertEqual(image.labels.get("vmlease-cache-key"), "v1-ubuntu-key")  # image kept
+        self.assertEqual(len(note_sink), 1)
+        self.assertIn(runner.TEARDOWN_WARNING_PREFIX, note_sink[0])
 
 
 if __name__ == "__main__":

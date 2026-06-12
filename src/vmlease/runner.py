@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
-from vmlease.cloudinit import render_cloudinit, render_minimal_cloudinit
+from vmlease.cloudinit import SYSPREP_COMMAND, render_cloudinit, render_minimal_cloudinit
 from vmlease.distro import get_profile
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
@@ -21,7 +21,7 @@ from vmlease.imagecache import (
     PURPOSE_IMAGE_CACHE,
     content_key,
 )
-from vmlease.model import HostRun, HostSpec, PlanItem
+from vmlease.model import HostRun, HostSpec, PlanItem, Probe, ProbeTag
 from vmlease.safety import CostGuard, make_run_id, run_label, validate_remote_dest, validate_upload_source
 
 if TYPE_CHECKING:
@@ -512,3 +512,148 @@ def _first_matching_image(
         ):
             return image
     return None
+
+
+# --------------------------------------------------------------------------- #
+# build-image: the snapshot ``on_ready`` tail + the build driver (D6, G1/G2)
+# --------------------------------------------------------------------------- #
+
+# The default bound (number of poll attempts) on the wait-for-off loop. Bounded
+# like ``destroy`` so a host that never powers off becomes an abort (G2), not a
+# hang. The wall-clock is the caller's injected ``sleep`` x attempts; the budget
+# is an attempt count so tests stay clock-free.
+DEFAULT_POWEROFF_ATTEMPTS = 30
+
+
+class PoweroffTimeoutError(RuntimeError):
+    """The host did not reach the ``"off"`` state within the bounded wait (G2).
+
+    Raised by :func:`_wait_until_off` so the snapshot tail aborts before any
+    ``create_image`` — a running host is never snapshotted.
+    """
+
+
+def _wait_until_off(
+    provider: Provider,
+    server_id: str,
+    *,
+    attempts: int = DEFAULT_POWEROFF_ATTEMPTS,
+    sleep: Callable[[float], None],
+    poll_interval: float = 2.0,
+) -> None:
+    """Poll ``provider.server_status`` until ``"off"``; raise on timeout (G2).
+
+    Bounded like :meth:`HetznerProvider.destroy`: at most ``attempts`` polls, with
+    the injected ``sleep`` between them (no real clock — tests pass a no-op sleep
+    and a small attempt budget). On exhaustion raises :class:`PoweroffTimeoutError`
+    so the caller aborts the build and tears the builder down; never silently
+    snapshots a running host. A ``server_status`` that raises (provider failure)
+    propagates — also an abort.
+    """
+    for attempt in range(attempts):
+        if provider.server_status(server_id) == "off":
+            return
+        if attempt < attempts - 1:
+            sleep(poll_interval)
+    raise PoweroffTimeoutError(
+        f"server {server_id} did not reach the off state within {attempts} polls"
+    )
+
+
+def make_snapshot_on_ready(
+    description: str,
+    labels: dict[str, str],
+    *,
+    sleep: Callable[[float], None],
+    poweroff_attempts: int = DEFAULT_POWEROFF_ATTEMPTS,
+) -> OnReady[Image]:
+    """Build the snapshot ``on_ready`` tail: sysprep → poweroff → wait-off → snapshot.
+
+    Returns an ``on_ready(host, ssh, provider) -> Image`` for the group-5 scaffold
+    (D6). The tail, in order:
+
+    1. **Sysprep** (D7/F-009): clear ``/etc/machine-id`` + the dbus id over SSH. A
+       **non-zero exit raises** (G1) — a non-sysprepped host carries a shared
+       machine-id and MUST NEVER be snapshotted. The abort propagates; the scaffold
+       still tears the builder down.
+    2. **Power off** then :func:`_wait_until_off` (G2): a poweroff failure or a
+       wait-for-off timeout raises **before** any ``create_image`` — a running host
+       is never captured.
+    3. **Snapshot**: ``provider.create_image(host.id, description, labels)`` with the
+       ``labels`` applied **in the create call** (atomic, D1) — the caller (the next
+       milestone) supplies the cache-key description + labels.
+
+    ``description`` / ``labels`` are captured here; ``sleep`` is injected so the
+    wait stays clock-free.
+    """
+
+    def on_ready(host: Host, ssh: SshRunner, provider: Provider) -> Image:
+        sysprep = Probe(
+            id="_sysprep",
+            title="sysprep machine-id",
+            command=SYSPREP_COMMAND,
+            tag=ProbeTag.MUTATING_HOST_ROOT,
+        )
+        result = ssh.run_probe(host, sysprep)
+        if result.exit_code != 0:
+            # G1: never snapshot a non-sysprepped host (machine-id would be shared).
+            raise RuntimeError(
+                f"sysprep failed on {host.name} ({host.id}) "
+                f"(exit {result.exit_code}): {result.stderr or result.stdout}"
+            )
+        # G2: poweroff + bounded wait-for-off before the snapshot; any failure here
+        # aborts before create_image.
+        provider.power_off(host.id)
+        _wait_until_off(provider, host.id, attempts=poweroff_attempts, sleep=sleep)
+        return provider.create_image(host.id, description, labels)
+
+    return on_ready
+
+
+def build_one_image(
+    spec: HostSpec,
+    profile: DistroProfile,
+    provider: Provider,
+    ssh_factory: Callable[[str, Keypair], SshRunner],
+    keypair: Keypair,
+    operator: str,
+    rescue_writer: RescueWriter | None,
+    *,
+    on_ready: OnReady[Image],
+    note_sink: list[str],
+) -> Image:
+    """Provision ONE builder, run the snapshot tail, ALWAYS tear the builder down.
+
+    The ``build-image`` driver (D6): it builds the **cold** ``plan_create`` (the
+    full ``render_cloudinit`` prep — ``build-image`` always prepares fully) and
+    runs the group-5 scaffold with the snapshot ``on_ready`` tail. The scaffold's
+    teardown-always ``finally`` reaps the builder regardless of how the body left —
+    a successful snapshot OR an abort (sysprep G1 / poweroff-or-timeout G2 /
+    provider error). Those aborts **propagate as exceptions** (the builder is still
+    torn down); they are deliberately NOT caught-and-swallowed into a success.
+
+    The teardown note is surfaced via ``note_sink`` (the scaffold appends to it in
+    its real ``finally``) so the next milestone's ``_cmd_build_image`` can route a
+    teardown failure to a non-zero exit + reap hint — exactly as the run adapter
+    folds it into a ``HostRun`` detail.
+    """
+
+    def plan_create(_profile: DistroProfile) -> tuple[str, str, bool]:
+        # build-image is ALWAYS cold: the cold default image + the full cloud-init +
+        # the profile's own rescue flag (a rescue-write distro's builder is written
+        # then prepped before the snapshot captures it).
+        cloud_init = render_cloudinit(_profile, operator, keypair.public_key)
+        return _profile.default_image, cloud_init, _profile.needs_rescue_write
+
+    return _with_ready_host(
+        spec,
+        profile,
+        provider,
+        ssh_factory,
+        keypair,
+        operator,
+        rescue_writer,
+        plan_create=plan_create,
+        on_ready=on_ready,
+        note_sink=note_sink,
+    )
