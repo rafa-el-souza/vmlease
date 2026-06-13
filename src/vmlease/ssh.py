@@ -48,10 +48,17 @@ StreamSubprocessRunner = Callable[[list[str], Callable[[str], None], float], int
 # joins it into its ``-e ssh …`` string). ``UserKnownHostsFile=/dev/null`` +
 # ``StrictHostKeyChecking=accept-new`` survive a reused IP carrying a new host key
 # (the run-2 bug); ``BatchMode`` fails fast instead of prompting; ``ConnectTimeout``
-# bounds each attempt.
+# bounds each attempt. ``LogLevel=ERROR`` quiets the per-connect "Permanently added
+# '<ip>' … to the list of known hosts" banner that ``UserKnownHostsFile=/dev/null``
+# + ``accept-new`` make ssh print on EVERY connection — load-bearing now that
+# ``[probe.assert]`` ships stderr assertions (``stderr_empty`` / ``stderr_lacks`` /
+# ``stderr_matches_not``): the banner would otherwise pollute captured probe stderr
+# and make a clean command fail ``stderr_empty``. ``ERROR`` (not ``QUIET``) keeps
+# real ``ERROR``/``FATAL`` connection failures visible.
 _BASE_SSH_OPTS: tuple[str, ...] = (
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "LogLevel=ERROR",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
 )
@@ -117,6 +124,9 @@ def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: s
     SAME IP with a DIFFERENT host key and REFUSE the connection (the run-2
     failure). Discarding the host-key store sidesteps that entirely. ``BatchMode``
     fails fast instead of prompting; a fixed connect timeout bounds each attempt.
+    ``LogLevel=ERROR`` suppresses ssh's per-connect "Permanently added" banner (an
+    INFO message ``accept-new`` emits on every connection) so it does not pollute
+    captured probe stderr, while keeping real ``ERROR``/``FATAL`` failures visible.
     Pure — the impl runs it.
     """
     return [

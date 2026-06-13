@@ -1996,6 +1996,10 @@ class TestSsh(unittest.TestCase):
         # IP with a new host key is never a refused connection (run-2 bug).
         self.assertIn("UserKnownHostsFile=/dev/null", argv)
         self.assertIn("StrictHostKeyChecking=accept-new", argv)
+        # quiet the per-connect "Permanently added" banner (accept-new emits it on
+        # every connection) so it never pollutes captured probe stderr — load-bearing
+        # for the [probe.assert] stderr_empty/stderr_lacks/stderr_matches_not checks.
+        self.assertIn("LogLevel=ERROR", argv)
 
     def test_run_probe_captures_exit(self) -> None:
         r = OpenSshRunnerForTest(_fake_ssh_subprocess(7, "out", "err"))
