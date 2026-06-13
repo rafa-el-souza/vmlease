@@ -2234,6 +2234,22 @@ class TestSsh(unittest.TestCase):
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
         r.wait_until_ready(self._host())  # no raise == ready
 
+    def test_run_probe_runs_command_verbatim_regardless_of_tag(self) -> None:
+        # Scenario #12: the runner executes the command VERBATIM — it does NOT
+        # strip/inject/refuse `sudo` based on the tag. A non-host-root probe whose
+        # command invokes sudo still reaches the transport unchanged; a tag<->sudo
+        # mismatch is lint's concern, not the runner's.
+        captured: list[str] = []
+
+        def capture(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            captured.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None)
+        probe = Probe(id="P", title="t", command="sudo systemctl restart foo", tag=ProbeTag.READ_ONLY)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(captured[-1], "sudo systemctl restart foo")
+
     def test_wait_until_ready_retries_module_probe_transport_blip(self) -> None:
         # Right after the post-reboot oneshot touches the sentinel the host is
         # fresh from a reboot: the module probe can hit a transient SSH transport
@@ -2556,6 +2572,28 @@ class TestResults(unittest.TestCase):
 
     def test_filename_deterministic(self) -> None:
         self.assertEqual(results.results_filename("r1", "20260601T000000Z"), "vmlease-r1-20260601T000000Z.json")
+
+    def test_results_never_reads_the_wall_clock(self) -> None:
+        # Scenario #38: the timestamp is purely caller-supplied; the library reads
+        # NO wall clock (runs stay reproducible; tests pin the filename). Two guards:
+        # (a) the full API still produces output with `time` sabotaged to raise;
+        # (b) the module source has no clock CALL (regression guard, any import style).
+        import inspect
+        import time as _time
+        from unittest import mock
+
+        def _boom(*_a: object, **_k: object) -> float:
+            raise AssertionError("vmlease.results must not read the wall clock")
+
+        with mock.patch.object(_time, "time", _boom), mock.patch.object(_time, "monotonic", _boom):
+            self.assertEqual(results.results_filename("r1", "TS"), "vmlease-r1-TS.json")
+            self.assertIn("TS", results.serialize_run("r1", "TS", [self._run()]))
+            with tempfile.TemporaryDirectory() as d:
+                results.write_results(Path(d) / "out", "r1", "TS", [self._run()])
+
+        src = inspect.getsource(results)
+        for clock_call in ("time.time(", "time.monotonic(", "datetime.now(", "datetime.today(", "utcnow("):
+            self.assertNotIn(clock_call, src, f"results must not call the clock ({clock_call})")
 
     def test_serialize_round_trips(self) -> None:
         text = results.serialize_run("r1", "20260601T000000Z", [self._run()])
