@@ -69,9 +69,12 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from vmlease.model import Battery, Probe, ProbeTag
+from vmlease.assertions import _ASSERTIONS
+from vmlease.model import Assertion, Battery, Probe, ProbeTag
 
-_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when"})
+_PROBE_KEYS = frozenset(
+    {"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when", "assert"}
+)
 _ROOT_KEYS = frozenset({"name", "probe"})
 
 
@@ -115,6 +118,7 @@ class _ProbeSpec:
     run: str | None
     script: str | None
     success_when: str = ""
+    assertions: tuple[Assertion, ...] = ()
 
 
 def parse_battery(text: str) -> _BatterySpec:
@@ -178,6 +182,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
     timeout = _parse_timeout(index, raw)
     success_when = _parse_success_when(index, raw)
+    assertions = _parse_assertions(index, raw)
     run, script = _parse_command_form(index, raw)
     return _ProbeSpec(
         id=str(raw["id"]),
@@ -188,6 +193,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         run=run,
         script=script,
         success_when=success_when,
+        assertions=assertions,
     )
 
 
@@ -250,6 +256,42 @@ def _parse_success_when(index: int, raw: dict[object, object]) -> str:
     return value
 
 
+def _parse_assertions(index: int, raw: dict[object, object]) -> tuple[Assertion, ...]:
+    """Compile the optional ``[probe.assert]`` table into bound :class:`Assertion`s.
+
+    Absent → ``()`` (back-compatible). A present ``assert`` must be a TOML table
+    (dict); each key must name a kind in the ``vmlease.assertions._ASSERTIONS``
+    registry (the registry key set IS the schema — an unknown key is rejected
+    naming it, mirroring the ``_PROBE_KEYS`` unknown-key message). For each known
+    key the kind's ``validate`` then ``build`` run **here, in the pure pass** —
+    so a malformed regex (compiled inside ``validate``/``build`` per D10(I))
+    surfaces as a :class:`BatteryError` at load, not at evaluation. A ``ValueError``
+    from either is re-raised as :class:`BatteryError` naming the probe AND the
+    assertion key (D10(J)).
+    """
+    if "assert" not in raw:
+        return ()
+    table = raw["assert"]
+    if not isinstance(table, dict):
+        raise BatteryError(f"probe #{index} 'assert' must be a table")
+    unknown = set(table) - set(_ASSERTIONS)
+    if unknown:
+        raise BatteryError(
+            f"probe #{index} has unrecognized assertion key(s): {sorted(unknown)}"
+        )
+    built: list[Assertion] = []
+    for key, value in table.items():
+        kind = _ASSERTIONS[key]
+        try:
+            kind.validate(value)
+            built.append(kind.build(value))
+        except ValueError as exc:
+            raise BatteryError(
+                f"probe #{index} assertion {key!r} is malformed: {exc}"
+            ) from exc
+    return tuple(built)
+
+
 def _assert_unique_ids(specs: tuple[_ProbeSpec, ...]) -> None:
     seen: set[str] = set()
     for s in specs:
@@ -292,6 +334,7 @@ def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:
         timeout=spec.timeout,
         source=source,
         success_when=spec.success_when,
+        assertions=spec.assertions,
     )
 
 

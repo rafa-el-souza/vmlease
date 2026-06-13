@@ -319,6 +319,10 @@ class TestModel(unittest.TestCase):
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertIsNone(p.timeout)
 
+    def test_probe_assertions_defaults_empty(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertEqual(p.assertions, ())
+
     def test_probe_source_defaults_empty(self) -> None:
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertEqual(p.source, "")
@@ -980,6 +984,64 @@ class TestBattery(unittest.TestCase):
                 "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
                 "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = 5\n"
             )
+
+    # --- [probe.assert] declarative assertions (§5) ----------------------- #
+    def _with_assert(self, assert_body: str) -> str:
+        """A minimal manifest with an inline ``[probe.assert]`` table body."""
+        return (
+            "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+            "tag = '''read-only'''\nrun = '''c'''\n"
+            f"[probe.assert]\n{assert_body}"
+        )
+
+    def test_parse_assert_absent_is_empty_tuple(self) -> None:
+        # back-compat: a probe without [probe.assert] carries no assertions.
+        spec = battery_mod.parse_battery(_DEMO_BATTERY)
+        self.assertEqual(spec.probes[0].assertions, ())
+
+    def test_parse_assert_unknown_key_rejected_naming_it(self) -> None:
+        # the registry key set IS the schema — an unknown key fails loud.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("bogus_check = 0\n"))
+        self.assertIn("bogus_check", str(ctx.exception))
+
+    def test_parse_assert_not_a_table_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(
+                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nassert = '''nope'''\n"
+            )
+        self.assertIn("assert", str(ctx.exception))
+
+    def test_parse_assert_wrong_shaped_value_rejected_naming_key(self) -> None:
+        # exit expects an int; a string is a shape error (ValueError -> BatteryError).
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("exit = '''x'''\n"))
+        self.assertIn("exit", str(ctx.exception))
+
+    def test_parse_assert_malformed_regex_fails_in_pure_pass(self) -> None:
+        # D10(I): a bad pattern is compiled inside parse_battery (the PURE pass)
+        # and surfaces as BatteryError at load, not at evaluation.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("stdout_matches = '''(unclosed'''\n"))
+        self.assertIn("stdout_matches", str(ctx.exception))
+
+    def test_parse_assert_carried_onto_spec_and_evaluates(self) -> None:
+        spec = battery_mod.parse_battery(
+            self._with_assert("exit = 0\nstdout_has = '''READY'''\n")
+        )
+        self.assertEqual(len(spec.probes[0].assertions), 2)
+        ok = model.Outcome(exit_code=0, stdout="READY now", stderr="")
+        bad = model.Outcome(exit_code=1, stdout="nope", stderr="")
+        self.assertTrue(all(a.evaluate(ok) for a in spec.probes[0].assertions))
+        self.assertFalse(all(a.evaluate(bad) for a in spec.probes[0].assertions))
+
+    def test_resolve_assert_carried_onto_probe(self) -> None:
+        b = _resolve_toml(self._with_assert("exit = 0\n"))
+        self.assertEqual(len(b.probes[0].assertions), 1)
+        self.assertTrue(
+            b.probes[0].assertions[0].evaluate(model.Outcome(0, "", ""))
+        )
 
     # --- resolution + symlink-safe containment ---------------------------- #
     def test_resolve_script_absolute_path_rejected(self) -> None:

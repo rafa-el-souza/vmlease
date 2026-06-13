@@ -99,6 +99,13 @@ class Probe:
             the runner's run-wide default" — the SSH layer resolves the effective
             value and enforces it, recording a timed-out :class:`ProbeResult`
             rather than hanging.
+        assertions: The declarative ``[probe.assert]`` predicates over the
+            probe's :class:`Outcome`, compiled from the manifest by the loader.
+            Each satisfies the :class:`Assertion` Protocol (the concrete kinds —
+            and the regex engine — live in :mod:`vmlease.assertions`, never
+            here). ``()`` (the default, back-compatible) means no declarative
+            assertions. This field is typed by the Protocol so ``model.py``
+            stays engine-free.
     """
 
     id: str
@@ -109,6 +116,7 @@ class Probe:
     timeout: float | None = None
     source: str = ""
     success_when: str = ""
+    assertions: tuple[Assertion, ...] = ()
 
 
 @dataclass(frozen=True)
