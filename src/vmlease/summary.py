@@ -1,13 +1,15 @@
 """Read-only summarizer over a raw vmlease results file — ONE canonical reader.
 
-A raw results file (``results.py``) is a per-host x per-probe transcript whose
-``ok`` is only the probe's exit code (the *vacuous-ok* footgun): the real
-"did it pass?" lives in ``*_OK`` / ``*_FAIL`` assertion tokens a probe prints to
-stdout. Every consumer that re-derives a verdict from those tokens invents its
-own rule, so the same file yields different answers. This module is the single
-canonical reader: it computes one deterministic verdict per probe and emits a
-versioned ``.summary.json`` companion. The raw file is the source of truth and
-is never mutated.
+A raw results file (``results.py``) is a per-host x per-probe transcript. A probe
+that declares ``[probe.assert]`` carries an AUTHORITATIVE recorded ``ok`` — the
+assertion verdict, evaluated once at run time and stored, not re-derived here. For
+a probe with NO assertions the token convention decides: ``ok`` alone is only the
+probe's exit code (the *vacuous-ok* footgun), so the real "did it pass?" lives in
+the ``*_OK`` / ``*_FAIL`` tokens a probe prints to stdout — and every consumer that
+re-derives a verdict from those tokens invents its own rule, so the same file
+yields different answers. This module is the single canonical reader: it computes
+one deterministic verdict per probe and emits a versioned ``.summary.json``
+companion. The raw file is the source of truth and is never mutated.
 
 Like the rest of the library this module is pure (no wall-clock / RNG reads):
 the timestamp and run-id come from the raw document, never the clock. The split
