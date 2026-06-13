@@ -9,6 +9,40 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple, Protocol, runtime_checkable
+
+
+class Outcome(NamedTuple):
+    """The captured result of one probe command — the input an assertion reads.
+
+    A flat ``(exit_code, stdout, stderr)`` triple the runner passes to each
+    assertion's :meth:`Assertion.evaluate` / :meth:`Assertion.describe`. Pure
+    data, no engine: this keeps :mod:`vmlease.model` free of the regex backend
+    (``re2`` lives only in :mod:`vmlease.assertions`).
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@runtime_checkable
+class Assertion(Protocol):
+    """A predicate over a probe's :class:`Outcome` — structural typing only.
+
+    The concrete, value-bound kinds live in :mod:`vmlease.assertions` (which may
+    import a regex engine); they satisfy this Protocol structurally. ``model.py``
+    defines only the shape so ``Probe`` can reference it without importing the
+    engine — import direction is one-way (``assertions`` → ``model``).
+    """
+
+    def evaluate(self, outcome: Outcome) -> bool:
+        """Whether this assertion holds for ``outcome``."""
+        ...
+
+    def describe(self, outcome: Outcome) -> str:
+        """A single-line failure description (only called when it failed)."""
+        ...
 
 
 class ProbeTag(StrEnum):
