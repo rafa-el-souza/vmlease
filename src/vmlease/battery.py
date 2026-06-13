@@ -340,6 +340,30 @@ def _resolve_script_ref(probe_id: str, script: str, base_dir: Path) -> str:
         raise BatteryError(f"probe {probe_id!r} cannot read script {script!r}: {exc}") from exc
 
 
+def structural_violations(battery: Battery) -> tuple[str, ...]:
+    """No-verdict-source structural findings (the fatal subset of ``lint_battery``).
+
+    A probe that **declares no assertions** whose command prints tokens without an
+    explicit ``exit`` (see :func:`_looks_vacuously_ok`) has no source of truth for
+    its ``ok`` other than the command's exit code — which an un-gated token tail
+    leaves at ``0`` regardless of what it printed. There is no verdict source.
+
+    This is the same detection as the vacuous-ok advisory in :func:`lint_battery`
+    (single-sourced here so the advisory set and the fatal set are identical); a
+    probe that **declares assertions** (``[probe.assert]``) or **exit-gates** its
+    command is exempt. The ``vmlease lint`` command gates a non-zero exit on a
+    non-empty result; at load it stays advisory via :func:`lint_battery`.
+    """
+    violations: list[str] = []
+    for probe in battery.probes:
+        if not probe.assertions and _looks_vacuously_ok(probe.command):
+            violations.append(
+                f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
+                f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
+            )
+    return tuple(violations)
+
+
 def lint_battery(battery: Battery) -> tuple[str, ...]:
     """Non-fatal authoring warnings for a battery (never raises; ``()`` = clean).
 
@@ -352,7 +376,9 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
       printed. Gate with ``exit $rc``. A probe that **declares assertions**
       (``[probe.assert]``) is **exempt**: its ``ok`` is read from those declared
       predicates, not the exit code, so an un-gated token-printing tail is exactly
-      the intended authoring style, not a footgun.
+      the intended authoring style, not a footgun. These findings are
+      single-sourced from :func:`structural_violations` (the advisory set is the
+      same set ``vmlease lint`` gates on as fatal).
 
     - **non-host-root sudo** — a probe whose tag is not ``MUTATING_HOST_ROOT`` but
       whose command invokes ``sudo``. The escalation authoring contract reserves
@@ -364,13 +390,8 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     guarantee is still the author's ``exit $rc`` / tag. Warnings are advisory — the
     run and ``ok`` are unaffected, and a single probe may trigger both rules.
     """
-    warnings: list[str] = []
+    warnings: list[str] = list(structural_violations(battery))
     for probe in battery.probes:
-        if not probe.assertions and _looks_vacuously_ok(probe.command):
-            warnings.append(
-                f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
-                f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
-            )
         if probe.tag is not ProbeTag.MUTATING_HOST_ROOT and _invokes_sudo(probe.command):
             warnings.append(
                 f"probe {probe.id!r}: command invokes sudo but the probe is not tagged "

@@ -1183,6 +1183,34 @@ class TestBatteryLint(unittest.TestCase):
         self.assertTrue(any("exit $rc" in w for w in warns))
         self.assertTrue(any("sudo" in w for w in warns))
 
+    # --- structural_violations: the fatal no-verdict-source subset (§9) ---- #
+    def test_structural_violations_flags_no_verdict_source_probe(self) -> None:
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        viol = battery_mod.structural_violations(b)
+        self.assertTrue(any("'V'" in v and "exit $rc" in v for v in viol))
+
+    def test_structural_violations_exempts_assertion_declaring_probe(self) -> None:
+        b = self._b(self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+
+    def test_structural_violations_exempts_exit_gated_probe(self) -> None:
+        b = self._b(self._p("G", "grep x f && echo OK || echo FAIL; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+
+    def test_structural_violations_single_sourced_into_advisory(self) -> None:
+        # the advisory vacuous-ok finding IS the fatal structural finding (same set).
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        viol = battery_mod.structural_violations(b)
+        warns = battery_mod.lint_battery(b)
+        self.assertEqual(len(viol), 1)
+        self.assertTrue(all(v in warns for v in viol))
+
+    def test_structural_violations_ignores_sudo_mislabel(self) -> None:
+        # sudo-mislabel is advisory-only; it is NOT a structural violation.
+        b = self._b(self._p("S", "sudo systemctl restart foo; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+        self.assertTrue(any("sudo" in w for w in battery_mod.lint_battery(b)))
+
 
 # --------------------------------------------------------------------------- #
 # battery.shellcheck_battery — severity-graded findings over every probe (D5)
@@ -1582,15 +1610,16 @@ class TestCliLint(unittest.TestCase):
 
     def test_unavailable_skips_with_notice_and_exits_0(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            # a vacuously-ok probe so the advisory check still has something to print
+            # an advisory-only (sudo-mislabel) probe so the advisory check still has
+            # something to print, but there is NO structural violation to gate on.
             manifest = battery_toml("lint-cli", (
-                {"id": "P", "title": "p", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+                {"id": "P", "title": "p", "run": "sudo true; exit $?", "tag": "read-only"},
             ))
             p = _write_battery_bundle(d, manifest)
             rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
             self.assertEqual(rc, 0)
             self.assertIn("shellcheck unavailable", err)
-            self.assertIn("warning:", err)  # advisory vacuous-ok still printed
+            self.assertIn("warning:", err)  # advisory sudo-mislabel still printed
 
     def test_unavailable_with_require_shellcheck_exits_1(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1611,6 +1640,100 @@ class TestCliLint(unittest.TestCase):
             )
             self.assertEqual(rc, 2)
             self.assertIn("error:", err)
+
+    # --- structural no-verdict-source rule: HARD at `vmlease lint` (§9) ---- #
+    _VACUOUS = "grep x f && echo OK || echo FAIL"
+
+    def test_structural_violation_hard_fails_with_clean_shellcheck(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            # shellcheck is CLEAN (returncode 0, no findings) — structural still fatal.
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+            self.assertIn("exit $rc", err)
+
+    def test_structural_violation_hard_fails_with_shellcheck_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
+            self.assertEqual(rc, 1)  # fatal regardless of shellcheck availability
+            self.assertIn("error:", err)
+            self.assertIn("exit $rc", err)
+
+    def test_structural_violation_hard_fails_with_require_shellcheck(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", p, "--require-shellcheck"], self._unavailable_runner()
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+
+    def test_assertion_declaring_probe_passes_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            # an un-gated token tail but ok is decided by a declared assertion -> exempt.
+            manifest = (
+                "name = '''lint-cli'''\n\n[[probe]]\nid = '''A'''\ntitle = '''a'''\n"
+                "tag = '''read-only'''\nrun = '''check && echo READY || echo NOPE'''\n"
+                "[probe.assert]\nstdout_has = '''READY'''\n"
+            )
+            p = _write_battery_bundle(d, manifest)
+            rc, _, _ = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 0)
+
+    def test_exit_gated_probe_passes_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "G", "title": "g", "run": self._VACUOUS + "; exit $?", "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, _ = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 0)
+
+    def test_load_time_advisory_warns_but_does_not_gate_on_plan(self) -> None:
+        # a no-verdict-source probe WARNS on plan but does not raise / change flow.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main(["plan", "--battery", p, "--distros", "ubuntu", "--run-token", "lint-run"])
+            self.assertEqual(rc, 0)  # advisory only — does not gate
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("exit $rc", err.getvalue())
+
+    def test_load_time_advisory_warns_but_does_not_gate_on_run(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            err = io.StringIO()
+            # decline the provisioning confirmation -> exits 0, zero provider calls.
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(
+                    cli.build_parser().parse_args([
+                        "run", "--battery", p, "--distros", "ubuntu",
+                        "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                        "--run-token", "lint-run",
+                    ]),
+                    reader=lambda _prompt: "n",
+                )
+            self.assertEqual(rc, 0)  # advisory only — does not gate
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("exit $rc", err.getvalue())
 
 
 # --------------------------------------------------------------------------- #
