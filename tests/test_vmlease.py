@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,6 +28,7 @@ from tests.battery_helpers import battery_toml
 from vmlease import (
     archbuild,
     archimage,
+    assertions,
     cli,
     cloudinit,
     distro,
@@ -43,7 +45,40 @@ from vmlease import (
     workload,
 )
 from vmlease import battery as battery_mod
-from vmlease.model import Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
+from vmlease import shellcheck as shellcheck_mod
+from vmlease.model import Assertion, Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
+
+
+def make_probe_result(
+    probe_id: str,
+    tag: ProbeTag,
+    exit_code: int,
+    stdout: str = "",
+    stderr: str = "",
+    *,
+    ok: bool | None = None,
+    timed_out: bool = False,
+    assertion_failures: tuple[str, ...] = (),
+    has_assertions: bool = False,
+) -> ProbeResult:
+    """Construct a :class:`ProbeResult` with a defaulted ``ok`` for tests.
+
+    ``ok`` is now a REQUIRED stored field (the runner computes it). Test
+    constructions that don't care about the verdict default it to
+    ``exit_code == 0``; pass ``ok=`` to override (e.g. a token-derived pass on a
+    non-zero exit). This bounds the churn from the field becoming stored.
+    """
+    return ProbeResult(
+        probe_id=probe_id,
+        tag=tag,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        ok=(exit_code == 0) if ok is None else ok,
+        timed_out=timed_out,
+        assertion_failures=assertion_failures,
+        has_assertions=has_assertions,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +208,7 @@ class FakeSshRunner:
         if self._raise_on is not None and probe.id == self._raise_on:
             raise ssh.SshError(f"boom on {probe.id}")
         code = 7 if probe.id == self._fail_on else 0
-        return ProbeResult(probe_id=probe.id, tag=probe.tag, exit_code=code, stdout=f"out-{probe.id}", stderr="")
+        return make_probe_result(probe.id, probe.tag, code, stdout=f"out-{probe.id}")
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
         self.ran.append(f"upload:{remote}")
@@ -254,69 +289,45 @@ _DEMO_BATTERY = battery_toml(
 # model
 # --------------------------------------------------------------------------- #
 class TestModel(unittest.TestCase):
-    def test_probe_result_ok(self) -> None:
-        ok = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
-        bad = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "", "err")
+    def test_probe_result_ok_is_a_stored_field(self) -> None:
+        # ``ok`` is now a runner-computed STORED verdict — the model stores it
+        # verbatim and applies no reading of its own (computation moved to
+        # ``run_probe``; see TestSsh for the verdict-rule coverage).
+        ok = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "out", "", ok=True)
+        bad = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "", ok=False)
         self.assertTrue(ok.ok)
         self.assertFalse(bad.ok)
 
-    def test_probe_result_ok_undeclared_exit_zero(self) -> None:
-        # (a) undeclared + exit 0 -> ok (exit-code reading)
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "anything", "")
-        self.assertTrue(res.ok)
-
-    def test_probe_result_not_ok_undeclared_exit_nonzero(self) -> None:
-        # (b) undeclared + exit 3 -> not ok
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "anything", "")
-        self.assertFalse(res.ok)
-
-    def test_probe_result_ok_declared_token_line_overrides_nonzero_exit(self) -> None:
-        # (c) declared token present as a line + exit 3 -> ok (token replaces exit code)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 3, "noise\n  CORE_RUNNING_OK  \nmore", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertTrue(res.ok)
-
-    def test_probe_result_not_ok_declared_token_absent_exit_zero(self) -> None:
-        # (d) declared + exit 0 but token absent -> not ok (exit code not consulted)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "other output", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
-
-    def test_probe_result_not_ok_token_only_embedded_in_line(self) -> None:
-        # (e) token only embedded in a longer line, never its own line -> not ok
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "found CORE_RUNNING_OK in scan", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
-
-    def test_probe_result_not_ok_declared_token_but_timed_out(self) -> None:
-        # (f) declared token present but timed_out=True -> not ok (partial output is no verdict)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "CORE_RUNNING_OK", "",
-            timed_out=True, success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
-
-    def test_probe_success_when_defaults_empty(self) -> None:
-        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
-        self.assertEqual(p.success_when, "")
-
-    def test_probe_result_success_when_defaults_empty(self) -> None:
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
-        self.assertEqual(res.success_when, "")
+    def test_probe_result_assertion_failures_defaults_empty(self) -> None:
+        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0)
+        self.assertEqual(res.assertion_failures, ())
 
     def test_probe_result_timed_out_defaults_false(self) -> None:
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0, "out")
         self.assertFalse(res.timed_out)
+
+    def test_model_imports_no_regex_engine_or_assertions(self) -> None:
+        # M1-gate / D10(B): importing ``vmlease.model`` must NOT transitively pull
+        # in the regex backend (``re2``) or ``vmlease.assertions``. A fresh
+        # subprocess proves no transitive runtime import (the verdict arrives
+        # already computed; the engine lives only in ``assertions``/``ssh``).
+        code = (
+            "import vmlease.model, sys; "
+            "print('re2' in sys.modules); "
+            "print('vmlease.assertions' in sys.modules)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(proc.stdout.split(), ["False", "False"])
 
     def test_probe_timeout_defaults_none(self) -> None:
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertIsNone(p.timeout)
+
+    def test_probe_assertions_defaults_empty(self) -> None:
+        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
+        self.assertEqual(p.assertions, ())
 
     def test_probe_source_defaults_empty(self) -> None:
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
@@ -947,38 +958,73 @@ class TestBattery(unittest.TestCase):
                 "tag = '''read-only'''\nrun = '''c'''\ntimeout = true\n"
             )
 
-    def test_parse_success_when_absent_is_empty(self) -> None:
-        # back-compat: a battery without success_when loads, token "".
-        spec = battery_mod.parse_battery(_DEMO_BATTERY)
-        self.assertEqual(spec.probes[0].success_when, "")
-
-    def test_parse_success_when_value_carried(self) -> None:
-        spec = battery_mod.parse_battery(battery_toml("x", (self._one(success_when="READY"),)))
-        self.assertEqual(spec.probes[0].success_when, "READY")
-
-    def test_resolve_success_when_carried_onto_probe(self) -> None:
-        # the resolved Probe carries the declared token through to model.
-        b = _resolve_toml(battery_toml("x", (self._one(success_when="READY"),)))
-        self.assertEqual(b.probes[0].success_when, "READY")
-
-    def test_parse_success_when_empty_string_raises_naming_probe(self) -> None:
+    def test_parse_success_when_key_now_rejected_as_unknown(self) -> None:
+        # success_when was retired (§8): the strict schema rejects it as an
+        # unrecognized probe key, naming it.
         with self.assertRaises(battery_mod.BatteryError) as ctx:
             battery_mod.parse_battery(
                 "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
-                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = ''''''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = '''READY'''\n"
             )
         self.assertIn("success_when", str(ctx.exception))
 
-    def test_parse_success_when_whitespace_only_raises(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(battery_toml("x", (self._one(success_when="   "),)))
+    # --- [probe.assert] declarative assertions (§5) ----------------------- #
+    def _with_assert(self, assert_body: str) -> str:
+        """A minimal manifest with an inline ``[probe.assert]`` table body."""
+        return (
+            "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+            "tag = '''read-only'''\nrun = '''c'''\n"
+            f"[probe.assert]\n{assert_body}"
+        )
 
-    def test_parse_success_when_non_string_raises(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
+    def test_parse_assert_absent_is_empty_tuple(self) -> None:
+        # back-compat: a probe without [probe.assert] carries no assertions.
+        spec = battery_mod.parse_battery(_DEMO_BATTERY)
+        self.assertEqual(spec.probes[0].assertions, ())
+
+    def test_parse_assert_unknown_key_rejected_naming_it(self) -> None:
+        # the registry key set IS the schema — an unknown key fails loud.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("bogus_check = 0\n"))
+        self.assertIn("bogus_check", str(ctx.exception))
+
+    def test_parse_assert_not_a_table_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
             battery_mod.parse_battery(
                 "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
-                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = 5\n"
+                "tag = '''read-only'''\nrun = '''c'''\nassert = '''nope'''\n"
             )
+        self.assertIn("assert", str(ctx.exception))
+
+    def test_parse_assert_wrong_shaped_value_rejected_naming_key(self) -> None:
+        # exit expects an int; a string is a shape error (ValueError -> BatteryError).
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("exit = '''x'''\n"))
+        self.assertIn("exit", str(ctx.exception))
+
+    def test_parse_assert_malformed_regex_fails_in_pure_pass(self) -> None:
+        # D10(I): a bad pattern is compiled inside parse_battery (the PURE pass)
+        # and surfaces as BatteryError at load, not at evaluation.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._with_assert("stdout_matches = '''(unclosed'''\n"))
+        self.assertIn("stdout_matches", str(ctx.exception))
+
+    def test_parse_assert_carried_onto_spec_and_evaluates(self) -> None:
+        spec = battery_mod.parse_battery(
+            self._with_assert("exit = 0\nstdout_has = '''READY'''\n")
+        )
+        self.assertEqual(len(spec.probes[0].assertions), 2)
+        ok = model.Outcome(exit_code=0, stdout="READY now", stderr="")
+        bad = model.Outcome(exit_code=1, stdout="nope", stderr="")
+        self.assertTrue(all(a.check(ok) is None for a in spec.probes[0].assertions))
+        self.assertFalse(all(a.check(bad) is None for a in spec.probes[0].assertions))
+
+    def test_resolve_assert_carried_onto_probe(self) -> None:
+        b = _resolve_toml(self._with_assert("exit = 0\n"))
+        self.assertEqual(len(b.probes[0].assertions), 1)
+        self.assertIsNone(
+            b.probes[0].assertions[0].check(model.Outcome(0, "", ""))
+        )
 
     # --- resolution + symlink-safe containment ---------------------------- #
     def test_resolve_script_absolute_path_rejected(self) -> None:
@@ -1084,17 +1130,20 @@ class TestBatteryLint(unittest.TestCase):
         b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def _ps(self, pid: str, cmd: str, tag: ProbeTag, success_when: str) -> Probe:
-        return Probe(id=pid, title=pid, command=cmd, tag=tag, success_when=success_when)
+    def _ps(self, pid: str, cmd: str, tag: ProbeTag) -> Probe:
+        # A probe that DECLARES an assertion (exempt from the vacuous-ok advisory).
+        assertion = assertions._ASSERTIONS["stdout_has"].build("READY")
+        return Probe(id=pid, title=pid, command=cmd, tag=tag, assertions=(assertion,))
 
-    def test_success_when_probe_exempt_from_vacuous_ok(self) -> None:
-        # un-gated token-printing tail, but ok is token-derived -> not a footgun.
+    def test_assertions_declared_probe_exempt_from_vacuous_ok(self) -> None:
+        # un-gated token-printing tail, but ok is decided by declared assertions
+        # -> not a footgun.
         b = self._b(
-            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY")
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY)
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def test_same_probe_without_success_when_still_warns(self) -> None:
+    def test_same_probe_without_assertions_still_warns(self) -> None:
         b = self._b(self._p("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY))
         warns = battery_mod.lint_battery(b)
         self.assertTrue(any("'T'" in w and "exit $rc" in w for w in warns))
@@ -1121,18 +1170,46 @@ class TestBatteryLint(unittest.TestCase):
 
     def test_clean_battery_with_declared_and_gated_probes_silent(self) -> None:
         b = self._b(
-            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY"),
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY),
             self._p("G", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
     def test_probe_can_trigger_both_rules(self) -> None:
-        # un-gated token tail (no success_when) AND non-host-root sudo -> two warnings.
+        # un-gated token tail (no declared assertions) AND non-host-root sudo -> two warnings.
         b = self._b(self._p("B", "sudo check && echo OK || echo FAIL", ProbeTag.READ_ONLY))
         warns = battery_mod.lint_battery(b)
         self.assertEqual(len(warns), 2)
         self.assertTrue(any("exit $rc" in w for w in warns))
         self.assertTrue(any("sudo" in w for w in warns))
+
+    # --- structural_violations: the fatal no-verdict-source subset (§9) ---- #
+    def test_structural_violations_flags_no_verdict_source_probe(self) -> None:
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        viol = battery_mod.structural_violations(b)
+        self.assertTrue(any("'V'" in v and "exit $rc" in v for v in viol))
+
+    def test_structural_violations_exempts_assertion_declaring_probe(self) -> None:
+        b = self._b(self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+
+    def test_structural_violations_exempts_exit_gated_probe(self) -> None:
+        b = self._b(self._p("G", "grep x f && echo OK || echo FAIL; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+
+    def test_structural_violations_single_sourced_into_advisory(self) -> None:
+        # the advisory vacuous-ok finding IS the fatal structural finding (same set).
+        b = self._b(self._p("V", "grep x f && echo OK || echo FAIL", ProbeTag.READ_ONLY))
+        viol = battery_mod.structural_violations(b)
+        warns = battery_mod.lint_battery(b)
+        self.assertEqual(len(viol), 1)
+        self.assertTrue(all(v in warns for v in viol))
+
+    def test_structural_violations_ignores_sudo_mislabel(self) -> None:
+        # sudo-mislabel is advisory-only; it is NOT a structural violation.
+        b = self._b(self._p("S", "sudo systemctl restart foo; exit $?", ProbeTag.READ_ONLY))
+        self.assertEqual(battery_mod.structural_violations(b), ())
+        self.assertTrue(any("sudo" in w for w in battery_mod.lint_battery(b)))
 
 
 # --------------------------------------------------------------------------- #
@@ -1165,7 +1242,7 @@ class TestShellcheckDriver(unittest.TestCase):
 
     def test_parses_severities_codes_locations(self) -> None:
         b = self._b(Probe(id="PREP", title="prep", command="x=$(date)\n\ngrep f && a || b", tag=ProbeTag.READ_ONLY, source="prep.sh"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(_GCC_SAMPLE))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(_GCC_SAMPLE))
         assert isinstance(findings, tuple)
         self.assertEqual(len(findings), 2)
         warn, note = findings
@@ -1179,7 +1256,7 @@ class TestShellcheckDriver(unittest.TestCase):
     def test_run_probe_labelled_by_probe_id_and_fed_via_stdin(self) -> None:
         b = self._b(Probe(id="KVER", title="k", command="uname -r && echo ok || echo no", tag=ProbeTag.READ_ONLY, source="<inline>"))
         runner = self._runner("-:1:9: note: msg [SC2015]\n")
-        findings = battery_mod.shellcheck_battery(b, runner=runner)
+        findings = shellcheck_mod.shellcheck_battery(b, runner=runner)
         assert isinstance(findings, tuple)
         # run-block findings are located by the probe's source ("<inline>") + id
         self.assertEqual(findings[0].location, "<inline>")
@@ -1194,7 +1271,7 @@ class TestShellcheckDriver(unittest.TestCase):
             Probe(id="S", title="s", command="echo from-script", tag=ProbeTag.READ_ONLY, source="s.sh"),
             Probe(id="R", title="r", command="echo from-run", tag=ProbeTag.READ_ONLY, source="<inline>"),
         )
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:1:1: style: m [SC2086]\n"))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("-:1:1: style: m [SC2086]\n"))
         assert isinstance(findings, tuple)
         self.assertEqual([f.location for f in findings], ["s.sh", "<inline>"])
         # every call fed the command text over stdin, no path on the argv
@@ -1206,13 +1283,13 @@ class TestShellcheckDriver(unittest.TestCase):
     def test_non_matching_lines_skipped(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
         noisy = "\nIn - line 1:\n^-- some caret art\n" + _GCC_SAMPLE
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(noisy))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(noisy))
         assert isinstance(findings, tuple)
         self.assertEqual(len(findings), 2)
 
     def test_finding_without_code_keeps_empty_code(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:2:4: error: bare message no code\n"))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("-:2:4: error: bare message no code\n"))
         assert isinstance(findings, tuple)
         self.assertEqual(findings[0].code, "")
         self.assertEqual(findings[0].message, "bare message no code")
@@ -1223,7 +1300,7 @@ class TestShellcheckDriver(unittest.TestCase):
         def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
             raise FileNotFoundError("shellcheck")
 
-        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+        self.assertIs(shellcheck_mod.shellcheck_battery(b, runner=_run), shellcheck_mod.SHELLCHECK_UNAVAILABLE)
 
     def test_timeout_yields_unavailable_sentinel(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
@@ -1231,7 +1308,7 @@ class TestShellcheckDriver(unittest.TestCase):
         def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
             raise subprocess.TimeoutExpired(argv, 60.0)
 
-        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+        self.assertIs(shellcheck_mod.shellcheck_battery(b, runner=_run), shellcheck_mod.SHELLCHECK_UNAVAILABLE)
 
     def test_findings_at_or_above_thresholds(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
@@ -1241,17 +1318,17 @@ class TestShellcheckDriver(unittest.TestCase):
             "-:3:1: warning: w [SC2155]\n"
             "-:4:1: error: e [SC1009]\n"
         )
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(sample))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(sample))
         assert isinstance(findings, tuple)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "style")), 4)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "note")), 3)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "warning")), 2)
-        sev = [f.severity for f in battery_mod.findings_at_or_above(findings, "error")]
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "style")), 4)
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "note")), 3)
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "warning")), 2)
+        sev = [f.severity for f in shellcheck_mod.findings_at_or_above(findings, "error")]
         self.assertEqual(sev, ["error"])
 
     def test_clean_battery_yields_empty_findings_not_sentinel(self) -> None:
         b = self._b(Probe(id="P", title="p", command="uname -r", tag=ProbeTag.READ_ONLY, source="<inline>"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("", returncode=0))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("", returncode=0))
         self.assertEqual(findings, ())
 
 
@@ -1533,15 +1610,16 @@ class TestCliLint(unittest.TestCase):
 
     def test_unavailable_skips_with_notice_and_exits_0(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            # a vacuously-ok probe so the advisory check still has something to print
+            # an advisory-only (sudo-mislabel) probe so the advisory check still has
+            # something to print, but there is NO structural violation to gate on.
             manifest = battery_toml("lint-cli", (
-                {"id": "P", "title": "p", "run": "grep x f && echo OK || echo FAIL", "tag": "read-only"},
+                {"id": "P", "title": "p", "run": "sudo true; exit $?", "tag": "read-only"},
             ))
             p = _write_battery_bundle(d, manifest)
             rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
             self.assertEqual(rc, 0)
             self.assertIn("shellcheck unavailable", err)
-            self.assertIn("warning:", err)  # advisory vacuous-ok still printed
+            self.assertIn("warning:", err)  # advisory sudo-mislabel still printed
 
     def test_unavailable_with_require_shellcheck_exits_1(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1562,6 +1640,100 @@ class TestCliLint(unittest.TestCase):
             )
             self.assertEqual(rc, 2)
             self.assertIn("error:", err)
+
+    # --- structural no-verdict-source rule: HARD at `vmlease lint` (§9) ---- #
+    _VACUOUS = "grep x f && echo OK || echo FAIL"
+
+    def test_structural_violation_hard_fails_with_clean_shellcheck(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            # shellcheck is CLEAN (returncode 0, no findings) — structural still fatal.
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+            self.assertIn("exit $rc", err)
+
+    def test_structural_violation_hard_fails_with_shellcheck_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(["lint", "--battery", p], self._unavailable_runner())
+            self.assertEqual(rc, 1)  # fatal regardless of shellcheck availability
+            self.assertIn("error:", err)
+            self.assertIn("exit $rc", err)
+
+    def test_structural_violation_hard_fails_with_require_shellcheck(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, err = self._run_lint(
+                ["lint", "--battery", p, "--require-shellcheck"], self._unavailable_runner()
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err)
+
+    def test_assertion_declaring_probe_passes_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            # an un-gated token tail but ok is decided by a declared assertion -> exempt.
+            manifest = (
+                "name = '''lint-cli'''\n\n[[probe]]\nid = '''A'''\ntitle = '''a'''\n"
+                "tag = '''read-only'''\nrun = '''check && echo READY || echo NOPE'''\n"
+                "[probe.assert]\nstdout_has = '''READY'''\n"
+            )
+            p = _write_battery_bundle(d, manifest)
+            rc, _, _ = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 0)
+
+    def test_exit_gated_probe_passes_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "G", "title": "g", "run": self._VACUOUS + "; exit $?", "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            rc, _, _ = self._run_lint(["lint", "--battery", p], self._runner("", returncode=0))
+            self.assertEqual(rc, 0)
+
+    def test_load_time_advisory_warns_but_does_not_gate_on_plan(self) -> None:
+        # a no-verdict-source probe WARNS on plan but does not raise / change flow.
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli.main(["plan", "--battery", p, "--distros", "ubuntu", "--run-token", "lint-run"])
+            self.assertEqual(rc, 0)  # advisory only — does not gate
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("exit $rc", err.getvalue())
+
+    def test_load_time_advisory_warns_but_does_not_gate_on_run(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            manifest = battery_toml("lint-cli", (
+                {"id": "V", "title": "v", "run": self._VACUOUS, "tag": "read-only"},
+            ))
+            p = _write_battery_bundle(d, manifest)
+            err = io.StringIO()
+            # decline the provisioning confirmation -> exits 0, zero provider calls.
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(
+                    cli.build_parser().parse_args([
+                        "run", "--battery", p, "--distros", "ubuntu",
+                        "--results-dir", str(Path(d) / "r"), "--timestamp", "T",
+                        "--run-token", "lint-run",
+                    ]),
+                    reader=lambda _prompt: "n",
+                )
+            self.assertEqual(rc, 0)  # advisory only — does not gate
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("exit $rc", err.getvalue())
 
 
 # --------------------------------------------------------------------------- #
@@ -1824,6 +1996,10 @@ class TestSsh(unittest.TestCase):
         # IP with a new host key is never a refused connection (run-2 bug).
         self.assertIn("UserKnownHostsFile=/dev/null", argv)
         self.assertIn("StrictHostKeyChecking=accept-new", argv)
+        # quiet the per-connect "Permanently added" banner (accept-new emits it on
+        # every connection) so it never pollutes captured probe stderr — load-bearing
+        # for the [probe.assert] stderr_empty/stderr_lacks/stderr_matches_not checks.
+        self.assertIn("LogLevel=ERROR", argv)
 
     def test_run_probe_captures_exit(self) -> None:
         r = OpenSshRunnerForTest(_fake_ssh_subprocess(7, "out", "err"))
@@ -1832,14 +2008,67 @@ class TestSsh(unittest.TestCase):
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
         self.assertFalse(res.timed_out)  # a within-timeout probe is not a timeout
 
-    def test_run_probe_threads_success_when_and_derives_ok_from_token(self) -> None:
-        # a declaring probe's token travels into the result, and ``ok`` is read off
-        # stdout (the token line present) even though the exit code is non-zero.
-        r = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "noise\nREADY\nmore", ""))
-        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY, success_when="READY")
+    def _assert(self, key: str, value: object) -> Assertion:
+        return assertions._ASSERTIONS[key].build(value)
+
+    def test_run_probe_no_assertion_ok_is_exit_zero(self) -> None:
+        # No assertions declared → ok iff exit 0 (the relocated old rule).
+        r0 = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "out", ""))
+        r3 = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "out", "err"))
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        self.assertTrue(r0.run_probe(self._host(), probe).ok)
+        self.assertFalse(r3.run_probe(self._host(), probe).ok)
+
+    def test_run_probe_assertion_decided_ok_and_failures(self) -> None:
+        # A declared assertion decides ok; a satisfied one → ok with no failures.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "READY now", ""))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("stdout_has", "READY"),),
+        )
         res = r.run_probe(self._host(), probe)
-        self.assertEqual(res.success_when, "READY")
-        self.assertTrue(res.ok)  # token line present → ok despite non-zero exit
+        self.assertTrue(res.ok)
+        self.assertEqual(res.assertion_failures, ())
+
+    def test_run_probe_assertion_failure_records_description(self) -> None:
+        # A failed assertion → not ok and its describe() lands in assertion_failures.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "nope", ""))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("stdout_has", "READY"),),
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertFalse(res.ok)
+        self.assertEqual(len(res.assertion_failures), 1)
+        self.assertIn("stdout_has", res.assertion_failures[0])
+
+    def test_run_probe_refusal_exit_not_passes_on_nonzero_exit(self) -> None:
+        # A refusal assertion ``exit_not = 0`` PASSES on a non-zero exit — the
+        # assertion verdict, not the exit code, decides ok.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(13, "", "denied"))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("exit_not", 0),),
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.ok)  # exit was non-zero → exit_not 0 holds
+        self.assertEqual(res.assertion_failures, ())
+
+    def test_run_probe_timed_out_refusal_not_ok_despite_satisfiable_assertion(self) -> None:
+        # A timed-out probe is not ok even when its exit assertion WOULD be
+        # satisfiable — the evaluator is never invoked on the killed result (D10(E)).
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout, output="", stderr="")
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("exit_not", 0),),  # 124 != 0 → would pass
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.assertion_failures, ())  # evaluator never ran
 
     def test_run_probe_blocking_seam_records_timed_out_result(self) -> None:
         # T1: a slow/blocking transport that raises TimeoutExpired is RECORDED as a
@@ -2004,6 +2233,22 @@ class TestSsh(unittest.TestCase):
 
         r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=runner_fn, sleeper=lambda _x: None)
         r.wait_until_ready(self._host())  # no raise == ready
+
+    def test_run_probe_runs_command_verbatim_regardless_of_tag(self) -> None:
+        # Scenario #12: the runner executes the command VERBATIM — it does NOT
+        # strip/inject/refuse `sudo` based on the tag. A non-host-root probe whose
+        # command invokes sudo still reaches the transport unchanged; a tag<->sudo
+        # mismatch is lint's concern, not the runner's.
+        captured: list[str] = []
+
+        def capture(argv: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
+            captured.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        r = ssh.OpenSshRunner("probe", Path("/tmp/k"), runner=capture, sleeper=lambda _x: None)
+        probe = Probe(id="P", title="t", command="sudo systemctl restart foo", tag=ProbeTag.READ_ONLY)
+        r.run_probe(self._host(), probe)
+        self.assertEqual(captured[-1], "sudo systemctl restart foo")
 
     def test_wait_until_ready_retries_module_probe_transport_blip(self) -> None:
         # Right after the post-reboot oneshot touches the sentinel the host is
@@ -2320,13 +2565,35 @@ class TestResults(unittest.TestCase):
     def _run(self) -> model.HostRun:
         spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
         res = (
-            ProbeResult("P1", ProbeTag.READ_ONLY, 0, "ok", ""),
-            ProbeResult("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
+            make_probe_result("P1", ProbeTag.READ_ONLY, 0, "ok"),
+            make_probe_result("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
         )
         return model.HostRun(host_spec=spec, detail="## os-release\nID=ubuntu", results=res)
 
     def test_filename_deterministic(self) -> None:
         self.assertEqual(results.results_filename("r1", "20260601T000000Z"), "vmlease-r1-20260601T000000Z.json")
+
+    def test_results_never_reads_the_wall_clock(self) -> None:
+        # Scenario #38: the timestamp is purely caller-supplied; the library reads
+        # NO wall clock (runs stay reproducible; tests pin the filename). Two guards:
+        # (a) the full API still produces output with `time` sabotaged to raise;
+        # (b) the module source has no clock CALL (regression guard, any import style).
+        import inspect
+        import time as _time
+        from unittest import mock
+
+        def _boom(*_a: object, **_k: object) -> float:
+            raise AssertionError("vmlease.results must not read the wall clock")
+
+        with mock.patch.object(_time, "time", _boom), mock.patch.object(_time, "monotonic", _boom):
+            self.assertEqual(results.results_filename("r1", "TS"), "vmlease-r1-TS.json")
+            self.assertIn("TS", results.serialize_run("r1", "TS", [self._run()]))
+            with tempfile.TemporaryDirectory() as d:
+                results.write_results(Path(d) / "out", "r1", "TS", [self._run()])
+
+        src = inspect.getsource(results)
+        for clock_call in ("time.time(", "time.monotonic(", "datetime.now(", "datetime.today(", "utcnow("):
+            self.assertNotIn(clock_call, src, f"results must not call the clock ({clock_call})")
 
     def test_serialize_round_trips(self) -> None:
         text = results.serialize_run("r1", "20260601T000000Z", [self._run()])
@@ -2337,21 +2604,32 @@ class TestResults(unittest.TestCase):
         self.assertFalse(doc["hosts"][0]["probes"][0]["timed_out"])  # normal probe
         self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
         self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
-        # success_when is serialized unconditionally, including for the timed-out probe.
-        self.assertEqual(doc["hosts"][0]["probes"][0]["success_when"], "")
-        self.assertEqual(doc["hosts"][0]["probes"][1]["success_when"], "")
 
-    def test_serialize_declaring_probe_ok_from_token_and_carries_field(self) -> None:
-        # end-to-end: a declaring probe whose stdout carries the token serializes
-        # ok=True (token-derived, despite a non-zero exit) AND its success_when field.
+    def test_serialize_passing_assertion_probe_carries_declared_count_true(self) -> None:
+        # (7.5) DECLARED-count: a PASSING assertion probe (assertion_failures=())
+        # serializes has_assertions=True and assertion_failures=[] — has_assertions
+        # is the declared count, NOT derived from the (empty) failures list.
         spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
-        res = (ProbeResult("P1", ProbeTag.READ_ONLY, 1, "noise\nREADY\n", "", success_when="READY"),)
+        res = (make_probe_result("P1", ProbeTag.READ_ONLY, 0, "out", ok=True, has_assertions=True),)
         hr = model.HostRun(host_spec=spec, detail="ok", results=res)
         doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
         probe = doc["hosts"][0]["probes"][0]
-        self.assertEqual(probe["success_when"], "READY")
-        self.assertTrue(probe["ok"])  # token-derived ok despite exit_code 1
-        self.assertEqual(probe["exit_code"], 1)
+        self.assertTrue(probe["has_assertions"])              # declared, even though it PASSED
+        self.assertEqual(probe["assertion_failures"], [])
+
+    def test_serialize_failing_assertion_probe_carries_failures(self) -> None:
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        res = (
+            make_probe_result(
+                "P1", ProbeTag.READ_ONLY, 0, "out", ok=False,
+                has_assertions=True, assertion_failures=("stdout did not match /ready/",),
+            ),
+        )
+        hr = model.HostRun(host_spec=spec, detail="ok", results=res)
+        doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
+        probe = doc["hosts"][0]["probes"][0]
+        self.assertTrue(probe["has_assertions"])
+        self.assertEqual(probe["assertion_failures"], ["stdout did not match /ready/"])
 
     def test_write_results_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -2467,7 +2745,7 @@ class TestExecute(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2606,9 +2884,9 @@ class TestExecute(unittest.TestCase):
                 if "fedora" in host.name:
                     debian_done.wait(timeout=5.0)  # complete strictly after debian
                     fedora_done.set()
-                    return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                    return make_probe_result(probe.id, probe.tag, 0, "ok")
                 # ubuntu: completes first and fastest (no waits), parking the sink.
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2688,7 +2966,7 @@ class TestExecute(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2753,7 +3031,7 @@ class TestWorkloadSeam(unittest.TestCase):
 
         class _ReadyRecordingSsh:
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
-                return ProbeResult(probe.id, probe.tag, 0, "", "")
+                return make_probe_result(probe.id, probe.tag, 0, "")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2801,8 +3079,8 @@ class _ScriptedTimeoutSsh:
     def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
         self.ran.append(probe.id)
         if probe.id in self._timeout_ids:
-            return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
-        return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+            return make_probe_result(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
+        return make_probe_result(probe.id, probe.tag, 0, f"out-{probe.id}")
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
         return None
@@ -2897,7 +3175,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
         class _CommandRecordingSsh:
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 seen.append(probe.command)
-                return ProbeResult(probe.id, probe.tag, 0, "", "")
+                return make_probe_result(probe.id, probe.tag, 0, "")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -3106,8 +3384,8 @@ class TestCliRun(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 self.ran.append(probe.id)
                 if probe.id == "P6":
-                    return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 42.5s", timed_out=True)
-                return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+                    return make_probe_result(probe.id, probe.tag, 124, "", "timed out after 42.5s", timed_out=True)
+                return make_probe_result(probe.id, probe.tag, 0, f"out-{probe.id}")
 
         def _capture(*_a: object, **k: object) -> _TimeoutOneProbeSsh:
             captured.update(k)

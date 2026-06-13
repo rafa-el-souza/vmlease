@@ -90,44 +90,48 @@ class TestVerdict(unittest.TestCase):
     def test_pass_no_assertions(self) -> None:
         self.assertEqual(summary.verdict(0, False, [], []), summary.PASS_NO_ASSERTIONS)
 
-    # --- declared-predicate branch (success_when) --------------------------- #
-    def test_declared_ok_true_nonzero_exit_is_pass(self) -> None:
-        # (5.2a) declared success_when + recorded ok=True + non-zero exit → PASS:
-        # the declared predicate overrides the exit-code rule.
-        self.assertEqual(
-            summary.verdict(1, False, [], [], success_when="GATE_OK", ok=True), summary.PASS
-        )
-
-    def test_declared_ok_false_with_stray_ok_token_is_fail(self) -> None:
-        # (5.2b) declared + ok=False + a stray *_OK token in stdout → FAIL:
-        # the declared predicate overrides both the exit-code and ok-token rules.
-        self.assertEqual(
-            summary.verdict(0, False, [], ["STRAY_OK"], success_when="GATE_OK", ok=False),
-            summary.FAIL,
-        )
-
-    def test_declared_ok_false_with_stray_fail_token_is_fail(self) -> None:
-        # declared + ok=False + a stray *_FAIL diagnostic → still FAIL (no double-count,
-        # the predicate is authoritative over the fail-token arm too).
-        self.assertEqual(
-            summary.verdict(0, False, ["STRAY_FAIL"], [], success_when="GATE_OK", ok=False),
-            summary.FAIL,
-        )
-
-    def test_declared_timed_out_is_timeout(self) -> None:
-        # (5.2c) declared + timed_out=True → TIMEOUT dominates the declared predicate.
-        self.assertEqual(
-            summary.verdict(0, True, [], ["GATE_OK"], success_when="GATE_OK", ok=True),
-            summary.TIMEOUT,
-        )
-
-    def test_undeclared_defaults_unchanged(self) -> None:
-        # (5.2d) an exit-code probe (empty success_when) gets the exact pre-branch verdict
-        # across all four arms — the new params default so the old precedence is verbatim.
+    def test_no_assertion_defaults_unchanged(self) -> None:
+        # an exit-code probe (no assertions) gets the exact token-path verdict
+        # across all four arms — the params default so the old precedence is verbatim.
         self.assertEqual(summary.verdict(0, False, ["X_FAIL"], []), summary.FAIL)        # fail-token
         self.assertEqual(summary.verdict(1, False, [], ["Y_OK"]), summary.FAIL)          # nonzero exit
         self.assertEqual(summary.verdict(0, False, [], ["Y_OK"]), summary.PASS)          # ok-token
         self.assertEqual(summary.verdict(0, False, [], []), summary.PASS_NO_ASSERTIONS)  # no tokens
+
+    # --- declarative-assertion branch (has_assertions) ---------------------- #
+    def test_has_assertions_pass_takes_branch_without_ok_token(self) -> None:
+        # (7.5) DECLARED-count routing: a PASSING assertion probe (ok=True) whose
+        # stdout carries NO *_OK token still verdicts PASS — proving the assertion
+        # branch is taken, not the token path (which would yield PASS_NO_ASSERTIONS).
+        self.assertEqual(
+            summary.verdict(0, False, [], [], has_assertions=True, ok=True), summary.PASS
+        )
+
+    def test_has_assertions_fail_overrides_stray_ok_token(self) -> None:
+        # assertion FAIL (ok=False) overrides a stray *_OK token → FAIL.
+        self.assertEqual(
+            summary.verdict(0, False, [], ["STRAY_OK"], has_assertions=True, ok=False),
+            summary.FAIL,
+        )
+
+    def test_has_assertions_fail_overrides_stray_fail_token_still_fail(self) -> None:
+        # assertion FAIL with a stray *_FAIL token → FAIL (branch authoritative).
+        self.assertEqual(
+            summary.verdict(0, False, ["STRAY_FAIL"], [], has_assertions=True, ok=False),
+            summary.FAIL,
+        )
+
+    def test_has_assertions_pass_overrides_stray_fail_token(self) -> None:
+        # assertion PASS (ok=True) overrides a stray *_FAIL token → PASS.
+        self.assertEqual(
+            summary.verdict(0, False, ["STRAY_FAIL"], [], has_assertions=True, ok=True),
+            summary.PASS,
+        )
+
+    def test_has_assertions_timeout_still_dominates(self) -> None:
+        self.assertEqual(
+            summary.verdict(124, True, [], [], has_assertions=True, ok=False), summary.TIMEOUT
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +140,7 @@ class TestVerdict(unittest.TestCase):
 class TestSummarizeResults(unittest.TestCase):
     def test_schema_and_top_level_fields(self) -> None:
         s = summary.summarize_results(_raw_doc([]), source_raw="r.json")
-        self.assertEqual(s["schema_version"], "1")
+        self.assertEqual(s["schema_version"], "2")
         self.assertEqual(s["run_id"], "r1")
         self.assertEqual(s["timestamp"], "20260601T000000Z")
         self.assertEqual(s["source_raw"], "r.json")
@@ -241,7 +245,7 @@ class TestSummarizeResults(unittest.TestCase):
         # PASS flows into totals + a zero overall exit code.
         raw_probe = {
             "id": "start", "tag": "read-only", "exit_code": 1, "ok": True,
-            "timed_out": False, "success_when": "GATE_OK",
+            "timed_out": False, "has_assertions": True,
             "stdout": "GATE_OK\nSOME_NOISE_FAIL", "stderr": "",
         }
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
@@ -258,7 +262,7 @@ class TestSummarizeResults(unittest.TestCase):
         # A declaring probe recorded ok=False is FAIL even on a zero exit with a stray *_OK.
         raw_probe = {
             "id": "start", "tag": "read-only", "exit_code": 0, "ok": False,
-            "timed_out": False, "success_when": "GATE_OK",
+            "timed_out": False, "has_assertions": True,
             "stdout": "STRAY_OK", "stderr": "",
         }
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
@@ -277,6 +281,87 @@ class TestSummarizeResults(unittest.TestCase):
         self.assertEqual(probe["fail_tokens"], [])           # STEP_FAILED is not a _FAIL token
         self.assertEqual(probe["ok_tokens"], ["STEP_OK"])
         self.assertEqual(probe["verdict"], "PASS")
+
+    def test_assertion_probe_pass_routes_via_assertion_branch_not_tokens(self) -> None:
+        # (7.5) DECLARED-count: a PASSING assertion probe carries has_assertions=True
+        # and assertion_failures=[]; with NO *_OK token in stdout it still verdicts
+        # PASS — so the assertion branch (not the token path) decided it.
+        raw_probe = {
+            "id": "start", "tag": "read-only", "exit_code": 0, "ok": True,
+            "timed_out": False, "has_assertions": True, "assertion_failures": [],
+            "stdout": "plain output, no tokens here", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.PASS)       # NOT PASS_NO_ASSERTIONS
+        self.assertEqual(probe["assertion_failures"], [])
+        self.assertEqual(s["totals"][summary.PASS], 1)
+        self.assertEqual(s["totals"][summary.PASS_NO_ASSERTIONS], 0)
+
+    def test_assertion_fail_overrides_stray_fail_token_end_to_end(self) -> None:
+        # ok=False + has_assertions → FAIL even though a stray *_OK token is present.
+        raw_probe = {
+            "id": "start", "tag": "read-only", "exit_code": 0, "ok": False,
+            "timed_out": False, "has_assertions": True,
+            "assertion_failures": ["stdout did not match /ready/"],
+            "stdout": "STRAY_OK", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.FAIL)
+        self.assertEqual(probe["assertion_failures"], ["stdout did not match /ready/"])
+        self.assertEqual(summary.overall_exit_code(s), 1)
+
+    def test_assertion_pass_overrides_stray_fail_token_end_to_end(self) -> None:
+        # ok=True + has_assertions → PASS even with a stray *_FAIL token present.
+        raw_probe = {
+            "id": "start", "tag": "read-only", "exit_code": 0, "ok": True,
+            "timed_out": False, "has_assertions": True, "assertion_failures": [],
+            "stdout": "STRAY_FAIL", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [raw_probe]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.PASS)
+        self.assertEqual(summary.overall_exit_code(s), 0)
+
+    def test_matrix_worst_of_collapses_under_assertion_fail(self) -> None:
+        # An assertion-driven FAIL in one cell collapses the worst-of matrix cell.
+        passing = {
+            "id": "status-stopped", "tag": "read-only", "exit_code": 0, "ok": True,
+            "timed_out": False, "has_assertions": True, "assertion_failures": [], "stdout": "", "stderr": "",
+        }
+        failing = {
+            "id": "status-running", "tag": "read-only", "exit_code": 0, "ok": False,
+            "timed_out": False, "has_assertions": True,
+            "assertion_failures": ["assertion failed"], "stdout": "", "stderr": "",
+        }
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [passing, failing]}])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["matrix"]["sandbox status"]["ubuntu"], summary.FAIL)
+
+    def test_token_convention_probe_verdict_unchanged_without_has_assertions(self) -> None:
+        # A token-convention probe (no has_assertions key) keeps its old verdict.
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [
+            _probe("start", exit_code=0, stdout="SETUP_EXIT0_OK"),
+        ]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.PASS)       # via ok-token path
+        self.assertEqual(probe["ok_tokens"], ["SETUP_EXIT0_OK"])
+
+    def test_pre_schema_file_reads_without_error_token_path(self) -> None:
+        # (M5) A pre-schema raw probe (no has_assertions / assertion_failures keys)
+        # reads cleanly: has_assertions defaults False → token/exit path.
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [
+            _probe("start", exit_code=1),                      # legacy shape, no new keys
+        ]}])
+        s = summary.summarize_results(doc)
+        probe = s["hosts"][0]["probes"][0]
+        self.assertEqual(probe["verdict"], summary.FAIL)       # nonzero-exit path, no crash
+        self.assertEqual(probe["assertion_failures"], [])      # defaulted empty
 
 
 class TestOverallExitCode(unittest.TestCase):
@@ -322,7 +407,7 @@ class TestCliSummarize(unittest.TestCase):
             self.assertIn(str(companion), buf.getvalue())
             self.assertEqual(raw.read_bytes(), before)  # raw byte-for-byte unchanged
             doc = json.loads(companion.read_text(encoding="utf-8"))
-            self.assertEqual(doc["schema_version"], "1")
+            self.assertEqual(doc["schema_version"], "2")
 
     def test_explicit_out_path(self) -> None:
         with tempfile.TemporaryDirectory() as d:

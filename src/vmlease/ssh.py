@@ -21,7 +21,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from vmlease.model import ProbeResult
+from vmlease import assertions
+from vmlease.model import Outcome, ProbeResult
 from vmlease.safety import validate_remote_dest, validate_upload_dir_source
 
 if TYPE_CHECKING:
@@ -47,10 +48,17 @@ StreamSubprocessRunner = Callable[[list[str], Callable[[str], None], float], int
 # joins it into its ``-e ssh …`` string). ``UserKnownHostsFile=/dev/null`` +
 # ``StrictHostKeyChecking=accept-new`` survive a reused IP carrying a new host key
 # (the run-2 bug); ``BatchMode`` fails fast instead of prompting; ``ConnectTimeout``
-# bounds each attempt.
+# bounds each attempt. ``LogLevel=ERROR`` quiets the per-connect "Permanently added
+# '<ip>' … to the list of known hosts" banner that ``UserKnownHostsFile=/dev/null``
+# + ``accept-new`` make ssh print on EVERY connection — load-bearing now that
+# ``[probe.assert]`` ships stderr assertions (``stderr_empty`` / ``stderr_lacks`` /
+# ``stderr_matches_not``): the banner would otherwise pollute captured probe stderr
+# and make a clean command fail ``stderr_empty``. ``ERROR`` (not ``QUIET``) keeps
+# real ``ERROR``/``FATAL`` connection failures visible.
 _BASE_SSH_OPTS: tuple[str, ...] = (
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "LogLevel=ERROR",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
 )
@@ -116,6 +124,9 @@ def build_ssh_argv(host: Host, operator: str, private_key_path: Path, command: s
     SAME IP with a DIFFERENT host key and REFUSE the connection (the run-2
     failure). Discarding the host-key store sidesteps that entirely. ``BatchMode``
     fails fast instead of prompting; a fixed connect timeout bounds each attempt.
+    ``LogLevel=ERROR`` suppresses ssh's per-connect "Permanently added" banner (an
+    INFO message ``accept-new`` emits on every connection) so it does not pollute
+    captured probe stderr, while keeping real ``ERROR``/``FATAL`` failures visible.
     Pure — the impl runs it.
     """
     return [
@@ -239,13 +250,24 @@ class OpenSshRunner:
             proc = self._run(argv, timeout)
         except subprocess.TimeoutExpired as exc:
             return _timed_out_result(probe, timeout, exc)
+        outcome = Outcome(proc.returncode, proc.stdout, proc.stderr)
+        # Compute the verdict BEFORE constructing the frozen result (D10(A)):
+        # declared assertions decide ``ok``; otherwise it is the command's exit code.
+        if probe.assertions:
+            failures = assertions.evaluate(probe.assertions, outcome)
+            ok = not failures
+        else:
+            ok = proc.returncode == 0
+            failures = ()
         return ProbeResult(
             probe_id=probe.id,
             tag=probe.tag,
             exit_code=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
-            success_when=probe.success_when,
+            ok=ok,
+            assertion_failures=failures,
+            has_assertions=len(probe.assertions) > 0,
         )
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
@@ -391,14 +413,19 @@ def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpir
     stdout = _decode_partial(exc.stdout)
     stderr = _decode_partial(exc.stderr)
     stderr = f"{stderr}\n{note}" if stderr else note
+    # A killed probe is never ok and its partial ``(124, partial-output)`` must
+    # NEVER reach the assertion evaluator (D10(E)) — the verdict short-circuits
+    # to ``False`` here without consulting ``probe.assertions``.
     return ProbeResult(
         probe_id=probe.id,
         tag=probe.tag,
         exit_code=124,
         stdout=stdout,
         stderr=stderr,
+        ok=False,
         timed_out=True,
-        success_when=probe.success_when,
+        assertion_failures=(),
+        has_assertions=len(probe.assertions) > 0,
     )
 
 

@@ -44,12 +44,9 @@ from vmlease.archbuild import (
 )
 from vmlease.battery import (
     BatteryError,
-    ShellcheckFinding,
-    ShellcheckRunner,
-    findings_at_or_above,
     lint_battery,
     load_battery,
-    shellcheck_battery,
+    structural_violations,
 )
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.imagecache import (
@@ -88,6 +85,12 @@ from vmlease.safety import (
     reap,
     run_label,
     server_type_arch,
+)
+from vmlease.shellcheck import (
+    ShellcheckFinding,
+    ShellcheckRunner,
+    findings_at_or_above,
+    shellcheck_battery,
 )
 from vmlease.ssh import OpenSshRunner
 from vmlease.summary import overall_exit_code, summarize_results, summary_filename, write_summary
@@ -796,14 +799,18 @@ def _cmd_lint(args: argparse.Namespace, *, runner: ShellcheckRunner | None = Non
     """Shellcheck every probe in a battery bundle; severity-gated exit code (D5/D6).
 
     Loads + resolves the bundle (a malformed bundle is ``error:`` + exit 2), prints
-    the advisory vacuous-ok warnings, then runs the shellcheck driver over every
+    the advisory vacuous-ok warnings, evaluates the **structural no-verdict-source**
+    rule (fatal here, advisory at load), then runs the shellcheck driver over every
     probe. ``runner`` is the injectable shellcheck seam (tests pass a fake; the
     default lets the driver spawn the real binary). Exit contract:
 
-    - clean — no finding at or above ``--severity`` → ``0``
+    - a **structural violation** → ``1`` on **every** return path (clean shellcheck,
+      shellcheck-unavailable, or ``--require-shellcheck``) — it is fatal regardless
+      of shellcheck availability.
+    - clean — no structural violation and no finding at or above ``--severity`` → ``0``
     - any finding at or above ``--severity`` → ``1``
-    - shellcheck unavailable → notice + ``0`` (advisory still ran), unless
-      ``--require-shellcheck`` makes the absence itself a ``1`` failure.
+    - shellcheck unavailable → notice + ``0`` (structural + advisory still ran),
+      unless a structural violation or ``--require-shellcheck`` forces ``1``.
     """
     try:
         battery = load_battery(Path(args.battery))
@@ -814,6 +821,11 @@ def _cmd_lint(args: argparse.Namespace, *, runner: ShellcheckRunner | None = Non
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     _warn_battery(battery)
 
+    structural = structural_violations(battery)
+    for v in structural:
+        print(f"error: {v}", file=sys.stderr)
+    has_structural = bool(structural)
+
     result = shellcheck_battery(battery, runner=runner)
     if not isinstance(result, tuple):
         # The driver returned the unavailable sentinel (binary absent / wedged).
@@ -823,12 +835,16 @@ def _cmd_lint(args: argparse.Namespace, *, runner: ShellcheckRunner | None = Non
                 file=sys.stderr,
             )
             return 1
+        if has_structural:
+            return 1
         print("notice: shellcheck unavailable — skipped; advisory checks ran", file=sys.stderr)
         return 0
 
     _print_findings(result)
     _print_lint_summary(result, args.severity)
-    return 1 if findings_at_or_above(result, args.severity) else 0
+    if has_structural or findings_at_or_above(result, args.severity):
+        return 1
+    return 0
 
 
 def _print_findings(findings: tuple[ShellcheckFinding, ...]) -> None:

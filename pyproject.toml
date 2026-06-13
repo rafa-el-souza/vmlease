@@ -11,13 +11,22 @@ requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "zerotrust-ai", email = "287701868+zerotrust-ai@users.noreply.github.com" }]
 keywords = ["hetzner", "provisioning", "vm", "ssh", "cloud-init", "throwaway", "probe"]
-dependencies = []
+dependencies = ["google-re2>=1.1"]
 
 [project.scripts]
 vmlease = "vmlease.cli:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6", "mypy>=1.11", "coverage>=7.6", "pre-commit>=3.8"]
+
+[tool.uv]
+# Wheels-only for google-re2: never fall back to a source build for this dep.
+# google-re2 publishes no musllinux wheels, so on an unsupported platform
+# (musl/Alpine) `uv sync` fails LOUD here rather than silently compiling a
+# divergent/ABI-skewed RE2+Abseil binary from sdist. The supported matrix is
+# glibc-Linux / macOS / Windows (D6). Scoped to the package (not global
+# `no-build`) so the editable root project still installs from source.
+no-build-package = ["google-re2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vmlease"]
@@ -43,6 +52,8 @@ exclude = ["*"]
 
 [tool.mypy]
 python_version = "3.11"
+# `google-re2` ships no type info; `stubs/re2.pyi` declares the surface we use.
+mypy_path = "stubs"
 strict = true
 warn_unreachable = true
 warn_redundant_casts = true

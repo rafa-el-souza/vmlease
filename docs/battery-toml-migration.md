@@ -15,18 +15,42 @@ a CI/pre-commit gate.
 **What did NOT change:** the **results** document is still JSON (and `vmlease summarize` still reads
 it); `tag` still means what a probe touches; per-probe `timeout` semantics, the consecutive-timeout
 breaker, uploads, teardown/reap — all unchanged. `ok` = exit code **unless a probe declares
-`success_when`** (a new optional key — see below). The resolved command runs **verbatim**: `tag` does
+`[probe.assert]`** (a new optional table — see below). The resolved command runs **verbatim**: `tag` does
 not inject, strip, or enforce `sudo`; the `mutating:host-root` tag authorizes and records escalation,
 and `vmlease lint` emits an advisory warning when a non-host-root probe invokes `sudo` (a mislabel,
 not a block). The `plan`/`run`/`status`/`reap` CLI surface is unchanged except that `--battery` now
 takes the manifest path.
 
-**New optional key — `success_when`:** a probe may declare a single literal token (e.g.
-`success_when = "CORE_RUNNING_OK"`). When present, it **replaces** the exit-code reading: `ok` is true
-iff that token appears as a *complete line* of the probe's stdout (substring matches do not count, and
-the exit code is ignored). Such a probe needs no `rc=0; …; exit $rc` plumbing and is exempt from the
-vacuous-ok lint warning. A timed-out probe is never `ok` regardless of `success_when`. Omit the key to
-keep the exit-code reading; existing batteries that never declare it behave exactly as before.
+**New optional table — `[probe.assert]`:** a probe may declare a table of **assertions** the runner
+evaluates against the captured outcome `(exit_code, stdout, stderr)`. When present, the assertion
+result **replaces** the exit-code reading: `ok` is true iff every declared assertion holds, and a
+failure reports **which** assertion failed (no more `rc=0; …; exit $rc` plumbing or hand-grepped
+tokens). The vocabulary is twelve self-describing kinds:
+
+| Key | Value | Holds when |
+|---|---|---|
+| `exit` | int | exit code equals N |
+| `exit_not` | int | exit code ≠ N (`exit_not = 0` is the refusal-probe gate) |
+| `stdout_has` / `stderr_has` | str \| [str] | each value is a literal substring of the stream (list = all hold) |
+| `stdout_lacks` / `stderr_lacks` | str \| [str] | none of the values is a substring of the stream |
+| `stdout_matches` / `stderr_matches` | str \| [str] | each RE2 pattern matches the stream (list = all match) |
+| `stdout_matches_not` / `stderr_matches_not` | str \| [str] | no RE2 pattern matches the stream |
+| `stdout_empty` / `stderr_empty` | bool | the stream is empty (`true`) / non-empty (`false`) |
+
+`_has`/`_lacks` are **literal substring** matches (the old `success_when = "TOKEN"` becomes
+`stdout_has = "TOKEN"` — note the reading changes from complete-line to substring; for an exact line use
+`stdout_matches = '(?m)^TOKEN$'`, the `(?m)` required because RE2 anchors `^`/`$` to the whole text by
+default). Regex patterns use RE2 (linear-time, no backreferences/lookaround) and are compiled at
+load/lint, so a malformed pattern fails loud naming the probe — never at evaluation. A timed-out probe
+is never `ok` regardless of its assertions. Omit the table to keep the exit-code reading.
+
+**`vmlease lint` now HARD-FAILS a no-verdict-source probe.** A probe that prints pass/fail tokens but
+neither declares `[probe.assert]` nor exit-gates (`&& echo`/`|| echo` or a trailing `echo` without a
+statement-level `exit`) cannot report failure — it reads green over a failed command. `vmlease lint`
+now exits non-zero on this, naming the probe. This is a **structural** gate, **separate** from the
+shellcheck severity gate (it fires even when shellcheck is unavailable and regardless of `--severity`):
+the fix is to declare assertions or add an `exit $rc`. An honest info / exit-code probe (one that prints
+no tokens) is exempt.
 
 ---
 
@@ -90,7 +114,7 @@ exit $rc
 | `probes: [...]` | `[[probe]]` tables | one table per probe, **in execution order** (see step 2) |
 | `id`, `title`, `tag`, `classifies`, `timeout` | same keys | unchanged meaning and validation |
 | `command` | **exactly one of** `run = '''…'''` or `script = "file.sh"` | `run` for one-liners; `script` for anything non-trivial |
-| *(none)* | `success_when = "TOKEN"` | **new, optional** probe key — `ok` becomes "TOKEN is a complete stdout line" instead of exit-code 0 (see above); omit to keep exit-code semantics |
+| *(none)* | `[probe.assert]` table | **new, optional** — declares assertions over `(exit_code, stdout, stderr)`; `ok` becomes "every assertion holds" instead of exit-code 0 (see above); omit to keep exit-code semantics |
 
 The schema is **strict**: any key not listed above — at the root or on a probe — is rejected by name
 (a `timout` typo now fails loud instead of silently using the default). An empty `run` block or empty
@@ -193,6 +217,7 @@ zero provider calls. If `plan` is happy, `run` behaves exactly as before.
 | empty command | empty/whitespace-only `run` block or script file | a probe must do something; delete it or fill it in |
 | TOML parse error | usually quoting — remember `'''…'''` literal blocks need **no** escaping | if your shell itself contains `'''`, use a `script` file |
 | probe runs "too early/late" | you relied on the old tag-rank auto-sort | reorder the `[[probe]]` tables (step 2) |
+| `vmlease lint` fails: probe has no verdict source | a probe prints pass/fail tokens but neither declares `[probe.assert]` nor exit-gates — it can't report failure (structural gate, separate from shellcheck severity) | declare `[probe.assert]`, or add a statement-level `exit $rc`; an honest info probe that prints no tokens is exempt |
 
 ## Known consumers
 

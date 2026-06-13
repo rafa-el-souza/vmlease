@@ -9,6 +9,42 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple, Protocol, runtime_checkable
+
+
+class Outcome(NamedTuple):
+    """The captured result of one probe command — the input an assertion reads.
+
+    A flat ``(exit_code, stdout, stderr)`` triple the runner passes to each
+    assertion's :meth:`Assertion.check`. Pure
+    data, no engine: this keeps :mod:`vmlease.model` free of the regex backend
+    (``re2`` lives only in :mod:`vmlease.assertions`).
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@runtime_checkable
+class Assertion(Protocol):
+    """A predicate over a probe's :class:`Outcome` — structural typing only.
+
+    The concrete, value-bound kinds live in :mod:`vmlease.assertions` (which may
+    import a regex engine); they satisfy this Protocol structurally. ``model.py``
+    defines only the shape so ``Probe`` can reference it without importing the
+    engine — import direction is one-way (``assertions`` → ``model``).
+    """
+
+    def check(self, outcome: Outcome) -> str | None:
+        """A single-line failure description, or ``None`` when the assertion holds.
+
+        Computed in one pass: ``None`` means the predicate held; a non-empty
+        ``str`` is the single-source failure description (built through
+        ``assertions._describe``). The match is computed once — no separate
+        bool pass + describe re-scan.
+        """
+        ...
 
 
 class ProbeTag(StrEnum):
@@ -52,12 +88,6 @@ class Probe:
             (host-root authorizes and records escalation; the command still runs
             verbatim and an advisory lint, not the tag, flags a mismatch); it
             does NOT order execution — probes run in authoring order.
-        success_when: Optional literal success token. When non-empty, the
-            probe's :attr:`ProbeResult.ok` is decided by this token appearing as
-            a **complete line** of stdout (leading/trailing whitespace stripped),
-            replacing the exit-code reading — the author emits it as its own line
-            (``echo TOKEN``). ``""`` (the default, back-compatible) keeps ``ok``
-            exit-code-based.
         classifies: The design action this probe classifies (free text, for the
             results report — e.g. "L2 subuid append").
         timeout: Optional per-probe wall-clock bound (seconds) for the bounded
@@ -65,6 +95,13 @@ class Probe:
             the runner's run-wide default" — the SSH layer resolves the effective
             value and enforces it, recording a timed-out :class:`ProbeResult`
             rather than hanging.
+        assertions: The declarative ``[probe.assert]`` predicates over the
+            probe's :class:`Outcome`, compiled from the manifest by the loader.
+            Each satisfies the :class:`Assertion` Protocol (the concrete kinds —
+            and the regex engine — live in :mod:`vmlease.assertions`, never
+            here). ``()`` (the default, back-compatible) means no declarative
+            assertions. This field is typed by the Protocol so ``model.py``
+            stays engine-free.
     """
 
     id: str
@@ -74,7 +111,7 @@ class Probe:
     classifies: str = ""
     timeout: float | None = None
     source: str = ""
-    success_when: str = ""
+    assertions: tuple[Assertion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -186,6 +223,28 @@ class Image:
 class ProbeResult:
     """The captured outcome of one probe on one host.
 
+    ``ok`` is a **runner-computed STORED verdict** (D9/M1): the SSH layer
+    evaluates the probe's declarative assertions (or, when none are declared,
+    its exit code) in :meth:`OpenSshRunner.run_probe`
+    BEFORE constructing this frozen result, then stores the boolean here. It is
+    REQUIRED (no default — a defaulted verdict would silently mis-pass). The
+    model stays engine-free: it imports neither the regex backend (``re2``) nor
+    :mod:`vmlease.assertions`; the verdict arrives already computed.
+    ``assertion_failures`` carries the :meth:`Assertion.check` failure
+    description of each FAILED
+    declarative assertion (``()`` when none failed or none were declared) — the
+    parsed assertion list itself never travels into the result.
+
+    ``has_assertions`` (default ``False``, back-compatible) is a stored metadata
+    bool the runner sets from the DECLARED assertion count
+    (``len(probe.assertions) > 0``), NOT from ``assertion_failures`` (D10(C)): a
+    PASSING assertion probe has ``assertion_failures=()``, indistinguishable from
+    a no-assertion probe, so the count cannot be re-derived downstream. It lets
+    ``serialize_run`` (which only sees ``ProbeResult``, never the ``Probe``) emit
+    the assertions signal so the summarizer can route to the assertion verdict
+    branch. This is a metadata bool, not the engine-bearing assertion list —
+    ``model.py`` stays engine-free.
+
     ``timed_out`` (default ``False``, back-compatible) marks a result the bounded
     probe transport produced because the command outlived its effective timeout:
     the SSH layer killed the local process and recorded this result (sentinel exit
@@ -200,27 +259,10 @@ class ProbeResult:
     exit_code: int
     stdout: str
     stderr: str
+    ok: bool
     timed_out: bool = False
-    success_when: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """Whether the probe passed, by exactly one of two readings.
-
-        A timed-out result is never ok — a killed probe's partial output is not
-        a verdict. Otherwise, when ``success_when`` is declared (non-empty), the
-        probe is ok iff that token appears as a **complete line** of stdout
-        (each line stripped of leading/trailing whitespace) — the exit code does
-        not participate. When ``success_when`` is ``""`` (the default,
-        back-compatible reading), the probe is ok iff it exited zero.
-        Interpretation of a not-ok result is per-probe; it may be an *expected*
-        fail — see the battery doc.
-        """
-        if self.timed_out:
-            return False
-        if self.success_when:
-            return any(line.strip() == self.success_when for line in self.stdout.splitlines())
-        return self.exit_code == 0
+    assertion_failures: tuple[str, ...] = ()
+    has_assertions: bool = False
 
 
 @dataclass(frozen=True)

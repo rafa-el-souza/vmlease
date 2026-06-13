@@ -11,8 +11,7 @@ shell scripts, parsed with the standard-library ``tomllib`` (no third-party
 dependency). The manifest carries a non-empty string ``name`` and a non-empty
 ``[[probe]]`` array. Each probe declares a stable ``id``, a ``title``, a ``tag``
 (one of the :class:`~vmlease.model.ProbeTag` values), optional ``classifies``
-label, ``timeout`` (seconds) and ``success_when`` token (see the authoring
-caveat below), and **exactly one of**:
+label and ``timeout`` (seconds), and **exactly one of**:
 
 - ``run`` — a literal inline shell block (TOML's ``'''…'''`` multi-line strings
   need no escaping), used verbatim as the command; provenance ``"<inline>"``.
@@ -45,8 +44,8 @@ order they run and are recorded; ``tag`` records what a probe touches but does
 NOT reorder execution. A probe's ``ok`` is its command's **exit code by
 default**, so gate assertions with ``exit $rc`` (a command ending in
 ``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
-it printed). A probe MAY instead declare an optional ``success_when`` token:
-then ``ok`` is whether that token appears as a complete line of stdout (exit
+it printed). A probe MAY instead declare ``[probe.assert]`` predicates: then
+``ok`` is whether every declared assertion holds over the probe's outcome (exit
 code ignored), so such a probe needs no ``exit $rc`` and is exempt from the
 vacuous-ok warning. On sudo: the resolved command runs **verbatim** — ``tag``
 does not inject, strip, or enforce ``sudo``; the ``mutating:host-root`` tag
@@ -65,16 +64,16 @@ guarantee.
 from __future__ import annotations
 
 import re
-import subprocess
 import tomllib
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
-from vmlease.model import Battery, Probe, ProbeTag
+from vmlease.assertions import _ASSERTIONS
+from vmlease.model import Assertion, Battery, Probe, ProbeTag
 
-_PROBE_KEYS = frozenset({"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when"})
+_PROBE_KEYS = frozenset(
+    {"id", "title", "tag", "classifies", "timeout", "run", "script", "assert"}
+)
 _ROOT_KEYS = frozenset({"name", "probe"})
 
 
@@ -117,7 +116,7 @@ class _ProbeSpec:
     timeout: float | None
     run: str | None
     script: str | None
-    success_when: str = ""
+    assertions: tuple[Assertion, ...] = ()
 
 
 def parse_battery(text: str) -> _BatterySpec:
@@ -180,7 +179,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         valid = [t.value for t in ProbeTag]
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
     timeout = _parse_timeout(index, raw)
-    success_when = _parse_success_when(index, raw)
+    assertions = _parse_assertions(index, raw)
     run, script = _parse_command_form(index, raw)
     return _ProbeSpec(
         id=str(raw["id"]),
@@ -190,7 +189,7 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         timeout=timeout,
         run=run,
         script=script,
-        success_when=success_when,
+        assertions=assertions,
     )
 
 
@@ -235,22 +234,40 @@ def _parse_timeout(index: int, raw: dict[object, object]) -> float | None:
     return float(value)
 
 
-def _parse_success_when(index: int, raw: dict[object, object]) -> str:
-    """Parse the optional per-probe ``success_when`` literal token.
+def _parse_assertions(index: int, raw: dict[object, object]) -> tuple[Assertion, ...]:
+    """Compile the optional ``[probe.assert]`` table into bound :class:`Assertion`s.
 
-    Absent means ``""`` (exit-code reading — back-compatible). A *declared* value
-    must be a non-empty, non-whitespace-only string; a non-string or a
-    whitespace-only value is a malformed battery and raises :class:`BatteryError`
-    naming the probe.
+    Absent → ``()`` (back-compatible). A present ``assert`` must be a TOML table
+    (dict); each key must name a kind in the ``vmlease.assertions._ASSERTIONS``
+    registry (the registry key set IS the schema — an unknown key is rejected
+    naming it, mirroring the ``_PROBE_KEYS`` unknown-key message). For each known
+    key the kind's ``validate`` then ``build`` run **here, in the pure pass** —
+    so a malformed regex (compiled inside ``validate``/``build`` per D10(I))
+    surfaces as a :class:`BatteryError` at load, not at evaluation. A ``ValueError``
+    from either is re-raised as :class:`BatteryError` naming the probe AND the
+    assertion key (D10(J)).
     """
-    if "success_when" not in raw:
-        return ""
-    value = raw["success_when"]
-    if not isinstance(value, str) or not value.strip():
+    if "assert" not in raw:
+        return ()
+    table = raw["assert"]
+    if not isinstance(table, dict):
+        raise BatteryError(f"probe #{index} 'assert' must be a table")
+    unknown = set(table) - set(_ASSERTIONS)
+    if unknown:
         raise BatteryError(
-            f"probe #{index} 'success_when' must be a non-empty string, got {value!r}"
+            f"probe #{index} has unrecognized assertion key(s): {sorted(unknown)}"
         )
-    return value
+    built: list[Assertion] = []
+    for key, value in table.items():
+        kind = _ASSERTIONS[key]
+        try:
+            kind.validate(value)
+            built.append(kind.build(value))
+        except ValueError as exc:
+            raise BatteryError(
+                f"probe #{index} assertion {key!r} is malformed: {exc}"
+            ) from exc
+    return tuple(built)
 
 
 def _assert_unique_ids(specs: tuple[_ProbeSpec, ...]) -> None:
@@ -294,7 +311,7 @@ def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:
         classifies=spec.classifies,
         timeout=spec.timeout,
         source=source,
-        success_when=spec.success_when,
+        assertions=spec.assertions,
     )
 
 
@@ -323,19 +340,45 @@ def _resolve_script_ref(probe_id: str, script: str, base_dir: Path) -> str:
         raise BatteryError(f"probe {probe_id!r} cannot read script {script!r}: {exc}") from exc
 
 
+def structural_violations(battery: Battery) -> tuple[str, ...]:
+    """No-verdict-source structural findings (the fatal subset of ``lint_battery``).
+
+    A probe that **declares no assertions** whose command prints tokens without an
+    explicit ``exit`` (see :func:`_looks_vacuously_ok`) has no source of truth for
+    its ``ok`` other than the command's exit code — which an un-gated token tail
+    leaves at ``0`` regardless of what it printed. There is no verdict source.
+
+    This is the same detection as the vacuous-ok advisory in :func:`lint_battery`
+    (single-sourced here so the advisory set and the fatal set are identical); a
+    probe that **declares assertions** (``[probe.assert]``) or **exit-gates** its
+    command is exempt. The ``vmlease lint`` command gates a non-zero exit on a
+    non-empty result; at load it stays advisory via :func:`lint_battery`.
+    """
+    violations: list[str] = []
+    for probe in battery.probes:
+        if not probe.assertions and _looks_vacuously_ok(probe.command):
+            violations.append(
+                f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
+                f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
+            )
+    return tuple(violations)
+
+
 def lint_battery(battery: Battery) -> tuple[str, ...]:
     """Non-fatal authoring warnings for a battery (never raises; ``()`` = clean).
 
     Probes execute in **authoring order**, so there is no reorder to surprise an
     author; two footguns are checked, both advisory:
 
-    - **vacuous-ok** — a probe **without** a ``success_when`` declaration whose
-      ``ok`` is its command's exit code. A command that prints OK/FAIL tokens but is
-      not ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what
-      it printed. Gate with ``exit $rc``. A probe **with** a ``success_when``
-      declaration is **exempt**: its ``ok`` is read from the declared token, not the
-      exit code, so an un-gated token-printing tail is exactly the intended
-      authoring style, not a footgun.
+    - **vacuous-ok** — a probe that **declares no assertions** whose ``ok`` is its
+      command's exit code. A command that prints OK/FAIL tokens but is not
+      ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what it
+      printed. Gate with ``exit $rc``. A probe that **declares assertions**
+      (``[probe.assert]``) is **exempt**: its ``ok`` is read from those declared
+      predicates, not the exit code, so an un-gated token-printing tail is exactly
+      the intended authoring style, not a footgun. These findings are
+      single-sourced from :func:`structural_violations` (the advisory set is the
+      same set ``vmlease lint`` gates on as fatal).
 
     - **non-host-root sudo** — a probe whose tag is not ``MUTATING_HOST_ROOT`` but
       whose command invokes ``sudo``. The escalation authoring contract reserves
@@ -347,13 +390,8 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     guarantee is still the author's ``exit $rc`` / tag. Warnings are advisory — the
     run and ``ok`` are unaffected, and a single probe may trigger both rules.
     """
-    warnings: list[str] = []
+    warnings: list[str] = list(structural_violations(battery))
     for probe in battery.probes:
-        if not probe.success_when and _looks_vacuously_ok(probe.command):
-            warnings.append(
-                f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
-                f"prints tokens without an explicit exit -- gate it with 'exit $rc'"
-            )
         if probe.tag is not ProbeTag.MUTATING_HOST_ROOT and _invokes_sudo(probe.command):
             warnings.append(
                 f"probe {probe.id!r}: command invokes sudo but the probe is not tagged "
@@ -394,177 +432,3 @@ def _looks_vacuously_ok(command: str) -> bool:
         return True
     last = re.split(r"[;\n]", command.strip())[-1].strip()
     return last == "echo" or last.startswith("echo ")
-
-
-# --------------------------------------------------------------------------- #
-# shellcheck driver — severity-graded findings over every probe (D5/D6/D7)
-# --------------------------------------------------------------------------- #
-
-Severity = Literal["error", "warning", "note", "style"]
-
-# Severity ranking: ``style < note < warning < error`` (D5/Risks). shellcheck's
-# ``--format=gcc`` emits exactly these four; ``style`` sits below ``note``.
-_SEVERITY_RANK: dict[Severity, int] = {"style": 0, "note": 1, "warning": 2, "error": 3}
-
-# The four gcc-format severities as proper :data:`Severity` literals, keyed by the
-# matched string so the regex group narrows to ``Severity`` without a cast (the
-# ``_GCC_LINE`` alternation guarantees the key is present, so direct indexing has
-# no unreachable fallback branch).
-_SEVERITIES: dict[str, Severity] = {"error": "error", "warning": "warning", "note": "note", "style": "style"}
-
-# House discipline — every subprocess is bounded. shellcheck over a single probe
-# is sub-second in practice; 60s is a generous ceiling that still bounds a wedged
-# binary (mirrors ssh/provider-destroy's bound-every-subprocess posture).
-_SHELLCHECK_TIMEOUT = 60.0
-
-# The runner seam: ``(argv, stdin_text_or_None) -> CompletedProcess``. Injected so
-# tests drive the driver with fakes — no real shellcheck is ever invoked in unit
-# tests (mirrors ``ssh.SshSubprocessRunner``).
-ShellcheckRunner = Callable[[list[str], "str | None"], "subprocess.CompletedProcess[str]"]
-
-
-class _ShellcheckUnavailable:
-    """Distinct sentinel for "shellcheck could not be consulted" (D5/D6).
-
-    A module-level singleton (:data:`SHELLCHECK_UNAVAILABLE`) returned by
-    :func:`shellcheck_battery` when the binary is absent (``FileNotFoundError``)
-    or wedged (``subprocess.TimeoutExpired``) — distinct from an empty findings
-    tuple (which means "consulted, nothing flagged"). The CLI (next milestone)
-    surfaces it as a skip, never an exception.
-    """
-
-    __slots__ = ()
-
-
-SHELLCHECK_UNAVAILABLE = _ShellcheckUnavailable()
-
-
-@dataclass(frozen=True)
-class ShellcheckFinding:
-    """One shellcheck finding, located back to the probe that produced it.
-
-    ``location`` is the probe's ``source`` — the script path for a ``script``
-    probe (so gcc-format line numbers, which index the script content == the file
-    content, still align with the file), or the probe id label for a ``run``
-    probe (whose block is fed via stdin and so has no filename of its own).
-    """
-
-    probe_id: str
-    location: str
-    line: int
-    column: int
-    severity: Severity
-    code: str
-    message: str
-
-
-# ``<file>:<line>:<col>: <severity>: <message>`` — shellcheck ``--format=gcc``. The
-# SC code is appended in brackets at the end of the message (``... [SC2015]``); it
-# is pulled out separately so ``code`` and ``message`` are clean.
-_GCC_LINE = re.compile(
-    r"^(?P<file>[^:]*):(?P<line>\d+):(?P<col>\d+):\s*(?P<severity>error|warning|note|style):\s*(?P<message>.*)$"
-)
-_CODE_SUFFIX = re.compile(r"\s*\[(SC\d+)\]\s*$")
-
-
-def shellcheck_battery(
-    battery: Battery, *, runner: ShellcheckRunner | None = None
-) -> tuple[ShellcheckFinding, ...] | _ShellcheckUnavailable:
-    """Shellcheck every probe in ``battery``; return findings or the skip sentinel.
-
-    Each probe's command is fed to ``shellcheck --shell=bash --format=gcc -`` over
-    **stdin** (both probe kinds, uniformly). Feeding via stdin is deliberate: since
-    ``Probe.command`` already holds the resolved file contents, stdin sidesteps
-    BOTH the flag-like-path question (there is no path on the argv, so the ``--``
-    guard has nothing to guard) AND the path-resolution question (the driver only
-    ever receives a resolved :class:`Battery`, never the manifest directory).
-    shellcheck's gcc-format line numbers index the stdin content, which for a
-    ``script`` probe IS the file's content — so line numbers still align with the
-    file. Each finding is labelled with the probe's ``source`` (the script path for
-    a ``script`` probe, the probe id for a ``run`` probe) so it stays locatable.
-
-    The runner seam ``(argv, stdin_text) -> CompletedProcess`` is injected for
-    tests; the default uses :func:`subprocess.run` bounded by
-    :data:`_SHELLCHECK_TIMEOUT` (never ``shell=True``). Two boundary outcomes both
-    yield :data:`SHELLCHECK_UNAVAILABLE` (a skip, never an exception): a
-    ``FileNotFoundError`` (binary not installed) and a
-    :class:`subprocess.TimeoutExpired` (wedged binary). Treating a timeout as
-    unavailable — rather than as a finding-less error — keeps the contract simple:
-    a driver that could not get a verdict from shellcheck reports exactly that, and
-    the caller decides (skip vs. ``--require-shellcheck`` fail) uniformly.
-
-    Kept **per-script-ref**-shaped (iterates probes, one shellcheck call each) so a
-    future ``[[prep]]`` section (D7) reuses it verbatim.
-    """
-    run = runner if runner is not None else _default_shellcheck_runner
-    findings: list[ShellcheckFinding] = []
-    for probe in battery.probes:
-        argv = ["shellcheck", "--shell=bash", "--format=gcc", "-"]
-        try:
-            proc = run(argv, probe.command)
-        except FileNotFoundError:
-            return SHELLCHECK_UNAVAILABLE
-        except subprocess.TimeoutExpired:
-            return SHELLCHECK_UNAVAILABLE
-        findings.extend(_parse_gcc_output(probe, proc.stdout))
-    return tuple(findings)
-
-
-def _default_shellcheck_runner(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
-    """Run ``argv`` feeding ``stdin_text``, bounded by :data:`_SHELLCHECK_TIMEOUT`.
-
-    Never ``shell=True``. ``subprocess.run`` drains the pipes concurrently and, on
-    expiry, kills the process and raises :class:`subprocess.TimeoutExpired`;
-    :func:`shellcheck_battery` turns both that and a ``FileNotFoundError`` into the
-    unavailable sentinel. A non-zero shellcheck exit (findings present) is normal —
-    ``check=False`` keeps it as data, not an exception.
-    """
-    return subprocess.run(
-        argv,
-        input=stdin_text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_SHELLCHECK_TIMEOUT,
-    )
-
-
-def _parse_gcc_output(probe: Probe, output: str) -> list[ShellcheckFinding]:
-    """Parse ``shellcheck --format=gcc`` ``output`` into findings for ``probe``.
-
-    Non-matching lines (blank lines, banners) are tolerated and skipped. The SC
-    code is split off the trailing ``[SCnnnn]`` bracket; a line with no code keeps
-    an empty ``code``.
-    """
-    findings: list[ShellcheckFinding] = []
-    for raw in output.splitlines():
-        match = _GCC_LINE.match(raw)
-        if match is None:
-            continue
-        message = match["message"].strip()
-        code = ""
-        code_match = _CODE_SUFFIX.search(message)
-        if code_match is not None:
-            code = code_match.group(1)
-            message = message[: code_match.start()].strip()
-        severity = _SEVERITIES[match["severity"]]
-        findings.append(
-            ShellcheckFinding(
-                probe_id=probe.id,
-                location=probe.source,
-                line=int(match["line"]),
-                column=int(match["col"]),
-                severity=severity,
-                code=code,
-                message=message,
-            )
-        )
-    return findings
-
-
-def findings_at_or_above(
-    findings: tuple[ShellcheckFinding, ...], threshold: Severity
-) -> tuple[ShellcheckFinding, ...]:
-    """Findings whose severity is ``>= threshold`` in ``style < note < warning < error``."""
-    floor = _SEVERITY_RANK[threshold]
-    return tuple(f for f in findings if _SEVERITY_RANK[f.severity] >= floor)
