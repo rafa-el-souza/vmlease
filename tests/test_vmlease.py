@@ -43,6 +43,7 @@ from vmlease import (
     workload,
 )
 from vmlease import battery as battery_mod
+from vmlease import shellcheck as shellcheck_mod
 from vmlease.model import Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
 
 
@@ -1165,7 +1166,7 @@ class TestShellcheckDriver(unittest.TestCase):
 
     def test_parses_severities_codes_locations(self) -> None:
         b = self._b(Probe(id="PREP", title="prep", command="x=$(date)\n\ngrep f && a || b", tag=ProbeTag.READ_ONLY, source="prep.sh"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(_GCC_SAMPLE))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(_GCC_SAMPLE))
         assert isinstance(findings, tuple)
         self.assertEqual(len(findings), 2)
         warn, note = findings
@@ -1179,7 +1180,7 @@ class TestShellcheckDriver(unittest.TestCase):
     def test_run_probe_labelled_by_probe_id_and_fed_via_stdin(self) -> None:
         b = self._b(Probe(id="KVER", title="k", command="uname -r && echo ok || echo no", tag=ProbeTag.READ_ONLY, source="<inline>"))
         runner = self._runner("-:1:9: note: msg [SC2015]\n")
-        findings = battery_mod.shellcheck_battery(b, runner=runner)
+        findings = shellcheck_mod.shellcheck_battery(b, runner=runner)
         assert isinstance(findings, tuple)
         # run-block findings are located by the probe's source ("<inline>") + id
         self.assertEqual(findings[0].location, "<inline>")
@@ -1194,7 +1195,7 @@ class TestShellcheckDriver(unittest.TestCase):
             Probe(id="S", title="s", command="echo from-script", tag=ProbeTag.READ_ONLY, source="s.sh"),
             Probe(id="R", title="r", command="echo from-run", tag=ProbeTag.READ_ONLY, source="<inline>"),
         )
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:1:1: style: m [SC2086]\n"))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("-:1:1: style: m [SC2086]\n"))
         assert isinstance(findings, tuple)
         self.assertEqual([f.location for f in findings], ["s.sh", "<inline>"])
         # every call fed the command text over stdin, no path on the argv
@@ -1206,13 +1207,13 @@ class TestShellcheckDriver(unittest.TestCase):
     def test_non_matching_lines_skipped(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
         noisy = "\nIn - line 1:\n^-- some caret art\n" + _GCC_SAMPLE
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(noisy))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(noisy))
         assert isinstance(findings, tuple)
         self.assertEqual(len(findings), 2)
 
     def test_finding_without_code_keeps_empty_code(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("-:2:4: error: bare message no code\n"))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("-:2:4: error: bare message no code\n"))
         assert isinstance(findings, tuple)
         self.assertEqual(findings[0].code, "")
         self.assertEqual(findings[0].message, "bare message no code")
@@ -1223,7 +1224,7 @@ class TestShellcheckDriver(unittest.TestCase):
         def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
             raise FileNotFoundError("shellcheck")
 
-        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+        self.assertIs(shellcheck_mod.shellcheck_battery(b, runner=_run), shellcheck_mod.SHELLCHECK_UNAVAILABLE)
 
     def test_timeout_yields_unavailable_sentinel(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
@@ -1231,7 +1232,7 @@ class TestShellcheckDriver(unittest.TestCase):
         def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
             raise subprocess.TimeoutExpired(argv, 60.0)
 
-        self.assertIs(battery_mod.shellcheck_battery(b, runner=_run), battery_mod.SHELLCHECK_UNAVAILABLE)
+        self.assertIs(shellcheck_mod.shellcheck_battery(b, runner=_run), shellcheck_mod.SHELLCHECK_UNAVAILABLE)
 
     def test_findings_at_or_above_thresholds(self) -> None:
         b = self._b(Probe(id="P", title="p", command="x", tag=ProbeTag.READ_ONLY, source="<inline>"))
@@ -1241,17 +1242,17 @@ class TestShellcheckDriver(unittest.TestCase):
             "-:3:1: warning: w [SC2155]\n"
             "-:4:1: error: e [SC1009]\n"
         )
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner(sample))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner(sample))
         assert isinstance(findings, tuple)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "style")), 4)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "note")), 3)
-        self.assertEqual(len(battery_mod.findings_at_or_above(findings, "warning")), 2)
-        sev = [f.severity for f in battery_mod.findings_at_or_above(findings, "error")]
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "style")), 4)
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "note")), 3)
+        self.assertEqual(len(shellcheck_mod.findings_at_or_above(findings, "warning")), 2)
+        sev = [f.severity for f in shellcheck_mod.findings_at_or_above(findings, "error")]
         self.assertEqual(sev, ["error"])
 
     def test_clean_battery_yields_empty_findings_not_sentinel(self) -> None:
         b = self._b(Probe(id="P", title="p", command="uname -r", tag=ProbeTag.READ_ONLY, source="<inline>"))
-        findings = battery_mod.shellcheck_battery(b, runner=self._runner("", returncode=0))
+        findings = shellcheck_mod.shellcheck_battery(b, runner=self._runner("", returncode=0))
         self.assertEqual(findings, ())
 
 

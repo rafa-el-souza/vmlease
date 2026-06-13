@@ -44,12 +44,8 @@ from vmlease.archbuild import (
 )
 from vmlease.battery import (
     BatteryError,
-    ShellcheckFinding,
-    ShellcheckRunner,
-    findings_at_or_above,
     lint_battery,
     load_battery,
-    shellcheck_battery,
 )
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.imagecache import (
@@ -88,6 +84,12 @@ from vmlease.safety import (
     reap,
     run_label,
     server_type_arch,
+)
+from vmlease.shellcheck import (
+    ShellcheckFinding,
+    ShellcheckRunner,
+    findings_at_or_above,
+    shellcheck_battery,
 )
 from vmlease.ssh import OpenSshRunner
 from vmlease.summary import overall_exit_code, summarize_results, summary_filename, write_summary
