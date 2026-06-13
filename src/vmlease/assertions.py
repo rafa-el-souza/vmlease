@@ -9,7 +9,7 @@ three responsibilities (D4):
   registry key set IS the schema; an unknown key is rejected upstream).
 * ``build(value)`` — produce an object satisfying the
   :class:`~vmlease.model.Assertion` Protocol, **bound to** the parsed value.
-* the built object's ``evaluate(outcome) -> bool`` / ``describe(outcome) -> str``.
+* the built object's ``check(outcome) -> str | None``.
 
 This module imports :mod:`vmlease.model` and the RE2 engine (:mod:`re2`) — the
 regex pair (``*_matches``/``*_matches_not``) compiles patterns through
@@ -42,11 +42,12 @@ def evaluate(assertions: tuple[Assertion, ...], outcome: Outcome) -> tuple[str, 
 
     The runner (:meth:`OpenSshRunner.run_probe`) calls this to compute a probe's
     ``ok`` verdict: an empty result means every assertion held (``ok``); a
-    non-empty tuple carries the :meth:`Assertion.describe` of each assertion that
-    failed, in authoring order, for the result's ``assertion_failures`` field.
-    ``describe`` is only invoked on a failing assertion (its contract).
+    non-empty tuple carries each assertion's :meth:`Assertion.check` failure
+    description, in authoring order, for the result's ``assertion_failures``
+    field. Each ``check`` returns its failure description or ``None`` in a single
+    pass — the non-``None`` strings form ``assertion_failures``.
     """
-    return tuple(a.describe(outcome) for a in assertions if not a.evaluate(outcome))
+    return tuple(msg for a in assertions if (msg := a.check(outcome)) is not None)
 
 
 def _describe(key: str, value_repr: str, reason: str) -> str:
@@ -112,13 +113,12 @@ class _ExitAssertion:
     expected: int
     negated: bool
 
-    def evaluate(self, outcome: Outcome) -> bool:
+    def check(self, outcome: Outcome) -> str | None:
         equal = outcome.exit_code == self.expected
-        return (not equal) if self.negated else equal
-
-    def describe(self, outcome: Outcome) -> str:
-        reason = f"exit was {outcome.exit_code}"
-        return _describe(self.key, str(self.expected), reason)
+        passed = (not equal) if self.negated else equal
+        if passed:
+            return None
+        return _describe(self.key, str(self.expected), f"exit was {outcome.exit_code}")
 
 
 @dataclass(frozen=True)
@@ -137,18 +137,16 @@ class _SubstringAssertion:
     def _text(self, outcome: Outcome) -> str:
         return outcome.stderr if self.stream == "stderr" else outcome.stdout
 
-    def evaluate(self, outcome: Outcome) -> bool:
+    def check(self, outcome: Outcome) -> str | None:
         text = self._text(outcome)
         if self.lacks:
-            return not any(value in text for value in self.values)
-        return all(value in text for value in self.values)
-
-    def describe(self, outcome: Outcome) -> str:
-        text = self._text(outcome)
-        if self.lacks:
-            present = next(value for value in self.values if value in text)
+            present = next((v for v in self.values if v in text), None)
+            if present is None:
+                return None
             return _describe(self.key, _quote(present), "substring present")
-        missing = next(value for value in self.values if value not in text)
+        missing = next((v for v in self.values if v not in text), None)
+        if missing is None:
+            return None
         return _describe(self.key, _quote(missing), "substring not found")
 
 
@@ -163,11 +161,10 @@ class _EmptyAssertion:
     def _text(self, outcome: Outcome) -> str:
         return outcome.stderr if self.stream == "stderr" else outcome.stdout
 
-    def evaluate(self, outcome: Outcome) -> bool:
+    def check(self, outcome: Outcome) -> str | None:
         is_empty = self._text(outcome).strip() == ""
-        return is_empty == self.expect_empty
-
-    def describe(self, outcome: Outcome) -> str:
+        if is_empty == self.expect_empty:
+            return None
         reason = (
             f"{self.stream} was not empty"
             if self.expect_empty
@@ -198,14 +195,19 @@ def _compile_re2(key: str, pattern: str) -> CompiledPattern:
     try:
         return re2.compile(pattern, options=options)
     except re2.error as exc:
-        raise ValueError(f"{key} {_quote(pattern)}: invalid regex — {exc}") from exc
+        detail = (
+            exc.args[0].decode("utf-8", "replace")
+            if exc.args and isinstance(exc.args[0], bytes)
+            else str(exc)
+        )
+        raise ValueError(f"{key} {_quote(pattern)}: invalid regex — {detail}") from exc
 
 
 @dataclass(frozen=True)
 class _RegexAssertion:
     """``*_matches`` / ``*_matches_not`` — RE2 pattern over a stream (D5/D6).
 
-    Patterns are compiled at build/validate time (D10(I)); ``evaluate`` runs an
+    Patterns are compiled at build/validate time (D10(I)); ``check`` runs an
     UNANCHORED ``rx.search`` (matches anywhere — consistent with substring
     ``_has``; RE2 anchors ``^``/``$`` to the whole text unless ``(?m)``, D8#1).
     A list CONJOINS (D8#5): ``_matches`` → ALL patterns match (empty stream →
@@ -224,19 +226,17 @@ class _RegexAssertion:
     def _matches(self, rx: CompiledPattern, text: str) -> bool:
         return rx.search(text) is not None
 
-    def evaluate(self, outcome: Outcome) -> bool:
-        text = self._text(outcome)
-        if self.negated:
-            return not any(self._matches(rx, text) for rx in self.compiled)
-        return all(self._matches(rx, text) for rx in self.compiled)
-
-    def describe(self, outcome: Outcome) -> str:
+    def check(self, outcome: Outcome) -> str | None:
         text = self._text(outcome)
         pairs = zip(self.patterns, self.compiled, strict=True)
         if self.negated:
-            present = next(p for p, rx in pairs if self._matches(rx, text))
+            present = next((p for p, rx in pairs if self._matches(rx, text)), None)
+            if present is None:
+                return None
             return _describe(self.key, _quote(present), "pattern matched")
-        missing = next(p for p, rx in pairs if not self._matches(rx, text))
+        missing = next((p for p, rx in pairs if not self._matches(rx, text)), None)
+        if missing is None:
+            return None
         return _describe(self.key, _quote(missing), "pattern did not match")
 
 

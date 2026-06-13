@@ -1016,14 +1016,14 @@ class TestBattery(unittest.TestCase):
         self.assertEqual(len(spec.probes[0].assertions), 2)
         ok = model.Outcome(exit_code=0, stdout="READY now", stderr="")
         bad = model.Outcome(exit_code=1, stdout="nope", stderr="")
-        self.assertTrue(all(a.evaluate(ok) for a in spec.probes[0].assertions))
-        self.assertFalse(all(a.evaluate(bad) for a in spec.probes[0].assertions))
+        self.assertTrue(all(a.check(ok) is None for a in spec.probes[0].assertions))
+        self.assertFalse(all(a.check(bad) is None for a in spec.probes[0].assertions))
 
     def test_resolve_assert_carried_onto_probe(self) -> None:
         b = _resolve_toml(self._with_assert("exit = 0\n"))
         self.assertEqual(len(b.probes[0].assertions), 1)
-        self.assertTrue(
-            b.probes[0].assertions[0].evaluate(model.Outcome(0, "", ""))
+        self.assertIsNone(
+            b.probes[0].assertions[0].check(model.Outcome(0, "", ""))
         )
 
     # --- resolution + symlink-safe containment ---------------------------- #

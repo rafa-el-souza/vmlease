@@ -16,7 +16,7 @@ class Outcome(NamedTuple):
     """The captured result of one probe command — the input an assertion reads.
 
     A flat ``(exit_code, stdout, stderr)`` triple the runner passes to each
-    assertion's :meth:`Assertion.evaluate` / :meth:`Assertion.describe`. Pure
+    assertion's :meth:`Assertion.check`. Pure
     data, no engine: this keeps :mod:`vmlease.model` free of the regex backend
     (``re2`` lives only in :mod:`vmlease.assertions`).
     """
@@ -36,12 +36,14 @@ class Assertion(Protocol):
     engine — import direction is one-way (``assertions`` → ``model``).
     """
 
-    def evaluate(self, outcome: Outcome) -> bool:
-        """Whether this assertion holds for ``outcome``."""
-        ...
+    def check(self, outcome: Outcome) -> str | None:
+        """A single-line failure description, or ``None`` when the assertion holds.
 
-    def describe(self, outcome: Outcome) -> str:
-        """A single-line failure description (only called when it failed)."""
+        Computed in one pass: ``None`` means the predicate held; a non-empty
+        ``str`` is the single-source failure description (built through
+        ``assertions._describe``). The match is computed once — no separate
+        bool pass + describe re-scan.
+        """
         ...
 
 
@@ -228,7 +230,8 @@ class ProbeResult:
     REQUIRED (no default — a defaulted verdict would silently mis-pass). The
     model stays engine-free: it imports neither the regex backend (``re2``) nor
     :mod:`vmlease.assertions`; the verdict arrives already computed.
-    ``assertion_failures`` carries the :meth:`Assertion.describe` of each FAILED
+    ``assertion_failures`` carries the :meth:`Assertion.check` failure
+    description of each FAILED
     declarative assertion (``()`` when none failed or none were declared) — the
     parsed assertion list itself never travels into the result.
 
