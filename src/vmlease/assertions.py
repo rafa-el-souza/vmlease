@@ -11,8 +11,10 @@ three responsibilities (D4):
   :class:`~vmlease.model.Assertion` Protocol, **bound to** the parsed value.
 * the built object's ``evaluate(outcome) -> bool`` / ``describe(outcome) -> str``.
 
-This module imports from :mod:`vmlease.model` only — it is engine-free in this
-milestone (the RE2 regex pair lands separately). The describe format is
+This module imports :mod:`vmlease.model` and the RE2 engine (:mod:`re2`) — the
+regex pair (``*_matches``/``*_matches_not``) compiles patterns through
+``re2.compile`` (D6). It must NOT import :mod:`vmlease.battery` (which imports
+*this* module — a back-import would be circular). The describe format is
 single-sourced through :func:`_describe` (D10(D)): ``'<key> <value-repr>: <reason>'``.
 """
 
@@ -21,7 +23,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import re2
+
 from vmlease.model import Assertion, Outcome
+
+# RE2 automaton memory budget per compiled pattern (D8#8/D10(H)). Set EXPLICITLY
+# even though it equals RE2's built-in default — we own the bound, so a future
+# tightening is a one-line change, never a silently-inherited default.
+_RE2_MAX_MEM = 8 * 1024 * 1024
 
 
 def _describe(key: str, value_repr: str, reason: str) -> str:
@@ -156,6 +165,63 @@ def _quote(value: str) -> str:
     return f'"{value}"'
 
 
+def _compile_re2(key: str, pattern: str) -> re2._Regexp:
+    """Compile one RE2 pattern under the explicit ``max_mem`` budget (D6/D10(H)).
+
+    A compile failure (malformed pattern, unsupported backreference/lookaround,
+    or an over-``max_mem`` automaton) surfaces as :class:`re2.error`. Caught
+    NARROWLY here and re-raised as :class:`ValueError` carrying the key,
+    pattern, and the RE2 message — the §5 loader wraps ``ValueError`` →
+    ``BatteryError`` with the probe name, the same path the non-regex kinds use
+    (D10(J)). This module never imports ``BatteryError``.
+    """
+    options = re2.Options()
+    options.max_mem = _RE2_MAX_MEM
+    try:
+        return re2.compile(pattern, options=options)
+    except re2.error as exc:
+        raise ValueError(f"{key} {_quote(pattern)}: invalid regex — {exc}") from exc
+
+
+@dataclass(frozen=True)
+class _RegexAssertion:
+    """``*_matches`` / ``*_matches_not`` — RE2 pattern over a stream (D5/D6).
+
+    Patterns are compiled at build/validate time (D10(I)); ``evaluate`` runs an
+    UNANCHORED ``rx.search`` (matches anywhere — consistent with substring
+    ``_has``; RE2 anchors ``^``/``$`` to the whole text unless ``(?m)``, D8#1).
+    A list CONJOINS (D8#5): ``_matches`` → ALL patterns match (empty stream →
+    false); ``_matches_not`` → NONE match (empty stream → vacuously true).
+    """
+
+    key: str
+    patterns: tuple[str, ...]
+    compiled: tuple[re2._Regexp, ...]
+    stream: str  # "stdout" | "stderr"
+    negated: bool
+
+    def _text(self, outcome: Outcome) -> str:
+        return outcome.stderr if self.stream == "stderr" else outcome.stdout
+
+    def _matches(self, rx: re2._Regexp, text: str) -> bool:
+        return rx.search(text) is not None
+
+    def evaluate(self, outcome: Outcome) -> bool:
+        text = self._text(outcome)
+        if self.negated:
+            return not any(self._matches(rx, text) for rx in self.compiled)
+        return all(self._matches(rx, text) for rx in self.compiled)
+
+    def describe(self, outcome: Outcome) -> str:
+        text = self._text(outcome)
+        pairs = zip(self.patterns, self.compiled, strict=True)
+        if self.negated:
+            present = next(p for p, rx in pairs if self._matches(rx, text))
+            return _describe(self.key, _quote(present), "pattern matched")
+        missing = next(p for p, rx in pairs if not self._matches(rx, text))
+        return _describe(self.key, _quote(missing), "pattern did not match")
+
+
 # --------------------------------------------------------------------------- #
 # Registry (D4) — key → AssertionKind. The key set IS the schema.
 # --------------------------------------------------------------------------- #
@@ -188,6 +254,23 @@ def _exit_kind(key: str, *, negated: bool) -> AssertionKind:
     return AssertionKind(key, validate, build)
 
 
+def _regex_kind(key: str, stream: str, *, negated: bool) -> AssertionKind:
+    def compiled_for(value: object) -> tuple[tuple[str, ...], tuple[re2._Regexp, ...]]:
+        patterns = _as_str_list(key, value)
+        return patterns, tuple(_compile_re2(key, p) for p in patterns)
+
+    def validate(value: object) -> None:
+        # Compile here so the pure parse pass (§5 → registry validate) catches a
+        # bad pattern at parse, not at evaluation (D10(I)).
+        compiled_for(value)
+
+    def build(value: object) -> Assertion:
+        patterns, compiled = compiled_for(value)
+        return _RegexAssertion(key, patterns, compiled, stream, negated)
+
+    return AssertionKind(key, validate, build)
+
+
 def _empty_kind(key: str, stream: str) -> AssertionKind:
     def validate(value: object) -> None:
         _as_bool(key, value)
@@ -207,6 +290,10 @@ _ASSERTIONS: dict[str, AssertionKind] = {
         _str_kind("stdout_lacks", "stdout", lacks=True),
         _str_kind("stderr_has", "stderr", lacks=False),
         _str_kind("stderr_lacks", "stderr", lacks=True),
+        _regex_kind("stdout_matches", "stdout", negated=False),
+        _regex_kind("stdout_matches_not", "stdout", negated=True),
+        _regex_kind("stderr_matches", "stderr", negated=False),
+        _regex_kind("stderr_matches_not", "stderr", negated=True),
         _empty_kind("stdout_empty", "stdout"),
         _empty_kind("stderr_empty", "stderr"),
     )

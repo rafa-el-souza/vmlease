@@ -52,6 +52,8 @@ exclude = ["*"]
 
 [tool.mypy]
 python_version = "3.11"
+# `google-re2` ships no type info; `stubs/re2.pyi` declares the surface we use.
+mypy_path = "stubs"
 strict = true
 warn_unreachable = true
 warn_redundant_casts = true

@@ -20,7 +20,7 @@ def _build(key: str, value: object) -> Assertion:
 
 
 class TestRegistryShape(unittest.TestCase):
-    def test_exactly_the_eight_keys(self) -> None:
+    def test_exactly_the_twelve_keys(self) -> None:
         self.assertEqual(
             set(_ASSERTIONS),
             {
@@ -30,6 +30,10 @@ class TestRegistryShape(unittest.TestCase):
                 "stdout_lacks",
                 "stderr_has",
                 "stderr_lacks",
+                "stdout_matches",
+                "stdout_matches_not",
+                "stderr_matches",
+                "stderr_matches_not",
                 "stdout_empty",
                 "stderr_empty",
             },
@@ -196,6 +200,142 @@ class TestEmpty(unittest.TestCase):
     def test_empty_bool_shape_check(self) -> None:
         with self.assertRaises(ValueError):
             _build("stdout_empty", "yes")
+
+
+class TestRegexMatches(unittest.TestCase):
+    def test_stdout_happy(self) -> None:
+        a = _build("stdout_matches", r"READ[Yy]")
+        self.assertTrue(a.evaluate(Outcome(0, "all READY now", "")))
+
+    def test_stdout_fail_and_describe(self) -> None:
+        a = _build("stdout_matches", r"READY")
+        outcome = Outcome(0, "nope", "")
+        self.assertFalse(a.evaluate(outcome))
+        self.assertEqual(
+            a.describe(outcome), 'stdout_matches "READY": pattern did not match'
+        )
+
+    def test_stderr_happy_and_fail(self) -> None:
+        a = _build("stderr_matches", r"boo.")
+        self.assertTrue(a.evaluate(Outcome(0, "", "kaboom")))
+        self.assertFalse(a.evaluate(Outcome(0, "boom", "")))
+
+    def test_unanchored_search_matches_anywhere(self) -> None:
+        # .search is unanchored (NOT .match/.fullmatch): mid-text holds.
+        a = _build("stdout_matches", r"DY")
+        self.assertTrue(a.evaluate(Outcome(0, "READY", "")))
+
+    def test_list_conjoins_all_match(self) -> None:
+        a = _build("stdout_matches", [r"A.", r"B."])
+        self.assertTrue(a.evaluate(Outcome(0, "Ax then Bz", "")))
+
+    def test_list_fails_when_one_missing_describe_names_it(self) -> None:
+        a = _build("stdout_matches", [r"A.", r"B."])
+        outcome = Outcome(0, "Ax only", "")
+        self.assertFalse(a.evaluate(outcome))
+        self.assertEqual(
+            a.describe(outcome), 'stdout_matches "B.": pattern did not match'
+        )
+
+    def test_empty_stream_matches_is_false(self) -> None:
+        a = _build("stdout_matches", r"x")
+        self.assertFalse(a.evaluate(Outcome(0, "", "")))
+
+    def test_empty_list_rejected_naming_key(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _build("stdout_matches", [])
+        self.assertIn("stdout_matches", str(ctx.exception))
+
+
+class TestRegexMatchesNot(unittest.TestCase):
+    def test_pass_when_absent(self) -> None:
+        a = _build("stdout_matches_not", r"ERROR")
+        self.assertTrue(a.evaluate(Outcome(0, "all good", "")))
+
+    def test_fail_and_describe(self) -> None:
+        a = _build("stdout_matches_not", r"ERR.R")
+        outcome = Outcome(0, "got ERROR here", "")
+        self.assertFalse(a.evaluate(outcome))
+        self.assertEqual(
+            a.describe(outcome), 'stdout_matches_not "ERR.R": pattern matched'
+        )
+
+    def test_stderr_stream(self) -> None:
+        a = _build("stderr_matches_not", r"fail")
+        self.assertTrue(a.evaluate(Outcome(0, "fail", "")))
+        self.assertFalse(a.evaluate(Outcome(0, "", "fail")))
+
+    def test_list_none_match(self) -> None:
+        a = _build("stdout_matches_not", [r"X.", r"Y."])
+        self.assertTrue(a.evaluate(Outcome(0, "Zz", "")))
+
+    def test_list_fails_when_one_matches_describe_names_it(self) -> None:
+        a = _build("stdout_matches_not", [r"X.", r"Y."])
+        outcome = Outcome(0, "has Yo", "")
+        self.assertFalse(a.evaluate(outcome))
+        self.assertEqual(
+            a.describe(outcome), 'stdout_matches_not "Y.": pattern matched'
+        )
+
+    def test_empty_stream_matches_not_vacuously_true(self) -> None:
+        a = _build("stdout_matches_not", r"x")
+        self.assertTrue(a.evaluate(Outcome(0, "", "")))
+
+
+class TestRE2AnchoringSemantics(unittest.TestCase):
+    """Anchoring asserted as RE2, NOT Python `re` (D8#1/D10(K))."""
+
+    def test_multiline_flag_anchors_per_line(self) -> None:
+        # (?m)^X$ matches a line in the middle of multi-line text.
+        a = _build("stdout_matches", r"(?m)^READY$")
+        self.assertTrue(a.evaluate(Outcome(0, "starting\nREADY\ndone\n", "")))
+
+    def test_bare_anchors_are_whole_text_not_per_line(self) -> None:
+        # Without (?m), ^X$ is whole-text: a mid-text line does NOT match.
+        a = _build("stdout_matches", r"^READY$")
+        self.assertFalse(a.evaluate(Outcome(0, "starting\nREADY\ndone\n", "")))
+
+    def test_dollar_does_not_match_before_trailing_newline(self) -> None:
+        # RE2 `$` is end-of-text only — unlike Python `re`, it does NOT match
+        # before a trailing \n. So `^READY$` fails against "READY\n".
+        a = _build("stdout_matches", r"^READY$")
+        self.assertFalse(a.evaluate(Outcome(0, "READY\n", "")))
+        # Without the trailing newline it matches whole-text.
+        self.assertTrue(a.evaluate(Outcome(0, "READY", "")))
+
+
+class TestRegexCompileRejection(unittest.TestCase):
+    """Bad patterns rejected AT COMPILE (validate/build), raising ValueError (D10(I/J))."""
+
+    def test_malformed_pattern_rejected_at_validate(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _ASSERTIONS["stdout_matches"].validate(r"(unclosed")
+        self.assertIn("stdout_matches", str(ctx.exception))
+
+    def test_backreference_rejected(self) -> None:
+        # RE2 omits backreferences — surfaces through the compile-failure path.
+        with self.assertRaises(ValueError):
+            _build("stdout_matches", r"(a)\1")
+
+    def test_lookahead_rejected(self) -> None:
+        # RE2 omits lookaround — same compile-failure path.
+        with self.assertRaises(ValueError):
+            _build("stdout_matches", r"(?=x)")
+
+    def test_over_max_mem_pattern_rejected_at_compile(self) -> None:
+        # A syntactically-valid pattern whose automaton exceeds the 8 MiB
+        # max_mem budget is rejected at compile (D8#8/D10(H)). Self-checking:
+        # the SAME pattern compiles under a generous budget, proving the
+        # rejection is budget-driven, not a syntax error.
+        import re2
+
+        over_budget = "[Ā-￿]{1000}" * 100
+        with self.assertRaises(ValueError):
+            _build("stdout_matches", over_budget)
+        big = re2.Options()
+        big.max_mem = 1024 * 1024 * 1024
+        # Proves the pattern is well-formed; only the budget rejected it above.
+        self.assertIsNotNone(re2.compile(over_budget, options=big))
 
 
 if __name__ == "__main__":
