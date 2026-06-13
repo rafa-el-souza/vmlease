@@ -13,7 +13,7 @@ identifying the contract version.
 - **WHEN** `vmlease summarize vmlease-run-ts.json` is invoked with no `--out`
 - **THEN** a `vmlease-run-ts.summary.json` file is written in the same directory
 - **AND** the original raw file is byte-for-byte unchanged
-- **AND** the summary's top-level `schema_version` is `"1"`
+- **AND** the summary's top-level `schema_version` is `"2"`
 
 #### Scenario: Explicit output path honored
 - **WHEN** `vmlease summarize <raw> --out /tmp/s.json` is invoked
