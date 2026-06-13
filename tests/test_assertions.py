@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 import unittest
 import unittest.mock
 
@@ -389,6 +390,48 @@ class TestCheckSinglePass(unittest.TestCase):
         ) as describe:
             self.assertEqual(a.check(Outcome(0, "nope", "")), "MSG")
             describe.assert_called_once()
+
+
+class TestRe2ReDoSResistance(unittest.TestCase):
+    """RE2 evaluates an adversarial pattern x adversarial input in LINEAR time (D6).
+
+    Threat model (D6): batteries AND workloads are untrusted, so BOTH the
+    author-written pattern and the workload-controlled stdout/stderr are
+    adversarial, and assertion eval is post-capture in-harness (NOT bounded by
+    the per-probe command timeout). A backtracking engine (stdlib ``re``) on
+    ``(a+)+$`` against a long all-``a`` input with a non-matching tail exhibits
+    CATASTROPHIC exponential backtracking — an effectively unbounded hang (ReDoS).
+    RE2 is linear-time BY CONSTRUCTION, so it evaluates near-instantly. This also
+    validates the no-input-cap decision (D8#2): even a 100k-char adversarial input
+    is bounded by the engine, not by truncation (which would silently false-pass an
+    absence assertion past the cap).
+    """
+
+    def test_catastrophic_pattern_evaluates_in_linear_time(self) -> None:
+        # ``(a+)+$`` over ``"a"*N + "!"`` is the classic ReDoS worst case: every
+        # grouping of the a-run must be tried to reach ``$``, which the trailing
+        # ``!`` defeats. Exponential under backtracking; O(n) under RE2.
+        a = _build("stdout_matches", r"(a+)+$")
+        outcome = Outcome(0, "a" * 100_000 + "!", "")
+        start = time.monotonic()
+        result = a.check(outcome)
+        elapsed = time.monotonic() - start
+        # No match (the ``!`` blocks ``$``) -> a failure description, computed FAST.
+        self.assertIsNotNone(result)
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"RE2 eval took {elapsed:.3f}s over a ReDoS pattern+input; a backtracking "
+            "engine would hang here. RE2's linear-time guarantee (D6) is broken if slow.",
+        )
+
+    def test_embedded_code_construct_rejected_at_compile(self) -> None:
+        # No-RCE is STRUCTURAL: RE2 has no embedded-code construct, so
+        # ``(?{...})`` / ``(??{...})`` fail to compile (rejected at load, never
+        # executed) — the same compile-failure path as backref/lookaround.
+        for evil in (r"(?{ system('id') })", r"(??{ 1 })"):
+            with self.assertRaises(ValueError):
+                _build("stdout_matches", evil)
 
 
 if __name__ == "__main__":
