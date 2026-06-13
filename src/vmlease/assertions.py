@@ -22,10 +22,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import re2
 
 from vmlease.model import Assertion, Outcome
+
+if TYPE_CHECKING:
+    from re2 import _Regexp as CompiledPattern
+
+# RE2 automaton memory budget per compiled pattern (D8#8/D10(H)). Set EXPLICITLY
+# even though it equals RE2's built-in default — we own the bound, so a future
+# tightening is a one-line change, never a silently-inherited default.
+_RE2_MAX_MEM = 8 * 1024 * 1024
 
 
 def evaluate(assertions: tuple[Assertion, ...], outcome: Outcome) -> tuple[str, ...]:
@@ -38,11 +47,6 @@ def evaluate(assertions: tuple[Assertion, ...], outcome: Outcome) -> tuple[str, 
     ``describe`` is only invoked on a failing assertion (its contract).
     """
     return tuple(a.describe(outcome) for a in assertions if not a.evaluate(outcome))
-
-# RE2 automaton memory budget per compiled pattern (D8#8/D10(H)). Set EXPLICITLY
-# even though it equals RE2's built-in default — we own the bound, so a future
-# tightening is a one-line change, never a silently-inherited default.
-_RE2_MAX_MEM = 8 * 1024 * 1024
 
 
 def _describe(key: str, value_repr: str, reason: str) -> str:
@@ -177,7 +181,7 @@ def _quote(value: str) -> str:
     return f'"{value}"'
 
 
-def _compile_re2(key: str, pattern: str) -> re2._Regexp:
+def _compile_re2(key: str, pattern: str) -> CompiledPattern:
     """Compile one RE2 pattern under the explicit ``max_mem`` budget (D6/D10(H)).
 
     A compile failure (malformed pattern, unsupported backreference/lookaround,
@@ -210,14 +214,14 @@ class _RegexAssertion:
 
     key: str
     patterns: tuple[str, ...]
-    compiled: tuple[re2._Regexp, ...]
+    compiled: tuple[CompiledPattern, ...]
     stream: str  # "stdout" | "stderr"
     negated: bool
 
     def _text(self, outcome: Outcome) -> str:
         return outcome.stderr if self.stream == "stderr" else outcome.stdout
 
-    def _matches(self, rx: re2._Regexp, text: str) -> bool:
+    def _matches(self, rx: CompiledPattern, text: str) -> bool:
         return rx.search(text) is not None
 
     def evaluate(self, outcome: Outcome) -> bool:
@@ -269,7 +273,7 @@ def _exit_kind(key: str, *, negated: bool) -> AssertionKind:
 
 
 def _regex_kind(key: str, stream: str, *, negated: bool) -> AssertionKind:
-    def compiled_for(value: object) -> tuple[tuple[str, ...], tuple[re2._Regexp, ...]]:
+    def compiled_for(value: object) -> tuple[tuple[str, ...], tuple[CompiledPattern, ...]]:
         patterns = _as_str_list(key, value)
         return patterns, tuple(_compile_re2(key, p) for p in patterns)
 
