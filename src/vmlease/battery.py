@@ -11,8 +11,7 @@ shell scripts, parsed with the standard-library ``tomllib`` (no third-party
 dependency). The manifest carries a non-empty string ``name`` and a non-empty
 ``[[probe]]`` array. Each probe declares a stable ``id``, a ``title``, a ``tag``
 (one of the :class:`~vmlease.model.ProbeTag` values), optional ``classifies``
-label, ``timeout`` (seconds) and ``success_when`` token (see the authoring
-caveat below), and **exactly one of**:
+label and ``timeout`` (seconds), and **exactly one of**:
 
 - ``run`` — a literal inline shell block (TOML's ``'''…'''`` multi-line strings
   need no escaping), used verbatim as the command; provenance ``"<inline>"``.
@@ -45,8 +44,8 @@ order they run and are recorded; ``tag`` records what a probe touches but does
 NOT reorder execution. A probe's ``ok`` is its command's **exit code by
 default**, so gate assertions with ``exit $rc`` (a command ending in
 ``echo OK`` / ``echo FAIL`` always exits 0 → a vacuous ``ok`` that ignores what
-it printed). A probe MAY instead declare an optional ``success_when`` token:
-then ``ok`` is whether that token appears as a complete line of stdout (exit
+it printed). A probe MAY instead declare ``[probe.assert]`` predicates: then
+``ok`` is whether every declared assertion holds over the probe's outcome (exit
 code ignored), so such a probe needs no ``exit $rc`` and is exempt from the
 vacuous-ok warning. On sudo: the resolved command runs **verbatim** — ``tag``
 does not inject, strip, or enforce ``sudo``; the ``mutating:host-root`` tag
@@ -73,7 +72,7 @@ from vmlease.assertions import _ASSERTIONS
 from vmlease.model import Assertion, Battery, Probe, ProbeTag
 
 _PROBE_KEYS = frozenset(
-    {"id", "title", "tag", "classifies", "timeout", "run", "script", "success_when", "assert"}
+    {"id", "title", "tag", "classifies", "timeout", "run", "script", "assert"}
 )
 _ROOT_KEYS = frozenset({"name", "probe"})
 
@@ -117,7 +116,6 @@ class _ProbeSpec:
     timeout: float | None
     run: str | None
     script: str | None
-    success_when: str = ""
     assertions: tuple[Assertion, ...] = ()
 
 
@@ -181,7 +179,6 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         valid = [t.value for t in ProbeTag]
         raise BatteryError(f"probe #{index} has unknown tag {tag_raw!r}; valid: {valid}") from exc
     timeout = _parse_timeout(index, raw)
-    success_when = _parse_success_when(index, raw)
     assertions = _parse_assertions(index, raw)
     run, script = _parse_command_form(index, raw)
     return _ProbeSpec(
@@ -192,7 +189,6 @@ def _parse_probe(index: int, raw: object) -> _ProbeSpec:
         timeout=timeout,
         run=run,
         script=script,
-        success_when=success_when,
         assertions=assertions,
     )
 
@@ -236,24 +232,6 @@ def _parse_timeout(index: int, raw: dict[object, object]) -> float | None:
     if value <= 0:
         raise BatteryError(f"probe #{index} 'timeout' must be positive, got {value!r}")
     return float(value)
-
-
-def _parse_success_when(index: int, raw: dict[object, object]) -> str:
-    """Parse the optional per-probe ``success_when`` literal token.
-
-    Absent means ``""`` (exit-code reading — back-compatible). A *declared* value
-    must be a non-empty, non-whitespace-only string; a non-string or a
-    whitespace-only value is a malformed battery and raises :class:`BatteryError`
-    naming the probe.
-    """
-    if "success_when" not in raw:
-        return ""
-    value = raw["success_when"]
-    if not isinstance(value, str) or not value.strip():
-        raise BatteryError(
-            f"probe #{index} 'success_when' must be a non-empty string, got {value!r}"
-        )
-    return value
 
 
 def _parse_assertions(index: int, raw: dict[object, object]) -> tuple[Assertion, ...]:
@@ -333,7 +311,6 @@ def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:
         classifies=spec.classifies,
         timeout=spec.timeout,
         source=source,
-        success_when=spec.success_when,
         assertions=spec.assertions,
     )
 
@@ -369,13 +346,13 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     Probes execute in **authoring order**, so there is no reorder to surprise an
     author; two footguns are checked, both advisory:
 
-    - **vacuous-ok** — a probe **without** a ``success_when`` declaration whose
-      ``ok`` is its command's exit code. A command that prints OK/FAIL tokens but is
-      not ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what
-      it printed. Gate with ``exit $rc``. A probe **with** a ``success_when``
-      declaration is **exempt**: its ``ok`` is read from the declared token, not the
-      exit code, so an un-gated token-printing tail is exactly the intended
-      authoring style, not a footgun.
+    - **vacuous-ok** — a probe that **declares no assertions** whose ``ok`` is its
+      command's exit code. A command that prints OK/FAIL tokens but is not
+      ``exit``-gated always exits 0, so ``ok`` is meaningless regardless of what it
+      printed. Gate with ``exit $rc``. A probe that **declares assertions**
+      (``[probe.assert]``) is **exempt**: its ``ok`` is read from those declared
+      predicates, not the exit code, so an un-gated token-printing tail is exactly
+      the intended authoring style, not a footgun.
 
     - **non-host-root sudo** — a probe whose tag is not ``MUTATING_HOST_ROOT`` but
       whose command invokes ``sudo``. The escalation authoring contract reserves
@@ -389,7 +366,7 @@ def lint_battery(battery: Battery) -> tuple[str, ...]:
     """
     warnings: list[str] = []
     for probe in battery.probes:
-        if not probe.success_when and _looks_vacuously_ok(probe.command):
+        if not probe.assertions and _looks_vacuously_ok(probe.command):
             warnings.append(
                 f"probe {probe.id!r}: ok reflects the command's exit code only, but the command "
                 f"prints tokens without an explicit exit -- gate it with 'exit $rc'"

@@ -241,15 +241,11 @@ class OpenSshRunner:
         except subprocess.TimeoutExpired as exc:
             return _timed_out_result(probe, timeout, exc)
         outcome = Outcome(proc.returncode, proc.stdout, proc.stderr)
-        # Compute the verdict BEFORE constructing the frozen result (D10(A)). The
-        # ``success_when``/exit branches are the OLD ``ProbeResult.ok`` property
-        # logic relocated verbatim; §8 removes them once ``success_when`` is gone.
+        # Compute the verdict BEFORE constructing the frozen result (D10(A)):
+        # declared assertions decide ``ok``; otherwise it is the command's exit code.
         if probe.assertions:
             failures = assertions.evaluate(probe.assertions, outcome)
             ok = not failures
-        elif probe.success_when:
-            ok = any(line.strip() == probe.success_when for line in proc.stdout.splitlines())
-            failures = ()
         else:
             ok = proc.returncode == 0
             failures = ()
@@ -260,7 +256,6 @@ class OpenSshRunner:
             stdout=proc.stdout,
             stderr=proc.stderr,
             ok=ok,
-            success_when=probe.success_when,
             assertion_failures=failures,
             has_assertions=len(probe.assertions) > 0,
         )
@@ -419,7 +414,6 @@ def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpir
         stderr=stderr,
         ok=False,
         timed_out=True,
-        success_when=probe.success_when,
         assertion_failures=(),
         has_assertions=len(probe.assertions) > 0,
     )

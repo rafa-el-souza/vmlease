@@ -86,12 +86,6 @@ class Probe:
             (host-root authorizes and records escalation; the command still runs
             verbatim and an advisory lint, not the tag, flags a mismatch); it
             does NOT order execution — probes run in authoring order.
-        success_when: Optional literal success token. When non-empty, the
-            probe's :attr:`ProbeResult.ok` is decided by this token appearing as
-            a **complete line** of stdout (leading/trailing whitespace stripped),
-            replacing the exit-code reading — the author emits it as its own line
-            (``echo TOKEN``). ``""`` (the default, back-compatible) keeps ``ok``
-            exit-code-based.
         classifies: The design action this probe classifies (free text, for the
             results report — e.g. "L2 subuid append").
         timeout: Optional per-probe wall-clock bound (seconds) for the bounded
@@ -115,7 +109,6 @@ class Probe:
     classifies: str = ""
     timeout: float | None = None
     source: str = ""
-    success_when: str = ""
     assertions: tuple[Assertion, ...] = ()
 
 
@@ -229,8 +222,8 @@ class ProbeResult:
     """The captured outcome of one probe on one host.
 
     ``ok`` is a **runner-computed STORED verdict** (D9/M1): the SSH layer
-    evaluates the probe's declarative assertions (or, transitionally, its
-    ``success_when`` token / exit code) in :meth:`OpenSshRunner.run_probe`
+    evaluates the probe's declarative assertions (or, when none are declared,
+    its exit code) in :meth:`OpenSshRunner.run_probe`
     BEFORE constructing this frozen result, then stores the boolean here. It is
     REQUIRED (no default — a defaulted verdict would silently mis-pass). The
     model stays engine-free: it imports neither the regex backend (``re2``) nor
@@ -265,7 +258,6 @@ class ProbeResult:
     stderr: str
     ok: bool
     timed_out: bool = False
-    success_when: str = ""
     assertion_failures: tuple[str, ...] = ()
     has_assertions: bool = False
 

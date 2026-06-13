@@ -58,7 +58,6 @@ def make_probe_result(
     *,
     ok: bool | None = None,
     timed_out: bool = False,
-    success_when: str = "",
     assertion_failures: tuple[str, ...] = (),
     has_assertions: bool = False,
 ) -> ProbeResult:
@@ -77,7 +76,6 @@ def make_probe_result(
         stderr=stderr,
         ok=(exit_code == 0) if ok is None else ok,
         timed_out=timed_out,
-        success_when=success_when,
         assertion_failures=assertion_failures,
         has_assertions=has_assertions,
     )
@@ -303,14 +301,6 @@ class TestModel(unittest.TestCase):
     def test_probe_result_assertion_failures_defaults_empty(self) -> None:
         res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0)
         self.assertEqual(res.assertion_failures, ())
-
-    def test_probe_success_when_defaults_empty(self) -> None:
-        p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
-        self.assertEqual(p.success_when, "")
-
-    def test_probe_result_success_when_defaults_empty(self) -> None:
-        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0, "out")
-        self.assertEqual(res.success_when, "")
 
     def test_probe_result_timed_out_defaults_false(self) -> None:
         res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0, "out")
@@ -968,38 +958,15 @@ class TestBattery(unittest.TestCase):
                 "tag = '''read-only'''\nrun = '''c'''\ntimeout = true\n"
             )
 
-    def test_parse_success_when_absent_is_empty(self) -> None:
-        # back-compat: a battery without success_when loads, token "".
-        spec = battery_mod.parse_battery(_DEMO_BATTERY)
-        self.assertEqual(spec.probes[0].success_when, "")
-
-    def test_parse_success_when_value_carried(self) -> None:
-        spec = battery_mod.parse_battery(battery_toml("x", (self._one(success_when="READY"),)))
-        self.assertEqual(spec.probes[0].success_when, "READY")
-
-    def test_resolve_success_when_carried_onto_probe(self) -> None:
-        # the resolved Probe carries the declared token through to model.
-        b = _resolve_toml(battery_toml("x", (self._one(success_when="READY"),)))
-        self.assertEqual(b.probes[0].success_when, "READY")
-
-    def test_parse_success_when_empty_string_raises_naming_probe(self) -> None:
+    def test_parse_success_when_key_now_rejected_as_unknown(self) -> None:
+        # success_when was retired (§8): the strict schema rejects it as an
+        # unrecognized probe key, naming it.
         with self.assertRaises(battery_mod.BatteryError) as ctx:
             battery_mod.parse_battery(
                 "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
-                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = ''''''\n"
+                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = '''READY'''\n"
             )
         self.assertIn("success_when", str(ctx.exception))
-
-    def test_parse_success_when_whitespace_only_raises(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(battery_toml("x", (self._one(success_when="   "),)))
-
-    def test_parse_success_when_non_string_raises(self) -> None:
-        with self.assertRaises(battery_mod.BatteryError):
-            battery_mod.parse_battery(
-                "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
-                "tag = '''read-only'''\nrun = '''c'''\nsuccess_when = 5\n"
-            )
 
     # --- [probe.assert] declarative assertions (§5) ----------------------- #
     def _with_assert(self, assert_body: str) -> str:
@@ -1163,17 +1130,20 @@ class TestBatteryLint(unittest.TestCase):
         b = self._b(self._p("V", "uname -a", ProbeTag.READ_ONLY))
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def _ps(self, pid: str, cmd: str, tag: ProbeTag, success_when: str) -> Probe:
-        return Probe(id=pid, title=pid, command=cmd, tag=tag, success_when=success_when)
+    def _ps(self, pid: str, cmd: str, tag: ProbeTag) -> Probe:
+        # A probe that DECLARES an assertion (exempt from the vacuous-ok advisory).
+        assertion = assertions._ASSERTIONS["stdout_has"].build("READY")
+        return Probe(id=pid, title=pid, command=cmd, tag=tag, assertions=(assertion,))
 
-    def test_success_when_probe_exempt_from_vacuous_ok(self) -> None:
-        # un-gated token-printing tail, but ok is token-derived -> not a footgun.
+    def test_assertions_declared_probe_exempt_from_vacuous_ok(self) -> None:
+        # un-gated token-printing tail, but ok is decided by declared assertions
+        # -> not a footgun.
         b = self._b(
-            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY")
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY)
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
-    def test_same_probe_without_success_when_still_warns(self) -> None:
+    def test_same_probe_without_assertions_still_warns(self) -> None:
         b = self._b(self._p("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY))
         warns = battery_mod.lint_battery(b)
         self.assertTrue(any("'T'" in w and "exit $rc" in w for w in warns))
@@ -1200,13 +1170,13 @@ class TestBatteryLint(unittest.TestCase):
 
     def test_clean_battery_with_declared_and_gated_probes_silent(self) -> None:
         b = self._b(
-            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY, "READY"),
+            self._ps("T", "check && echo READY || echo NOPE", ProbeTag.READ_ONLY),
             self._p("G", "do-setup; exit $?", ProbeTag.MUTATING_HOST_ROOT),
         )
         self.assertEqual(battery_mod.lint_battery(b), ())
 
     def test_probe_can_trigger_both_rules(self) -> None:
-        # un-gated token tail (no success_when) AND non-host-root sudo -> two warnings.
+        # un-gated token tail (no declared assertions) AND non-host-root sudo -> two warnings.
         b = self._b(self._p("B", "sudo check && echo OK || echo FAIL", ProbeTag.READ_ONLY))
         warns = battery_mod.lint_battery(b)
         self.assertEqual(len(warns), 2)
@@ -1911,20 +1881,11 @@ class TestSsh(unittest.TestCase):
         self.assertEqual((res.exit_code, res.stdout), (7, "out"))
         self.assertFalse(res.timed_out)  # a within-timeout probe is not a timeout
 
-    def test_run_probe_threads_success_when_and_derives_ok_from_token(self) -> None:
-        # a declaring probe's token travels into the result, and ``ok`` is read off
-        # stdout (the token line present) even though the exit code is non-zero.
-        r = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "noise\nREADY\nmore", ""))
-        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY, success_when="READY")
-        res = r.run_probe(self._host(), probe)
-        self.assertEqual(res.success_when, "READY")
-        self.assertTrue(res.ok)  # token line present → ok despite non-zero exit
-
     def _assert(self, key: str, value: object) -> Assertion:
         return assertions._ASSERTIONS[key].build(value)
 
     def test_run_probe_no_assertion_ok_is_exit_zero(self) -> None:
-        # No assertions and no success_when → ok iff exit 0 (the relocated old rule).
+        # No assertions declared → ok iff exit 0 (the relocated old rule).
         r0 = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "out", ""))
         r3 = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "out", "err"))
         probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
@@ -2478,21 +2439,6 @@ class TestResults(unittest.TestCase):
         self.assertFalse(doc["hosts"][0]["probes"][0]["timed_out"])  # normal probe
         self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
         self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
-        # success_when is serialized unconditionally, including for the timed-out probe.
-        self.assertEqual(doc["hosts"][0]["probes"][0]["success_when"], "")
-        self.assertEqual(doc["hosts"][0]["probes"][1]["success_when"], "")
-
-    def test_serialize_declaring_probe_ok_from_token_and_carries_field(self) -> None:
-        # end-to-end: a declaring probe whose stdout carries the token serializes
-        # ok=True (token-derived, despite a non-zero exit) AND its success_when field.
-        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
-        res = (make_probe_result("P1", ProbeTag.READ_ONLY, 1, "noise\nREADY\n", success_when="READY", ok=True),)
-        hr = model.HostRun(host_spec=spec, detail="ok", results=res)
-        doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
-        probe = doc["hosts"][0]["probes"][0]
-        self.assertEqual(probe["success_when"], "READY")
-        self.assertTrue(probe["ok"])  # token-derived ok despite exit_code 1
-        self.assertEqual(probe["exit_code"], 1)
 
     def test_serialize_passing_assertion_probe_carries_declared_count_true(self) -> None:
         # (7.5) DECLARED-count: a PASSING assertion probe (assertion_failures=())

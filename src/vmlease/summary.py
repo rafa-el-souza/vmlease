@@ -53,17 +53,14 @@ Verdict rule (per probe, deterministic precedence):
 1. ``timed_out`` true → ``TIMEOUT``;
 2. else, when the probe declared ≥1 declarative assertion (``has_assertions``),
    the runner-stored ``ok`` (the AND of those assertions) is authoritative →
-   ``PASS`` iff ``ok`` holds, else ``FAIL`` (overriding the ``success_when``,
-   exit-code, and token rules both ways);
-3. else, when the probe declared a non-empty ``success_when``, the declared
-   predicate is authoritative → ``PASS`` iff the *recorded* ``ok`` holds, else
-   ``FAIL`` (overriding the exit-code and fail-token rules);
-4. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
-5. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
-6. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
+   ``PASS`` iff ``ok`` holds, else ``FAIL`` (overriding the exit-code and token
+   rules both ways);
+3. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
+4. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
+5. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
 
 A pre-schema raw file (no ``has_assertions`` key) reads ``has_assertions=False``
-for every probe and falls to the ``success_when`` / token path unchanged (M5).
+for every probe and falls to the token path unchanged (M5).
 """
 
 from __future__ import annotations
@@ -161,7 +158,6 @@ def verdict(
     timed_out: bool,
     fail_tokens: list[str],
     ok_tokens: list[str],
-    success_when: str = "",
     ok: bool = False,
     has_assertions: bool = False,
 ) -> str:
@@ -170,17 +166,14 @@ def verdict(
     Precedence: ``timed_out`` dominates. When the probe declared ≥1 declarative
     assertion (``has_assertions``) the runner-stored ``ok`` (the AND of those
     assertions) is authoritative — ``PASS`` iff ``ok`` holds, else ``FAIL`` —
-    overriding the ``success_when``, exit-code, AND token rules BOTH ways (a
-    stray ``*_FAIL`` token cannot flip a passing assertion probe, nor a stray
-    ``*_OK`` token a failing one). Below that, a non-empty ``success_when`` is the
-    declared predicate (``PASS`` iff ``ok``). A probe with neither falls through
-    to the exact exit-code/token precedence unchanged.
+    overriding the exit-code AND token rules BOTH ways (a stray ``*_FAIL`` token
+    cannot flip a passing assertion probe, nor a stray ``*_OK`` token a failing
+    one). A probe without assertions falls through to the exact exit-code/token
+    precedence unchanged.
     """
     if timed_out:
         return TIMEOUT
     if has_assertions:
-        return PASS if ok else FAIL
-    if success_when:
         return PASS if ok else FAIL
     if fail_tokens or exit_code != 0:
         return FAIL
@@ -224,7 +217,6 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
     stdout = str(raw_probe.get("stdout", ""))
     stderr = str(raw_probe.get("stderr", ""))
     ok = bool(raw_probe.get("ok", exit_code == 0))
-    success_when = str(raw_probe.get("success_when", ""))
     has_assertions = bool(raw_probe.get("has_assertions", False))
     assertion_failures = list(raw_probe.get("assertion_failures", []))
     tokens = harvest_tokens(stdout)
@@ -240,7 +232,6 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
             timed_out,
             tokens["fail_tokens"],
             tokens["ok_tokens"],
-            success_when,
             ok,
             has_assertions,
         ),
