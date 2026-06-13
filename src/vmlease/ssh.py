@@ -262,6 +262,7 @@ class OpenSshRunner:
             ok=ok,
             success_when=probe.success_when,
             assertion_failures=failures,
+            has_assertions=len(probe.assertions) > 0,
         )
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
@@ -420,6 +421,7 @@ def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpir
         timed_out=True,
         success_when=probe.success_when,
         assertion_failures=(),
+        has_assertions=len(probe.assertions) > 0,
     )
 
 

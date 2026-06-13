@@ -60,6 +60,7 @@ def make_probe_result(
     timed_out: bool = False,
     success_when: str = "",
     assertion_failures: tuple[str, ...] = (),
+    has_assertions: bool = False,
 ) -> ProbeResult:
     """Construct a :class:`ProbeResult` with a defaulted ``ok`` for tests.
 
@@ -78,6 +79,7 @@ def make_probe_result(
         timed_out=timed_out,
         success_when=success_when,
         assertion_failures=assertion_failures,
+        has_assertions=has_assertions,
     )
 
 
@@ -2491,6 +2493,32 @@ class TestResults(unittest.TestCase):
         self.assertEqual(probe["success_when"], "READY")
         self.assertTrue(probe["ok"])  # token-derived ok despite exit_code 1
         self.assertEqual(probe["exit_code"], 1)
+
+    def test_serialize_passing_assertion_probe_carries_declared_count_true(self) -> None:
+        # (7.5) DECLARED-count: a PASSING assertion probe (assertion_failures=())
+        # serializes has_assertions=True and assertion_failures=[] — has_assertions
+        # is the declared count, NOT derived from the (empty) failures list.
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        res = (make_probe_result("P1", ProbeTag.READ_ONLY, 0, "out", ok=True, has_assertions=True),)
+        hr = model.HostRun(host_spec=spec, detail="ok", results=res)
+        doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
+        probe = doc["hosts"][0]["probes"][0]
+        self.assertTrue(probe["has_assertions"])              # declared, even though it PASSED
+        self.assertEqual(probe["assertion_failures"], [])
+
+    def test_serialize_failing_assertion_probe_carries_failures(self) -> None:
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        res = (
+            make_probe_result(
+                "P1", ProbeTag.READ_ONLY, 0, "out", ok=False,
+                has_assertions=True, assertion_failures=("stdout did not match /ready/",),
+            ),
+        )
+        hr = model.HostRun(host_spec=spec, detail="ok", results=res)
+        doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
+        probe = doc["hosts"][0]["probes"][0]
+        self.assertTrue(probe["has_assertions"])
+        self.assertEqual(probe["assertion_failures"], ["stdout did not match /ready/"])
 
     def test_write_results_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:

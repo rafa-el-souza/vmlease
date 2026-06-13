@@ -239,6 +239,16 @@ class ProbeResult:
     declarative assertion (``()`` when none failed or none were declared) — the
     parsed assertion list itself never travels into the result.
 
+    ``has_assertions`` (default ``False``, back-compatible) is a stored metadata
+    bool the runner sets from the DECLARED assertion count
+    (``len(probe.assertions) > 0``), NOT from ``assertion_failures`` (D10(C)): a
+    PASSING assertion probe has ``assertion_failures=()``, indistinguishable from
+    a no-assertion probe, so the count cannot be re-derived downstream. It lets
+    ``serialize_run`` (which only sees ``ProbeResult``, never the ``Probe``) emit
+    the assertions signal so the summarizer can route to the assertion verdict
+    branch. This is a metadata bool, not the engine-bearing assertion list —
+    ``model.py`` stays engine-free.
+
     ``timed_out`` (default ``False``, back-compatible) marks a result the bounded
     probe transport produced because the command outlived its effective timeout:
     the SSH layer killed the local process and recorded this result (sentinel exit
@@ -257,6 +267,7 @@ class ProbeResult:
     timed_out: bool = False
     success_when: str = ""
     assertion_failures: tuple[str, ...] = ()
+    has_assertions: bool = False
 
 
 @dataclass(frozen=True)

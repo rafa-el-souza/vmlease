@@ -14,10 +14,10 @@ the timestamp and run-id come from the raw document, never the clock. The split
 mirrors ``results.py`` — a pure :func:`summarize_results` builder + a thin
 :func:`write_summary` I/O wrapper + a deterministic :func:`summary_filename`.
 
-Summary shape (``schema_version`` ``"1"``)::
+Summary shape (``schema_version`` ``"2"``)::
 
     {
-      "schema_version": "1",
+      "schema_version": "2",
       "source_raw": "<path or name of the raw file, informational>",
       "run_id": "<from the raw doc>",
       "timestamp": "<from the raw doc>",
@@ -34,6 +34,7 @@ Summary shape (``schema_version`` ``"1"``)::
               "ok": true,                    # exit_code == 0 (raw, may be vacuous)
               "timed_out": false,
               "verdict": "PASS",             # the canonical computed verdict
+              "assertion_failures": [],      # describe() of each failed assertion
               "ok_tokens": ["SETUP_EXIT0_OK"],
               "fail_tokens": [], "info_tokens": [], "review_tokens": [],
               "stdout_tail": "<last TAIL_LEN chars>",
@@ -50,12 +51,19 @@ Summary shape (``schema_version`` ``"1"``)::
 Verdict rule (per probe, deterministic precedence):
 
 1. ``timed_out`` true → ``TIMEOUT``;
-2. else, when the probe declared a non-empty ``success_when``, the declared
+2. else, when the probe declared ≥1 declarative assertion (``has_assertions``),
+   the runner-stored ``ok`` (the AND of those assertions) is authoritative →
+   ``PASS`` iff ``ok`` holds, else ``FAIL`` (overriding the ``success_when``,
+   exit-code, and token rules both ways);
+3. else, when the probe declared a non-empty ``success_when``, the declared
    predicate is authoritative → ``PASS`` iff the *recorded* ``ok`` holds, else
    ``FAIL`` (overriding the exit-code and fail-token rules);
-3. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
-4. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
-5. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
+4. else any ``fail_tokens`` OR ``exit_code != 0`` → ``FAIL``;
+5. else ``exit_code == 0`` with ≥1 ``ok_token`` → ``PASS``;
+6. else (``exit_code == 0``, no assertion tokens) → ``PASS_NO_ASSERTIONS``.
+
+A pre-schema raw file (no ``has_assertions`` key) reads ``has_assertions=False``
+for every probe and falls to the ``success_when`` / token path unchanged (M5).
 """
 
 from __future__ import annotations
@@ -71,7 +79,7 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 # Constants — single source of truth for verdict strings + the contract knobs
 # --------------------------------------------------------------------------- #
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -155,18 +163,23 @@ def verdict(
     ok_tokens: list[str],
     success_when: str = "",
     ok: bool = False,
+    has_assertions: bool = False,
 ) -> str:
     """Compute the one canonical verdict for a probe (see the module docstring).
 
-    Precedence: ``timed_out`` dominates. When the probe declared a non-empty
-    ``success_when`` the declared predicate is authoritative — the verdict is
-    ``PASS`` iff the probe's *recorded* ``ok`` holds, else ``FAIL`` — overriding
-    the exit-code and fail-token rules (the single source of the pass/fail
-    predicate; the line-match is never re-derived here). A probe with no
-    ``success_when`` falls through to the exact exit-code precedence unchanged.
+    Precedence: ``timed_out`` dominates. When the probe declared ≥1 declarative
+    assertion (``has_assertions``) the runner-stored ``ok`` (the AND of those
+    assertions) is authoritative — ``PASS`` iff ``ok`` holds, else ``FAIL`` —
+    overriding the ``success_when``, exit-code, AND token rules BOTH ways (a
+    stray ``*_FAIL`` token cannot flip a passing assertion probe, nor a stray
+    ``*_OK`` token a failing one). Below that, a non-empty ``success_when`` is the
+    declared predicate (``PASS`` iff ``ok``). A probe with neither falls through
+    to the exact exit-code/token precedence unchanged.
     """
     if timed_out:
         return TIMEOUT
+    if has_assertions:
+        return PASS if ok else FAIL
     if success_when:
         return PASS if ok else FAIL
     if fail_tokens or exit_code != 0:
@@ -212,6 +225,8 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
     stderr = str(raw_probe.get("stderr", ""))
     ok = bool(raw_probe.get("ok", exit_code == 0))
     success_when = str(raw_probe.get("success_when", ""))
+    has_assertions = bool(raw_probe.get("has_assertions", False))
+    assertion_failures = list(raw_probe.get("assertion_failures", []))
     tokens = harvest_tokens(stdout)
     return {
         "id": probe_id,
@@ -221,8 +236,15 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
         "ok": ok,
         "timed_out": timed_out,
         "verdict": verdict(
-            exit_code, timed_out, tokens["fail_tokens"], tokens["ok_tokens"], success_when, ok
+            exit_code,
+            timed_out,
+            tokens["fail_tokens"],
+            tokens["ok_tokens"],
+            success_when,
+            ok,
+            has_assertions,
         ),
+        "assertion_failures": assertion_failures,
         **tokens,
         "stdout_tail": stdout[-TAIL_LEN:],
         "stderr_tail": stderr[-TAIL_LEN:],
