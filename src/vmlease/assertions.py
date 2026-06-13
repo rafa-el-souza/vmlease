@@ -27,6 +27,18 @@ import re2
 
 from vmlease.model import Assertion, Outcome
 
+
+def evaluate(assertions: tuple[Assertion, ...], outcome: Outcome) -> tuple[str, ...]:
+    """Evaluate every assertion against ``outcome``; return the FAILED descriptions.
+
+    The runner (:meth:`OpenSshRunner.run_probe`) calls this to compute a probe's
+    ``ok`` verdict: an empty result means every assertion held (``ok``); a
+    non-empty tuple carries the :meth:`Assertion.describe` of each assertion that
+    failed, in authoring order, for the result's ``assertion_failures`` field.
+    ``describe`` is only invoked on a failing assertion (its contract).
+    """
+    return tuple(a.describe(outcome) for a in assertions if not a.evaluate(outcome))
+
 # RE2 automaton memory budget per compiled pattern (D8#8/D10(H)). Set EXPLICITLY
 # even though it equals RE2's built-in default — we own the bound, so a future
 # tightening is a one-line change, never a silently-inherited default.

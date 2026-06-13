@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,6 +28,7 @@ from tests.battery_helpers import battery_toml
 from vmlease import (
     archbuild,
     archimage,
+    assertions,
     cli,
     cloudinit,
     distro,
@@ -44,7 +46,39 @@ from vmlease import (
 )
 from vmlease import battery as battery_mod
 from vmlease import shellcheck as shellcheck_mod
-from vmlease.model import Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
+from vmlease.model import Assertion, Host, HostSpec, Image, Probe, ProbeResult, ProbeTag
+
+
+def make_probe_result(
+    probe_id: str,
+    tag: ProbeTag,
+    exit_code: int,
+    stdout: str = "",
+    stderr: str = "",
+    *,
+    ok: bool | None = None,
+    timed_out: bool = False,
+    success_when: str = "",
+    assertion_failures: tuple[str, ...] = (),
+) -> ProbeResult:
+    """Construct a :class:`ProbeResult` with a defaulted ``ok`` for tests.
+
+    ``ok`` is now a REQUIRED stored field (the runner computes it). Test
+    constructions that don't care about the verdict default it to
+    ``exit_code == 0``; pass ``ok=`` to override (e.g. a token-derived pass on a
+    non-zero exit). This bounds the churn from the field becoming stored.
+    """
+    return ProbeResult(
+        probe_id=probe_id,
+        tag=tag,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        ok=(exit_code == 0) if ok is None else ok,
+        timed_out=timed_out,
+        success_when=success_when,
+        assertion_failures=assertion_failures,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +208,7 @@ class FakeSshRunner:
         if self._raise_on is not None and probe.id == self._raise_on:
             raise ssh.SshError(f"boom on {probe.id}")
         code = 7 if probe.id == self._fail_on else 0
-        return ProbeResult(probe_id=probe.id, tag=probe.tag, exit_code=code, stdout=f"out-{probe.id}", stderr="")
+        return make_probe_result(probe.id, probe.tag, code, stdout=f"out-{probe.id}")
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
         self.ran.append(f"upload:{remote}")
@@ -255,65 +289,45 @@ _DEMO_BATTERY = battery_toml(
 # model
 # --------------------------------------------------------------------------- #
 class TestModel(unittest.TestCase):
-    def test_probe_result_ok(self) -> None:
-        ok = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
-        bad = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "", "err")
+    def test_probe_result_ok_is_a_stored_field(self) -> None:
+        # ``ok`` is now a runner-computed STORED verdict — the model stores it
+        # verbatim and applies no reading of its own (computation moved to
+        # ``run_probe``; see TestSsh for the verdict-rule coverage).
+        ok = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "out", "", ok=True)
+        bad = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "", ok=False)
         self.assertTrue(ok.ok)
         self.assertFalse(bad.ok)
 
-    def test_probe_result_ok_undeclared_exit_zero(self) -> None:
-        # (a) undeclared + exit 0 -> ok (exit-code reading)
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "anything", "")
-        self.assertTrue(res.ok)
-
-    def test_probe_result_not_ok_undeclared_exit_nonzero(self) -> None:
-        # (b) undeclared + exit 3 -> not ok
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 3, "anything", "")
-        self.assertFalse(res.ok)
-
-    def test_probe_result_ok_declared_token_line_overrides_nonzero_exit(self) -> None:
-        # (c) declared token present as a line + exit 3 -> ok (token replaces exit code)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 3, "noise\n  CORE_RUNNING_OK  \nmore", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertTrue(res.ok)
-
-    def test_probe_result_not_ok_declared_token_absent_exit_zero(self) -> None:
-        # (d) declared + exit 0 but token absent -> not ok (exit code not consulted)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "other output", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
-
-    def test_probe_result_not_ok_token_only_embedded_in_line(self) -> None:
-        # (e) token only embedded in a longer line, never its own line -> not ok
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "found CORE_RUNNING_OK in scan", "",
-            success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
-
-    def test_probe_result_not_ok_declared_token_but_timed_out(self) -> None:
-        # (f) declared token present but timed_out=True -> not ok (partial output is no verdict)
-        res = model.ProbeResult(
-            "P1", model.ProbeTag.READ_ONLY, 0, "CORE_RUNNING_OK", "",
-            timed_out=True, success_when="CORE_RUNNING_OK",
-        )
-        self.assertFalse(res.ok)
+    def test_probe_result_assertion_failures_defaults_empty(self) -> None:
+        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0)
+        self.assertEqual(res.assertion_failures, ())
 
     def test_probe_success_when_defaults_empty(self) -> None:
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
         self.assertEqual(p.success_when, "")
 
     def test_probe_result_success_when_defaults_empty(self) -> None:
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0, "out")
         self.assertEqual(res.success_when, "")
 
     def test_probe_result_timed_out_defaults_false(self) -> None:
-        res = model.ProbeResult("P1", model.ProbeTag.READ_ONLY, 0, "out", "")
+        res = make_probe_result("P1", model.ProbeTag.READ_ONLY, 0, "out")
         self.assertFalse(res.timed_out)
+
+    def test_model_imports_no_regex_engine_or_assertions(self) -> None:
+        # M1-gate / D10(B): importing ``vmlease.model`` must NOT transitively pull
+        # in the regex backend (``re2``) or ``vmlease.assertions``. A fresh
+        # subprocess proves no transitive runtime import (the verdict arrives
+        # already computed; the engine lives only in ``assertions``/``ssh``).
+        code = (
+            "import vmlease.model, sys; "
+            "print('re2' in sys.modules); "
+            "print('vmlease.assertions' in sys.modules)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(proc.stdout.split(), ["False", "False"])
 
     def test_probe_timeout_defaults_none(self) -> None:
         p = model.Probe(id="P1", title="t", command="c", tag=model.ProbeTag.READ_ONLY)
@@ -1904,6 +1918,68 @@ class TestSsh(unittest.TestCase):
         self.assertEqual(res.success_when, "READY")
         self.assertTrue(res.ok)  # token line present → ok despite non-zero exit
 
+    def _assert(self, key: str, value: object) -> Assertion:
+        return assertions._ASSERTIONS[key].build(value)
+
+    def test_run_probe_no_assertion_ok_is_exit_zero(self) -> None:
+        # No assertions and no success_when → ok iff exit 0 (the relocated old rule).
+        r0 = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "out", ""))
+        r3 = OpenSshRunnerForTest(_fake_ssh_subprocess(3, "out", "err"))
+        probe = Probe(id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY)
+        self.assertTrue(r0.run_probe(self._host(), probe).ok)
+        self.assertFalse(r3.run_probe(self._host(), probe).ok)
+
+    def test_run_probe_assertion_decided_ok_and_failures(self) -> None:
+        # A declared assertion decides ok; a satisfied one → ok with no failures.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "READY now", ""))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("stdout_has", "READY"),),
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.ok)
+        self.assertEqual(res.assertion_failures, ())
+
+    def test_run_probe_assertion_failure_records_description(self) -> None:
+        # A failed assertion → not ok and its describe() lands in assertion_failures.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(0, "nope", ""))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("stdout_has", "READY"),),
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertFalse(res.ok)
+        self.assertEqual(len(res.assertion_failures), 1)
+        self.assertIn("stdout_has", res.assertion_failures[0])
+
+    def test_run_probe_refusal_exit_not_passes_on_nonzero_exit(self) -> None:
+        # A refusal assertion ``exit_not = 0`` PASSES on a non-zero exit — the
+        # assertion verdict, not the exit code, decides ok.
+        r = OpenSshRunnerForTest(_fake_ssh_subprocess(13, "", "denied"))
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("exit_not", 0),),
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.ok)  # exit was non-zero → exit_not 0 holds
+        self.assertEqual(res.assertion_failures, ())
+
+    def test_run_probe_timed_out_refusal_not_ok_despite_satisfiable_assertion(self) -> None:
+        # A timed-out probe is not ok even when its exit assertion WOULD be
+        # satisfiable — the evaluator is never invoked on the killed result (D10(E)).
+        def slow(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(argv, timeout, output="", stderr="")
+
+        r = OpenSshRunnerForTest(slow)
+        probe = Probe(
+            id="P1", title="t", command="c", tag=ProbeTag.READ_ONLY,
+            assertions=(self._assert("exit_not", 0),),  # 124 != 0 → would pass
+        )
+        res = r.run_probe(self._host(), probe)
+        self.assertTrue(res.timed_out)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.assertion_failures, ())  # evaluator never ran
+
     def test_run_probe_blocking_seam_records_timed_out_result(self) -> None:
         # T1: a slow/blocking transport that raises TimeoutExpired is RECORDED as a
         # timed-out result (exit 124, timed_out=True, partial output), not raised
@@ -2383,8 +2459,8 @@ class TestResults(unittest.TestCase):
     def _run(self) -> model.HostRun:
         spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
         res = (
-            ProbeResult("P1", ProbeTag.READ_ONLY, 0, "ok", ""),
-            ProbeResult("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
+            make_probe_result("P1", ProbeTag.READ_ONLY, 0, "ok"),
+            make_probe_result("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
         )
         return model.HostRun(host_spec=spec, detail="## os-release\nID=ubuntu", results=res)
 
@@ -2408,7 +2484,7 @@ class TestResults(unittest.TestCase):
         # end-to-end: a declaring probe whose stdout carries the token serializes
         # ok=True (token-derived, despite a non-zero exit) AND its success_when field.
         spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
-        res = (ProbeResult("P1", ProbeTag.READ_ONLY, 1, "noise\nREADY\n", "", success_when="READY"),)
+        res = (make_probe_result("P1", ProbeTag.READ_ONLY, 1, "noise\nREADY\n", success_when="READY", ok=True),)
         hr = model.HostRun(host_spec=spec, detail="ok", results=res)
         doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
         probe = doc["hosts"][0]["probes"][0]
@@ -2530,7 +2606,7 @@ class TestExecute(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2669,9 +2745,9 @@ class TestExecute(unittest.TestCase):
                 if "fedora" in host.name:
                     debian_done.wait(timeout=5.0)  # complete strictly after debian
                     fedora_done.set()
-                    return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                    return make_probe_result(probe.id, probe.tag, 0, "ok")
                 # ubuntu: completes first and fastest (no waits), parking the sink.
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2751,7 +2827,7 @@ class TestExecute(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 if "debian" in host.name:
                     raise ssh.SshError("debian unreachable")
-                return ProbeResult(probe.id, probe.tag, 0, "ok", "")
+                return make_probe_result(probe.id, probe.tag, 0, "ok")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2816,7 +2892,7 @@ class TestWorkloadSeam(unittest.TestCase):
 
         class _ReadyRecordingSsh:
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
-                return ProbeResult(probe.id, probe.tag, 0, "", "")
+                return make_probe_result(probe.id, probe.tag, 0, "")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -2864,8 +2940,8 @@ class _ScriptedTimeoutSsh:
     def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
         self.ran.append(probe.id)
         if probe.id in self._timeout_ids:
-            return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
-        return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+            return make_probe_result(probe.id, probe.tag, 124, "", "timed out after 1.0s", timed_out=True)
+        return make_probe_result(probe.id, probe.tag, 0, f"out-{probe.id}")
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
         return None
@@ -2960,7 +3036,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
         class _CommandRecordingSsh:
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 seen.append(probe.command)
-                return ProbeResult(probe.id, probe.tag, 0, "", "")
+                return make_probe_result(probe.id, probe.tag, 0, "")
 
             def upload(self, host: Host, local: Path, remote: str) -> None:
                 return None
@@ -3169,8 +3245,8 @@ class TestCliRun(unittest.TestCase):
             def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
                 self.ran.append(probe.id)
                 if probe.id == "P6":
-                    return ProbeResult(probe.id, probe.tag, 124, "", "timed out after 42.5s", timed_out=True)
-                return ProbeResult(probe.id, probe.tag, 0, f"out-{probe.id}", "")
+                    return make_probe_result(probe.id, probe.tag, 124, "", "timed out after 42.5s", timed_out=True)
+                return make_probe_result(probe.id, probe.tag, 0, f"out-{probe.id}")
 
         def _capture(*_a: object, **k: object) -> _TimeoutOneProbeSsh:
             captured.update(k)

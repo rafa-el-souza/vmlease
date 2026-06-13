@@ -21,7 +21,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from vmlease.model import ProbeResult
+from vmlease import assertions
+from vmlease.model import Outcome, ProbeResult
 from vmlease.safety import validate_remote_dest, validate_upload_dir_source
 
 if TYPE_CHECKING:
@@ -239,13 +240,28 @@ class OpenSshRunner:
             proc = self._run(argv, timeout)
         except subprocess.TimeoutExpired as exc:
             return _timed_out_result(probe, timeout, exc)
+        outcome = Outcome(proc.returncode, proc.stdout, proc.stderr)
+        # Compute the verdict BEFORE constructing the frozen result (D10(A)). The
+        # ``success_when``/exit branches are the OLD ``ProbeResult.ok`` property
+        # logic relocated verbatim; §8 removes them once ``success_when`` is gone.
+        if probe.assertions:
+            failures = assertions.evaluate(probe.assertions, outcome)
+            ok = not failures
+        elif probe.success_when:
+            ok = any(line.strip() == probe.success_when for line in proc.stdout.splitlines())
+            failures = ()
+        else:
+            ok = proc.returncode == 0
+            failures = ()
         return ProbeResult(
             probe_id=probe.id,
             tag=probe.tag,
             exit_code=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
+            ok=ok,
             success_when=probe.success_when,
+            assertion_failures=failures,
         )
 
     def upload(self, host: Host, local: Path, remote: str) -> None:
@@ -391,14 +407,19 @@ def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpir
     stdout = _decode_partial(exc.stdout)
     stderr = _decode_partial(exc.stderr)
     stderr = f"{stderr}\n{note}" if stderr else note
+    # A killed probe is never ok and its partial ``(124, partial-output)`` must
+    # NEVER reach the assertion evaluator (D10(E)) — the verdict short-circuits
+    # to ``False`` here without consulting ``probe.assertions``.
     return ProbeResult(
         probe_id=probe.id,
         tag=probe.tag,
         exit_code=124,
         stdout=stdout,
         stderr=stderr,
+        ok=False,
         timed_out=True,
         success_when=probe.success_when,
+        assertion_failures=(),
     )
 
 

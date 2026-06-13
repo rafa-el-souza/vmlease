@@ -228,6 +228,17 @@ class Image:
 class ProbeResult:
     """The captured outcome of one probe on one host.
 
+    ``ok`` is a **runner-computed STORED verdict** (D9/M1): the SSH layer
+    evaluates the probe's declarative assertions (or, transitionally, its
+    ``success_when`` token / exit code) in :meth:`OpenSshRunner.run_probe`
+    BEFORE constructing this frozen result, then stores the boolean here. It is
+    REQUIRED (no default — a defaulted verdict would silently mis-pass). The
+    model stays engine-free: it imports neither the regex backend (``re2``) nor
+    :mod:`vmlease.assertions`; the verdict arrives already computed.
+    ``assertion_failures`` carries the :meth:`Assertion.describe` of each FAILED
+    declarative assertion (``()`` when none failed or none were declared) — the
+    parsed assertion list itself never travels into the result.
+
     ``timed_out`` (default ``False``, back-compatible) marks a result the bounded
     probe transport produced because the command outlived its effective timeout:
     the SSH layer killed the local process and recorded this result (sentinel exit
@@ -242,27 +253,10 @@ class ProbeResult:
     exit_code: int
     stdout: str
     stderr: str
+    ok: bool
     timed_out: bool = False
     success_when: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """Whether the probe passed, by exactly one of two readings.
-
-        A timed-out result is never ok — a killed probe's partial output is not
-        a verdict. Otherwise, when ``success_when`` is declared (non-empty), the
-        probe is ok iff that token appears as a **complete line** of stdout
-        (each line stripped of leading/trailing whitespace) — the exit code does
-        not participate. When ``success_when`` is ``""`` (the default,
-        back-compatible reading), the probe is ok iff it exited zero.
-        Interpretation of a not-ok result is per-probe; it may be an *expected*
-        fail — see the battery doc.
-        """
-        if self.timed_out:
-            return False
-        if self.success_when:
-            return any(line.strip() == self.success_when for line in self.stdout.splitlines())
-        return self.exit_code == 0
+    assertion_failures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
