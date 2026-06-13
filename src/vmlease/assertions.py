@@ -189,6 +189,8 @@ def _compile_re2(key: str, pattern: str) -> re2._Regexp:
     """
     options = re2.Options()
     options.max_mem = _RE2_MAX_MEM
+    options.log_errors = False  # RE2 logs compile errors to stderr by default; we surface them as
+                                # BatteryError, so silence RE2's own logging to keep operator stderr clean.
     try:
         return re2.compile(pattern, options=options)
     except re2.error as exc:

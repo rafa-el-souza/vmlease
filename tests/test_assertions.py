@@ -6,6 +6,8 @@ stdlib unittest only. Run with:
 """
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
 
 from vmlease.assertions import _ASSERTIONS
@@ -336,6 +338,45 @@ class TestRegexCompileRejection(unittest.TestCase):
         big.max_mem = 1024 * 1024 * 1024
         # Proves the pattern is well-formed; only the budget rejected it above.
         self.assertIsNotNone(re2.compile(over_budget, options=big))
+
+
+class TestRe2CompileLoggingSilenced(unittest.TestCase):
+    """RE2's own compile-error logging never reaches operator stderr (finding 1).
+
+    A malformed pattern in ``[probe.assert]`` is surfaced as ``BatteryError`` by
+    the loader; RE2's default ``log_errors`` would ALSO dump raw absl/C++ engine
+    noise to fd 2 (``WARNING: All log messages before absl::InitializeLog()…``,
+    ``E0000 … re2.cc … Error parsing …``) on top of that clean error. The
+    ``log_errors=False`` option on ``_compile_re2``'s ``Options`` silences it.
+
+    The noise is written to fd 2 from C++, so ``contextlib.redirect_stderr`` can
+    NOT capture it — this runs ``parse_battery`` over a malformed-regex battery in
+    a SUBPROCESS and inspects the real fd-2 stream (mirrors the engine-free model
+    gate ``test_model_imports_no_regex_engine_or_assertions``).
+    """
+
+    def test_parse_battery_malformed_regex_keeps_stderr_clean(self) -> None:
+        manifest = (
+            "name = '''x'''\n\n[[probe]]\nid = '''P'''\ntitle = '''t'''\n"
+            "tag = '''read-only'''\nrun = '''c'''\n"
+            "[probe.assert]\nstdout_matches = '''(unclosed'''\n"
+        )
+        code = (
+            "import vmlease.battery as b\n"
+            f"manifest = {manifest!r}\n"
+            "try:\n"
+            "    b.parse_battery(manifest)\n"
+            "except b.BatteryError:\n"
+            "    print('BATTERY_ERROR_RAISED')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        )
+        # (b) the clean BatteryError still fired (engine still raises identically).
+        self.assertIn("BATTERY_ERROR_RAISED", proc.stdout)
+        # (a) NONE of RE2's raw engine noise leaked to operator stderr.
+        for needle in ("re2.cc", "E0000", "absl"):
+            self.assertNotIn(needle, proc.stderr)
 
 
 if __name__ == "__main__":
