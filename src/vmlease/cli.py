@@ -48,6 +48,7 @@ from vmlease.battery import (
     load_battery,
     structural_violations,
 )
+from vmlease.capabilities import canonical_requires
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.imagecache import (
     LABEL_ARCH,
@@ -151,7 +152,11 @@ def _parse_upload(value: str) -> UploadSpec:
     return UploadSpec(local=local, remote=remote)
 
 
-def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
+def _matrix_from_args(
+    args: argparse.Namespace,
+    workload: Workload,
+    requires: tuple[str, ...] = (),
+) -> Matrix:
     distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
     uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
     return Matrix(
@@ -161,6 +166,7 @@ def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
         run_token=args.run_token,
         firewall=args.firewall,
         uploads=uploads,
+        requires=requires,
     )
 
 
@@ -173,7 +179,9 @@ def _warn_battery(battery: Battery) -> None:
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(args, ProbeWorkload(battery))
+        matrix = _matrix_from_args(
+            args, ProbeWorkload(battery), canonical_requires(battery.requires)
+        )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -182,7 +190,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}")
+        requires_note = f"  requires={list(it.requires)}" if it.requires else ""
+        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
     return 0
 
 
@@ -197,7 +206,9 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
 def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(args, ProbeWorkload(battery))
+        matrix = _matrix_from_args(
+            args, ProbeWorkload(battery), canonical_requires(battery.requires)
+        )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -207,7 +218,8 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}")
+        requires_note = f"  requires={list(it.requires)}" if it.requires else ""
+        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}{requires_note}")
     if not _confirm("Proceed with provisioning? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0

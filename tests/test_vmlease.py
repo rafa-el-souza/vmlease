@@ -1681,6 +1681,68 @@ class TestRunner(unittest.TestCase):
             with self.assertRaises(safety.UploadError):
                 runner.plan(m)
 
+    # --- requires on the provisioning spine (group 2) -------------------- #
+    def test_matrix_carries_requires_default_empty(self) -> None:
+        self.assertEqual(self._matrix().requires, ())
+
+    def test_matrix_carries_requires(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu",), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        self.assertEqual(m.requires, ("docker",))
+
+    def test_build_host_specs_propagates_requires_to_every_host(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        specs = runner.build_host_specs(m)
+        self.assertEqual(len(specs), 3)
+        for s in specs:
+            self.assertEqual(s.requires, ("docker",))
+
+    def test_build_host_specs_canonicalizes_requires(self) -> None:
+        # build_host_specs funnels through capabilities.canonical_requires:
+        # order + duplicates collapse to the single canonical tuple.
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu",), "cpx22", "run-req",
+            requires=("docker", "docker"),
+        )
+        self.assertEqual(runner.build_host_specs(m)[0].requires, ("docker",))
+
+    def test_build_host_specs_requires_default_empty(self) -> None:
+        for s in runner.build_host_specs(self._matrix()):
+            self.assertEqual(s.requires, ())
+
+    def test_build_host_specs_deterministic_with_requires(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        a = runner.build_host_specs(m)
+        b = runner.build_host_specs(m)
+        self.assertEqual(
+            [(s.name, s.requires) for s in a],
+            [(s.name, s.requires) for s in b],
+        )
+
+    def test_plan_surfaces_requires_and_no_provider_calls(self) -> None:
+        # plan takes no provider (zero provider calls structurally) and surfaces
+        # the host's requires on every PlanItem.
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        items = runner.plan(m)
+        self.assertEqual(len(items), 2)
+        for it in items:
+            self.assertEqual(it.requires, ("docker",))
+
+    def test_plan_requires_default_empty(self) -> None:
+        for it in runner.plan(self._matrix()):
+            self.assertEqual(it.requires, ())
+
 
 # --------------------------------------------------------------------------- #
 # cli — plan subcommand (zero provider calls)
@@ -1754,6 +1816,22 @@ class TestCli(unittest.TestCase):
             self.assertEqual(len(m.uploads), 2)
             self.assertEqual(m.uploads[0].remote, "~/x.whl")
             self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
+
+    def test_matrix_from_args_default_requires_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
+            ])
+            self.assertEqual(cli._matrix_from_args(ns, _demo_workload()).requires, ())
+
+    def test_matrix_from_args_carries_requires(self) -> None:
+        # the requires arg is already canonicalized (D-I.4) and lands on Matrix.
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
+            ])
+            m = cli._matrix_from_args(ns, _demo_workload(), ("docker",))
+            self.assertEqual(m.requires, ("docker",))
 
     def test_plan_rejects_bad_upload_no_provider_call(self) -> None:
         # the free-plan fail-closed path: a symlink source is refused at plan,

@@ -217,6 +217,11 @@ class HostSpec:
         firewall: Optional provider firewall name to attach at create time
             (``""`` = none). Restricting inbound to the operator's IP is good
             hygiene for a host that boots an unconfigured cloud image.
+        requires: The vmlease-provided capabilities this host needs (canonical
+            order, default-off — ``()`` means no capability). Propagated from the
+            run's :class:`~vmlease.runner.Matrix` onto every host so the runner
+            (and the cache key) can gate capability inclusion per host without
+            reading the opaque battery.
     """
 
     name: str
@@ -225,6 +230,7 @@ class HostSpec:
     distro_key: str
     labels: dict[str, str] = field(default_factory=dict)
     firewall: str = ""
+    requires: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -365,6 +371,8 @@ class PlanItem:
     execute so an operator can review (and cost-check) before any real spend.
     ``workload_summary`` is the injected workload's one-line self-description
     (e.g. ``probes=3`` for the probe battery) — the plan does not assume probes.
+    ``requires`` surfaces the host's vmlease-provided capabilities (canonical
+    order, ``()`` when none) so the operator can review them before any spend.
     """
 
     host_name: str
@@ -372,3 +380,4 @@ class PlanItem:
     server_type: str
     distro_key: str
     workload_summary: str
+    requires: tuple[str, ...] = ()

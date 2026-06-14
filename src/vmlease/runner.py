@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
+from vmlease.capabilities import canonical_requires
 from vmlease.cloudinit import SYSPREP_COMMAND, render_cloudinit, render_minimal_cloudinit
 from vmlease.distro import get_profile
 from vmlease.imagecache import (
@@ -65,6 +66,10 @@ class Matrix:
             (``""`` = none).
         uploads: Files scp'd onto every host after readiness, before the workload
             (``()`` = none). Validated host-independently before any spend.
+        requires: The vmlease-provided capabilities every host in the run needs
+            (a provisioning attribute, default-off — ``()`` means no capability).
+            The CLI lifts this from the battery and canonicalizes it; the runner
+            propagates it onto every :class:`~vmlease.model.HostSpec`.
     """
 
     workload: Workload
@@ -73,6 +78,7 @@ class Matrix:
     run_token: str
     firewall: str = ""
     uploads: tuple[UploadSpec, ...] = ()
+    requires: tuple[str, ...] = ()
 
 
 def build_host_specs(matrix: Matrix) -> list[HostSpec]:
@@ -85,6 +91,7 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
     """
     run_id = make_run_id(matrix.run_token)
     labels = run_label(run_id)
+    requires = canonical_requires(matrix.requires)
     specs: list[HostSpec] = []
     for key in matrix.distro_keys:
         profile = get_profile(key)
@@ -96,6 +103,7 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
                 distro_key=key,
                 labels=dict(labels),
                 firewall=matrix.firewall,
+                requires=requires,
             )
         )
     return specs
@@ -142,6 +150,7 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
             server_type=s.server_type,
             distro_key=s.distro_key,
             workload_summary=workload_summary,
+            requires=s.requires,
         )
         for s in specs
     ]
