@@ -1,10 +1,18 @@
 name = "vmlease-compose-plugin-check"
 
+# Opt into the vmlease-provided `docker` capability. Docker is default-off: a
+# battery that needs it must declare it here (else it provisions onto a
+# docker-less host and its docker probes fail loudly). This battery only verifies
+# docker — it installs no packages and runs no setup of its own, so it has no
+# `[prep]` section.
+requires = ["docker"]
+
 # A read-only, no-upload smoke that a freshly-provisioned VM has the docker
-# prerequisites vmlease's cloud-init installs: Docker, the `docker compose` v2
-# plugin, buildx, and `script(1)`. Guards vmlease's per-distro install template
-# against regressions. All probes are read-only (no host mutation beyond /tmp),
-# so authoring order already matches the former tag-rank execution order.
+# prerequisites vmlease's `requires = ["docker"]` capability installs: Docker,
+# the `docker compose` v2 plugin, buildx, and `script(1)`. Guards vmlease's
+# per-distro docker capability recipe against regressions. All probes are
+# read-only (no host mutation beyond /tmp), so authoring order already matches
+# the former tag-rank execution order.
 
 [[probe]]
 id = "COMPOSE"

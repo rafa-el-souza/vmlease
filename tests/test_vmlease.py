@@ -852,6 +852,10 @@ class TestBattery(unittest.TestCase):
         self.assertEqual(len(b.probes), 1)
         self.assertEqual(b.probes[0].tag, ProbeTag.READ_ONLY)
         self.assertTrue(b.probes[0].command.strip())
+        # The example is a docker smoke: post-migration it opts into docker via
+        # `requires = ["docker"]` (default-off) rather than relying on always-on
+        # docker. A docker-less host would fail its probes loudly.
+        self.assertEqual(b.requires, ("docker",))
 
     def test_parse_bad_toml(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):

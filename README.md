@@ -55,6 +55,98 @@ as **bash**. See `examples/compose-plugin-check/battery.toml`.
 Migrating a pre-TOML (JSON) battery? See [`docs/battery-toml-migration.md`](docs/battery-toml-migration.md)
 — field mapping, a one-time extraction helper, the authoring-order check, and a troubleshooting table.
 
+### Host prerequisites: `requires` and `[prep]`
+
+A battery declares its host prerequisites **declaratively**: the vmlease-provided capabilities it opts
+into (`requires`) and the packages + setup steps it brings itself (`[prep]`). Both are optional and
+additive to the manifest. The provisioning order per host is: capabilities (`requires`, baked into
+cloud-init at create time) → readiness gate → `[prep.packages]` → `[[prep.setup]]` (authoring order) →
+the probe loop.
+
+#### `requires` — opt into vmlease-provided capabilities (default-off)
+
+```toml
+requires = ["docker"]   # opt into the docker capability; default-off
+```
+
+`requires` names vmlease-provided capabilities the host needs. It is **opt-in and default-off**: a
+battery that names no capability provisions a host **without** it — in particular, **docker is no longer
+always installed**. A battery that needs docker MUST declare `requires = ["docker"]`; otherwise it lands
+on a docker-less host and its docker probes fail loudly (loud, not silent). An entry outside the known
+vocabulary is a hard battery-load error naming the unknown capability. The v1 vocabulary is exactly
+`docker`. A capability is realized per package-manager by a recipe (a package set + an optional setup
+fragment) injected into the host's cloud-init only when required — so docker and docker-less hosts are
+distinct cache entries automatically (see *Caching* below).
+
+> **Breaking:** docker used to be baked into every host. Existing batteries that rely on docker must add
+> `requires = ["docker"]`. The in-repo `examples/compose-plugin-check/` is migrated as the reference.
+
+#### `[prep]` — packages and setup the battery brings itself
+
+`[prep]` is host *setup*, not a test (distinct from probes — it carries no `tag` and no assertions). It
+runs once per host over SSH as the operator (`sudo` written inline where root is needed), after readiness
+and before the first probe.
+
+```toml
+[prep.packages]
+# A flat, validated table of UNION-OF-APPLICABLE-SELECTORS. Every key is EITHER a
+# known package-manager (apt / dnf / pacman) OR a known distro (ubuntu / debian /
+# fedora / arch …) — the two name-sets are disjoint and closed. A key that is
+# neither is a hard battery-load error (so an `apt-get` or `ubntu` typo fails loud).
+apt    = ["jq", "ripgrep"]   # installed on every apt host (ubuntu AND debian)
+debian = ["some-debian-only-pkg"]   # ADDED on debian only (its DISTRO key)
+
+[[prep.setup]]
+id = "INSTALL_UV"            # unique across setup steps
+title = "install uv"        # optional, human label
+run = '''curl -LsSf https://astral.sh/uv/install.sh | sudo sh'''  # inline; or `script = "step.sh"`
+# distros = ["ubuntu", "debian"]   # optional allowlist (default: every distro); a
+                                    # value that is not a known distro is rejected (typo guard)
+# required = true                   # default true; see soft/hard below
+# timeout = 1800                    # seconds; prep default is 1800 (longer than the
+                                    # probe default — prep includes source builds)
+```
+
+- **Union-of-applicable-selectors rule.** A host's effective package set is the **union** of the list
+  under the host's **package-manager** key and the list under the host's **distro** key, deduplicated,
+  manager entries first — one `<mgr> install` pass (`apt-get install -y` / `dnf install -y` /
+  `pacman -S --noconfirm`; on apt the index is refreshed with `apt-get update` first, since prep may run
+  on a cached host with a stale index). This is union-only (no subtraction): put the common packages
+  under the manager key and per-distro extras under the distro key. So on a debian host,
+  `apt = ["a"]` + `debian = ["b"]` ⇒ effective `["a", "b"]`.
+- **The manager-vs-distro key taxonomy.** The flat mixed key-set is the one non-obvious part: a key is a
+  *manager* (the install **mechanics** axis — apt serves both ubuntu and debian) or a *distro* (a single
+  OS). They are disjoint closed sets; pick the manager key for "all distros that share this installer"
+  and the distro key for "this one OS only."
+- **`[[prep.setup]]` steps** run in authoring order, each with a unique `id`, **exactly one of** an inline
+  `run` block or a `script` reference (resolved relative to the manifest, contained to the bundle, and
+  shellchecked exactly like a probe `script` — `vmlease lint` covers prep scripts too), an optional
+  `distros` allowlist (default: every distro; a step whose allowlist excludes the host is skipped), an
+  optional `required` flag (default `true`), an optional `title`, and an optional `timeout` (default
+  `1800`s). A malformed `[prep]` is a hard battery-load error: an unrecognized key, a selector that is
+  neither manager nor distro, an unknown `distros` value, a duplicate `id`, a step with neither/both of
+  `run`/`script`, or an empty resolved command.
+
+#### Soft vs hard fail — and the `prep_phase` / `summarize` contract
+
+- **`[prep.packages]` always hard-fails**, and a **`required = true`** setup step that fails is a **hard**
+  failure: the host runs **no probes** and is torn down through the normal teardown/reap path.
+- A **`required = false`** setup step that fails is a **soft** failure: it is **recorded** and the phase
+  continues to the remaining setup steps and then the probe loop.
+- Every executed prep step is recorded in a structured **`prep_phase`** section of the results (per step:
+  `id`, `exit`, `required`, captured `stderr`) — always present (empty for a no-prep host), distinct from
+  the per-probe records. A soft failure is never silently dropped.
+- **`summarize` is where prep failure becomes a verdict.** A hard prep abort counts as **`PREP_HARD_FAIL`**
+  and forces a **non-zero** `summarize` exit (this also closes the old zero-probe-host → exit-0 hole — a
+  hard-aborted host has zero probes but is *not* silently green). A soft prep failure counts as
+  **`PREP_SOFT_FAIL`** — a distinct, visible state in `totals` that does **not** by itself force a non-zero
+  exit (a CI gate may still choose to fail on it). The summary `schema_version` is `"3"`.
+
+> **CI gates on `summarize`, never on `run`.** `vmlease run`'s exit code reflects only the run mechanics
+> (it does not parse `*_OK`/`*_FAIL` tokens, and a soft prep fail leaves it running). The trustworthy
+> pass/fail verdict — including `PREP_HARD_FAIL` → non-zero — lives in `summarize`'s exit code. Always
+> gate on `vmlease summarize <raw>; echo $?`, not on `run`.
+
 ### Summarizing results (`vmlease summarize`)
 
 A raw results file records each probe's `ok` as *only its exit code* — but the real "did it pass?" lives
@@ -66,11 +158,14 @@ raw file is never mutated) and exits with the overall verdict so a caller can ga
 vmlease summarize results/vmlease-run-ts.json; echo $?   # 0 = all PASS/PASS_NO_ASSERTIONS, non-zero otherwise
 ```
 
-The summary carries `schema_version: "1"`; per host its `distro`/`image`/`detail` + a probe record each
-with a computed `verdict`, the four harvested token buckets, and bounded stdout/stderr tails; a `matrix`
-pivot (canonical command × distro, collapsed worst-of); and `totals` by verdict. The per-probe verdict is
-deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit → `FAIL`; else zero exit
-with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) → `PASS_NO_ASSERTIONS`. Pass
+The summary carries `schema_version: "3"`; per host its `distro`/`image`/`detail` + a probe record each
+with a computed `verdict`, the four harvested token buckets, and bounded stdout/stderr tails; a `prep_phase`
+section (per executed prep step → its outcome; see *Host prerequisites* above); a `matrix` pivot (canonical
+command × distro, collapsed worst-of); and `totals` by verdict (including `PREP_HARD_FAIL`/`PREP_SOFT_FAIL`).
+The per-probe verdict is deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit →
+`FAIL`; else zero exit with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) →
+`PASS_NO_ASSERTIONS`. A hard prep abort forces a non-zero exit; a soft prep fail is surfaced but does not.
+Pass
 `--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes per host;
 without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
 
