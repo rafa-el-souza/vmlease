@@ -29,6 +29,7 @@ from vmlease import (
     archbuild,
     archimage,
     assertions,
+    capabilities,
     cli,
     cloudinit,
     distro,
@@ -1079,6 +1080,236 @@ class TestBattery(unittest.TestCase):
     def test_load_battery_missing_file(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
             battery_mod.load_battery(Path("/no/such/battery.toml"))
+
+
+# --------------------------------------------------------------------------- #
+# capabilities — the recipe registry + the one canonicalizer
+# --------------------------------------------------------------------------- #
+class TestCapabilities(unittest.TestCase):
+    def test_docker_is_the_v1_vocabulary(self) -> None:
+        self.assertEqual(capabilities.known_capabilities(), frozenset({"docker"}))
+
+    def test_docker_registered_for_apt_dnf_pacman(self) -> None:
+        for mgr in ("apt", "dnf", "pacman"):
+            self.assertIsInstance(
+                capabilities.recipe_for("docker", mgr), capabilities.CapabilityRecipe
+            )
+
+    def test_canonical_requires_sorts_and_dedups(self) -> None:
+        self.assertEqual(
+            capabilities.canonical_requires(("b", "a", "b")), ("a", "b")
+        )
+
+    def test_canonical_requires_order_invariant(self) -> None:
+        self.assertEqual(
+            capabilities.canonical_requires(("a", "b")),
+            capabilities.canonical_requires(("b", "a")),
+        )
+
+    def test_recipe_for_unknown_capability_raises(self) -> None:
+        with self.assertRaises(capabilities.UnknownCapabilityError) as ctx:
+            capabilities.recipe_for("nope", "apt")
+        self.assertIn("nope", str(ctx.exception))
+
+    def test_recipe_for_unsupported_manager_raises_naming_both(self) -> None:
+        # injectable registry: a synthetic capability with no recipe for a manager
+        # raises a clear error naming the capability AND the manager (before spend).
+        from types import MappingProxyType
+        registry = MappingProxyType(
+            {"widget": MappingProxyType({"apt": capabilities.CapabilityRecipe()})}
+        )
+        with self.assertRaises(capabilities.UnknownCapabilityError) as ctx:
+            capabilities.recipe_for("widget", "dnf", registry=registry)
+        msg = str(ctx.exception)
+        self.assertIn("widget", msg)
+        self.assertIn("dnf", msg)
+
+    def test_install_command_per_manager(self) -> None:
+        self.assertEqual(capabilities.install_command("apt"), "apt-get install -y")
+        self.assertEqual(capabilities.install_command("dnf"), "dnf install -y")
+        self.assertEqual(capabilities.install_command("pacman"), "pacman -S --noconfirm")
+
+    def test_install_command_unknown_manager_raises(self) -> None:
+        with self.assertRaises(capabilities.UnknownPackageManagerError):
+            capabilities.install_command("brew")
+
+
+# --------------------------------------------------------------------------- #
+# battery — requires + [prep] schema (happy + reject paths)
+# --------------------------------------------------------------------------- #
+class TestBatteryRequiresAndPrep(unittest.TestCase):
+    _PROBE = "\n[[probe]]\nid = '''P'''\ntitle = '''t'''\ntag = '''read-only'''\nrun = '''c'''\n"
+
+    def _manifest(self, body: str) -> str:
+        return f"name = '''x'''\n{body}{self._PROBE}"
+
+    # --- requires (host-capabilities) ------------------------------------- #
+    def test_requires_absent_defaults_empty(self) -> None:
+        b = _resolve_toml(self._manifest(""))
+        self.assertEqual(b.requires, ())
+
+    def test_requires_docker_carried(self) -> None:
+        b = _resolve_toml(self._manifest("requires = ['''docker''']\n"))
+        self.assertEqual(b.requires, ("docker",))
+
+    def test_requires_unknown_capability_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("requires = ['''dokcer''']\n"))
+        self.assertIn("dokcer", str(ctx.exception))
+
+    def test_requires_non_list_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(self._manifest("requires = '''docker'''\n"))
+
+    # --- [prep] happy paths ----------------------------------------------- #
+    def test_prep_absent_is_none(self) -> None:
+        b = _resolve_toml(self._manifest(""))
+        self.assertIsNone(b.prep)
+
+    def test_prep_packages_union_selectors_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[prep.packages]\napt = ['''a''']\ndebian = ['''b''']\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.packages["apt"], ("a",))
+        self.assertEqual(b.prep.packages["debian"], ("b",))
+
+    def test_prep_packages_union_resolution_manager_first_dedup(self) -> None:
+        # the loader carries the per-selector lists; the documented union rule is
+        # union(manager, distro), deduped, manager-first — exercised here over the
+        # carried lists (the runtime resolver in group 5 consumes the same shape).
+        b = _resolve_toml(self._manifest(
+            "[prep.packages]\napt = ['''a''', '''shared''']\nubuntu = ['''shared''', '''u''']\n"
+        ))
+        assert b.prep is not None
+        manager_list = b.prep.packages["apt"]
+        distro_list = b.prep.packages["ubuntu"]
+        union: list[str] = list(manager_list)
+        for p in distro_list:
+            if p not in union:
+                union.append(p)
+        self.assertEqual(union, ["a", "shared", "u"])
+
+    def test_prep_setup_step_defaults(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\n"
+        ))
+        assert b.prep is not None
+        step = b.prep.setup[0]
+        self.assertEqual(step.id, "s1")
+        self.assertEqual(step.command, "echo hi")
+        self.assertEqual(step.distros, ())
+        self.assertTrue(step.required)
+        self.assertEqual(step.timeout, 1800.0)
+        self.assertEqual(step.source, "<inline>")
+
+    def test_prep_setup_timeout_override(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\ntimeout = 42\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].timeout, 42.0)
+
+    def test_prep_setup_required_false_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\nrequired = false\n"
+        ))
+        assert b.prep is not None
+        self.assertFalse(b.prep.setup[0].required)
+
+    def test_prep_setup_script_resolved_and_contained(self) -> None:
+        b = _resolve_toml(
+            self._manifest("[[prep.setup]]\nid = '''s1'''\nscript = '''prep.sh'''\n"),
+            {"prep.sh": "echo prep\n"},
+        )
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].command, "echo prep\n")
+        self.assertEqual(b.prep.setup[0].source, "prep.sh")
+
+    def test_prep_setup_distros_allowlist_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ndistros = ['''arch''']\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].distros, ("arch",))
+
+    # --- [prep] reject paths ---------------------------------------------- #
+    def test_prep_unknown_key_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("[prep]\nbogus = 1\n"))
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_prep_packages_unknown_selector_rejected(self) -> None:
+        for bad in ("apt-get", "ubntu"):
+            with self.assertRaises(battery_mod.BatteryError) as ctx:
+                battery_mod.parse_battery(
+                    self._manifest(f"[prep.packages]\n{bad} = ['''x''']\n")
+                )
+            self.assertIn(bad, str(ctx.exception))
+
+    def test_prep_setup_distros_typo_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ndistros = ['''arhc''']\n"
+            ))
+        self.assertIn("arhc", str(ctx.exception))
+
+    def test_prep_setup_duplicate_id_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''a'''\n"
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''b'''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_neither_run_nor_script_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("[[prep.setup]]\nid = '''s1'''\n"))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_both_run_and_script_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\nscript = '''s.sh'''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_empty_command_rejected(self) -> None:
+        # an empty resolved command is a vacuous step, caught at resolve (the full
+        # loader), mirroring the probe empty-command rule.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''   '''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_unknown_step_key_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ntimout = 1\n"
+            ))
+        self.assertIn("timout", str(ctx.exception))
+
+    def test_prep_setup_script_containment_escape_rejected(self) -> None:
+        # absolute path, .. escape, and out-of-tree symlink are each refused.
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nscript = '''/etc/passwd'''\n"
+            ))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nscript = '''../outside.sh'''\n"
+            ))
+        d = Path(tempfile.mkdtemp())
+        outside = Path(tempfile.mkdtemp()) / "target.sh"
+        outside.write_text("echo nope\n", encoding="utf-8")
+        (d / "link.sh").symlink_to(outside)
+        (d / "battery.toml").write_text(
+            self._manifest("[[prep.setup]]\nid = '''s1'''\nscript = '''link.sh'''\n"),
+            encoding="utf-8",
+        )
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.load_battery(d / "battery.toml")
 
 
 # --------------------------------------------------------------------------- #

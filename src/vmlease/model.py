@@ -6,9 +6,11 @@ Pure data, no I/O. Every other module speaks in these types, so the layers
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple, Protocol, runtime_checkable
 
 
@@ -115,6 +117,71 @@ class Probe:
 
 
 @dataclass(frozen=True)
+class PrepStep:
+    """One declarative prep setup step: a named shell command run once per host.
+
+    A prep step is host setup the battery brings (install a build tool, configure
+    a service), distinct from a :class:`Probe` (a test). It carries no ``tag`` and
+    no assertions — prep mutates by definition, and its verdict is its exit code.
+
+    Attributes:
+        id: Stable short identifier, unique within the battery's prep.
+        command: The **resolved** shell run over SSH as the operator (``sudo``
+            inline where root is needed) — the verbatim inline ``run`` block, or
+            the contents of the step's ``script`` file. Runs verbatim.
+        distros: The distro-key allowlist this step runs on (``()`` — the default
+            — means every distro). A host whose distro is excluded skips the step.
+        required: When ``True`` (the default), a non-zero exit aborts the host
+            (a hard prep failure); when ``False``, the failure is recorded and the
+            phase continues (a soft prep failure).
+        title: Human-readable one-line description (``""`` when omitted).
+        timeout: Optional per-step wall-clock bound (seconds). ``None`` (the
+            default) means the prep-runner's prep-specific default applies.
+        source: Provenance of ``command`` — the script path it was read from, or
+            ``"<inline>"`` for an inline command. For lint output / error messages.
+    """
+
+    id: str
+    command: str
+    distros: tuple[str, ...] = ()
+    required: bool = True
+    title: str = ""
+    timeout: float | None = None
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class PrepStepResult:
+    """The captured outcome of one executed prep step on one host.
+
+    Mirrors :class:`ProbeResult`'s role for the prep phase but is a distinct
+    record: a prep step is not a probe (no tag, no assertions), and its non-pass
+    state is ternary (a soft failure is neither a hard abort nor a pass). Ordered
+    like :attr:`HostRun.prep_phase`. ``stderr`` is bounded captured text.
+    """
+
+    id: str
+    exit: int
+    required: bool
+    stderr: str
+
+
+@dataclass(frozen=True)
+class Prep:
+    """A battery's declared prep phase: per-distro packages + ordered setup steps.
+
+    ``packages`` is a frozen mapping ``{selector: tuple[str, ...]}`` whose every
+    key is a known package-manager OR a known distro (the two name-sets are
+    disjoint); the effective per-host set is the union of the host's manager list
+    and its distro list, deduplicated, manager entries first. ``setup`` is the
+    ordered :class:`PrepStep` list, run in authoring order after the package pass.
+    """
+
+    packages: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+    setup: tuple[PrepStep, ...] = ()
+
+
+@dataclass(frozen=True)
 class Battery:
     """A named collection of probes loaded from a data file.
 
@@ -122,10 +189,18 @@ class Battery:
     is the order they run and are recorded. ``tag`` records what each probe
     touches (and authorizes/records sudo escalation — the command runs verbatim,
     the lint warns on a non-host-root sudo); it does not reorder execution.
+
+    ``requires`` names the vmlease-provided capabilities the host needs
+    (opt-in, default-off — ``()`` means no capability, in particular no docker);
+    its values are validated against the capability registry at load. ``prep``
+    is the battery's declared :class:`Prep` phase (``None`` when the manifest
+    declares no ``[prep]`` — back-compatible construction).
     """
 
     name: str
     probes: tuple[Probe, ...]
+    requires: tuple[str, ...] = ()
+    prep: Prep | None = None
 
 
 @dataclass(frozen=True)
@@ -267,11 +342,19 @@ class ProbeResult:
 
 @dataclass(frozen=True)
 class HostRun:
-    """All results for one host plus its self-describing detail snapshot."""
+    """All results for one host plus its self-describing detail snapshot.
+
+    ``prep_phase`` records the executed prep steps (ordered like ``results``);
+    ``()`` (the default, back-compatible) means the host ran no prep. A hard prep
+    failure returns a :class:`HostRun` carrying the failing step in ``prep_phase``
+    with empty ``results`` — the failure is NOT raised, so the summary path can
+    count it (raising would discard the workload's return value).
+    """
 
     host_spec: HostSpec
     detail: str
     results: tuple[ProbeResult, ...]
+    prep_phase: tuple[PrepStepResult, ...] = ()
 
 
 @dataclass(frozen=True)
