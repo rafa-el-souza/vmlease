@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING
 
+from vmlease.capabilities import canonical_requires
 from vmlease.cloudinit import render_cloudinit
 
 if TYPE_CHECKING:
@@ -48,6 +49,21 @@ LABEL_DISTRO = "vmlease-distro"
 LABEL_ARCH = "vmlease-arch"
 LABEL_SOURCE_FP = "vmlease-source-fp"
 LABEL_BUILT = "vmlease-built"
+# The supersession-group discriminant for the required-capability set (D-D
+# correction / D13.8). A short stable HASH of the sorted requires set — NOT the
+# raw joined list, which would collapse distinct sets on the 63-char-bounded
+# label once a 2nd capability exists, re-opening the reap data-loss bug. With
+# this on the group identity, `reap-images` groups by (distro, arch, requires)
+# so a docker variant never supersedes the docker-less one.
+LABEL_REQUIRES_HASH = "vmlease-requires-hash"
+# The raw canonical (sorted+deduped, NUL-joined) required-capability set. The hash
+# above is the collision-safe GROUP IDENTITY; this echo is the recompute input —
+# `resolve_current_keys` reads it to re-render the group's current cloud-init
+# (the hash is one-way, so the set itself must be recoverable to recompute the
+# key). For v1's single capability the joined value is far inside the 63-char
+# label bound; if a future set ever overflowed, only the recompute echo (never
+# the group identity, which is the hash) would be affected.
+LABEL_REQUIRES = "vmlease-requires"
 
 # Fixed label values.
 PURPOSE_IMAGE_CACHE = "image-cache"
@@ -57,6 +73,26 @@ SCHEMA_V1 = "v1"
 # overflow, so values are truncated to this width (matching the key's hash
 # width — a sha folds to its first 32 hex either way).
 _LABEL_VALUE_MAX = 63
+
+# Width of the required-capabilities group hash (D13.8): the first 16 lowercase-hex
+# chars of the SHA-256 over the canonicalized requires set.
+_REQUIRES_HASH_HEX_WIDTH = 16
+
+
+def requires_hash(requires: tuple[str, ...]) -> str:
+    """The short stable group hash of a required-capability set (D13.8).
+
+    ``sha256("\\0".join(sorted(set(requires)))).hexdigest()[:16]`` — the
+    supersession-group discriminant carried on the cache label
+    (:data:`LABEL_REQUIRES_HASH`). Sorted+deduped so order can't perturb the
+    hash; the ``\\0`` join keeps adjacent-capability boundaries unambiguous; the
+    16-hex truncation stays well within the 63-char label bound and is
+    collision-safe for the small capability vocabulary. Distinct from
+    :func:`vmlease.capabilities.canonical_requires` (which normalizes the tuple
+    threaded into the render); this folds that set to the group label.
+    """
+    payload = "\0".join(sorted(set(requires))).encode()
+    return hashlib.sha256(payload).hexdigest()[:_REQUIRES_HASH_HEX_WIDTH]
 
 
 def base_fingerprint(profile: DistroProfile, arch: str, deps: ResolveDeps) -> str:
@@ -92,6 +128,7 @@ def content_key(
     profile: DistroProfile,
     arch: str,
     operator: str,
+    requires: tuple[str, ...],
     deps: ResolveDeps,
 ) -> str:
     """The cache content key ``"v1-<distro>-<32hex>"`` (D4).
@@ -108,16 +145,23 @@ def content_key(
       report — the pinned arch-fold resolving D4-vs-D10).
     - ``base_fp`` — the upstream fingerprint (:func:`base_fingerprint`).
     - the **canonical** rendered cloud-init — ``render_cloudinit`` with the real
-      ``operator`` and the pinned :data:`_CACHE_KEY_CANONICAL_PUBKEY` sentinel,
-      so the per-run pubkey is normalized out while packages / extra_setup /
-      docker_repo / system_update / finalize / template are all captured.
+      ``operator``, the pinned :data:`_CACHE_KEY_CANONICAL_PUBKEY` sentinel, and
+      the host's ``requires`` (so docker vs docker-less variants render distinct
+      cloud-init and hence distinct keys — D4/D-D), with the per-run pubkey
+      normalized out while packages / extra_setup / capability recipes /
+      system_update / finalize / template are all captured.
+
+    ``requires`` is threaded into the render (NOT hashed as a separate term):
+    D-D keeps the key a single function of the *real* cloud-init, and the render
+    already canonicalizes ``requires`` order, so ``["a","b"]`` and ``["b","a"]``
+    fold to the same key.
 
     Hash = **SHA-256**, lowercase hex, first 32 chars. The ``\\0`` separators
     prevent boundary ambiguity (so ``"a" + "bc"`` ≠ ``"ab" + "c"``). Inputs are
     UTF-8 bytes.
     """
     base_fp = base_fingerprint(profile, arch, deps)
-    return content_key_from_base_fp(base_fp, profile, arch, operator)
+    return content_key_from_base_fp(base_fp, profile, arch, operator, requires)
 
 
 def content_key_from_base_fp(
@@ -125,6 +169,7 @@ def content_key_from_base_fp(
     profile: DistroProfile,
     arch: str,
     operator: str,
+    requires: tuple[str, ...],
 ) -> str:
     """The cache content key given an **already-resolved** base fingerprint.
 
@@ -135,10 +180,14 @@ def content_key_from_base_fp(
     implementation, so the two can never hash different bytes.
 
     Hashes the SAME payload as :func:`content_key`: ``arch \\0 base_fp \\0
-    canonical_cloud_init`` (the canonical render uses the real ``operator`` and the
-    pinned :data:`_CACHE_KEY_CANONICAL_PUBKEY`), SHA-256, lowercase hex, first 32.
+    canonical_cloud_init`` (the canonical render uses the real ``operator``, the
+    pinned :data:`_CACHE_KEY_CANONICAL_PUBKEY`, and the host's ``requires`` — so
+    the docker vs docker-less variant renders distinct bytes), SHA-256, lowercase
+    hex, first 32.
     """
-    canonical_cloud_init = render_cloudinit(profile, operator, _CACHE_KEY_CANONICAL_PUBKEY)
+    canonical_cloud_init = render_cloudinit(
+        profile, operator, _CACHE_KEY_CANONICAL_PUBKEY, requires
+    )
     payload = f"{arch}\0{base_fp}\0{canonical_cloud_init}".encode()
     digest = hashlib.sha256(payload).hexdigest()[:_KEY_HASH_HEX_WIDTH]
     return f"v1-{profile.key}-{digest}"
@@ -155,6 +204,7 @@ def cache_labels(
     key: str,
     source_fp: str,
     run_token: str,
+    requires: tuple[str, ...],
 ) -> dict[str, str]:
     """The full rich cache label set, from ONE function (D5).
 
@@ -170,6 +220,11 @@ def cache_labels(
     never carry the per-run reap label (the data-loss guard — a per-run reap
     would otherwise delete the cache). This function therefore emits **no**
     ``vmlease=`` label.
+
+    ``requires`` is folded to its short group hash (:func:`requires_hash`) and
+    emitted as :data:`LABEL_REQUIRES_HASH` so the supersession group identity is
+    ``(distro, arch, requires-hash)`` — a docker variant never supersedes the
+    docker-less one (the reap data-loss guard, D-D correction).
     """
     return {
         LABEL_PURPOSE: PURPOSE_IMAGE_CACHE,
@@ -179,7 +234,22 @@ def cache_labels(
         LABEL_ARCH: _truncate_label(arch),
         LABEL_SOURCE_FP: _truncate_label(source_fp),
         LABEL_BUILT: _truncate_label(run_token),
+        LABEL_REQUIRES_HASH: _truncate_label(requires_hash(requires)),
+        LABEL_REQUIRES: _truncate_label("\0".join(canonical_requires(requires))),
     }
+
+
+def _requires_of(image: Image) -> tuple[str, ...]:
+    """The canonical required-capability set recorded on an image (recompute echo).
+
+    Reads :data:`LABEL_REQUIRES` (NUL-joined canonical set), returning ``()`` for
+    a docker-less / pre-``requires`` image with no label. Used by
+    :func:`resolve_current_keys` to re-render a group's current cloud-init (the
+    group's :data:`LABEL_REQUIRES_HASH` identity is one-way, so the set itself is
+    recovered from this echo).
+    """
+    raw = image.labels.get(LABEL_REQUIRES, "")
+    return tuple(part for part in raw.split("\0") if part)
 
 
 def superseded(images: Iterable[Image], current_key: str) -> list[Image]:
@@ -194,9 +264,19 @@ def superseded(images: Iterable[Image], current_key: str) -> list[Image]:
     return [img for img in images if img.labels.get(LABEL_CACHE_KEY) != current_key]
 
 
-def _group_of(image: Image) -> tuple[str, str]:
-    """The ``(distro, arch)`` group an image belongs to (its label tuple)."""
-    return (image.labels.get(LABEL_DISTRO, ""), image.labels.get(LABEL_ARCH, ""))
+def group_of(image: Image) -> tuple[str, str, str]:
+    """The ``(distro, arch, requires-hash)`` group an image belongs to (D-D correction).
+
+    The required-capability set is part of the supersession-group identity (carried
+    as the collision-safe :data:`LABEL_REQUIRES_HASH`), so a docker image and a
+    docker-less image of the same distro+arch are distinct groups and never
+    supersede one another.
+    """
+    return (
+        image.labels.get(LABEL_DISTRO, ""),
+        image.labels.get(LABEL_ARCH, ""),
+        image.labels.get(LABEL_REQUIRES_HASH, ""),
+    )
 
 
 def resolve_current_keys(
@@ -205,13 +285,17 @@ def resolve_current_keys(
     operator: str,
     deps: ResolveDeps,
     warn: Callable[[str], None],
-) -> dict[tuple[str, str], str]:
-    """Resolve each present ``(distro, arch)`` group's current key (D10).
+) -> dict[tuple[str, str, str], str]:
+    """Resolve each present ``(distro, arch, requires-hash)`` group's current key (D10).
 
-    For every distinct ``(distro, arch)`` group present in ``images``, resolve
-    that group's current content key (reusing :func:`base_fingerprint` +
-    :func:`content_key` through the injected ``deps`` seam) and return the
-    ``{(distro, arch): current_key}`` mapping.
+    For every distinct ``(distro, arch, requires-hash)`` group present in
+    ``images``, resolve that group's current content key (reusing
+    :func:`base_fingerprint` + :func:`content_key` through the injected ``deps``
+    seam, with the group's recorded ``requires`` recovered from
+    :func:`_requires_of`) and return the ``{(distro, arch, requires-hash):
+    current_key}`` mapping. Because ``requires`` is part of the group identity, a
+    docker group and a docker-less group of one distro+arch each resolve their own
+    current key — neither supersedes the other (the reap data-loss guard).
 
     **Fail-safe** (D10): a group whose current key cannot be resolved — e.g. a
     rescue-write mirror is down and ``resolve_and_verify`` raises — is **skipped
@@ -222,20 +306,22 @@ def resolve_current_keys(
     profile (e.g. ``vmlease.distro.get_profile``); ``warn`` is the injected
     sink for the skip notice (no I/O in this module).
     """
-    groups: dict[tuple[str, str], str] = {}
-    seen: set[tuple[str, str]] = set()
+    groups: dict[tuple[str, str, str], str] = {}
+    seen: set[tuple[str, str, str]] = set()
     for image in images:
-        group = _group_of(image)
+        group = group_of(image)
         if group in seen:
             continue
         seen.add(group)
-        distro_key, arch = group
+        distro_key, arch, _requires_hash = group
+        requires = _requires_of(image)
         try:
             profile = profile_for(distro_key)
-            groups[group] = content_key(profile, arch, operator, deps)
+            groups[group] = content_key(profile, arch, operator, requires, deps)
         except Exception as exc:  # fail-safe: any resolve failure keeps the group (never delete)
             warn(
                 f"cannot resolve current cache key for group "
-                f"(distro={distro_key!r}, arch={arch!r}): {exc}; keeping its images"
+                f"(distro={distro_key!r}, arch={arch!r}, requires={list(requires)!r}): "
+                f"{exc}; keeping its images"
             )
     return groups

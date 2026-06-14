@@ -2070,15 +2070,130 @@ class TestTemplating(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestCloudInit(unittest.TestCase):
     def test_apt_uses_distro_specific_docker_repo(self) -> None:
-        deb = cloudinit.render_cloudinit(distro.get_profile("debian"), "probe", "ssh-ed25519 AAAA")
-        ubu = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        # The debian↔ubuntu repo-path divergence holds when docker is required —
+        # the docker recipe (manager-keyed) renders the per-distro slug derived
+        # from the profile key (the profile no longer carries a docker-repo slug).
+        deb = cloudinit.render_cloudinit(distro.get_profile("debian"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        ubu = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ("docker",))
         self.assertIn("download.docker.com/linux/debian", deb)
         self.assertIn("download.docker.com/linux/ubuntu", ubu)
         # debian must NOT carry the ubuntu repo path and vice versa
         self.assertNotIn("download.docker.com/linux/ubuntu", deb)
 
+    # --- requires gates the docker recipe (3.5a) -------------------------- #
+    def test_no_requires_renders_docker_free_cloudinit(self) -> None:
+        # The acceptance test: a battery that requires nothing gets a docker-FREE
+        # rendered cloud-init on every distro — no docker packages, no repo/keyring
+        # setup, no static bundle. Always-on substrate (arch's modprobe) stays.
+        for key in ("ubuntu", "debian", "fedora", "arch"):
+            with self.subTest(distro=key):
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA", ())
+                for forbidden in (
+                    "docker-ce",
+                    "dockerd-rootless-setuptool.sh",
+                    "download.docker.com",
+                    "docker-buildx",
+                    " docker ",  # the pacman docker package, space-delimited on the install line
+                ):
+                    self.assertNotIn(forbidden, out, msg=f"{key}: docker leaked: {forbidden!r}")
+                # no unfilled slots regardless of requires
+                self.assertNotIn("@@", out)
+        # arch's always-on substrate (modprobe) survives a docker-free render
+        arch_free = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
+        self.assertIn("modprobe nf_tables ip_tables", arch_free)
+
+    def test_requires_docker_renders_recipe_per_manager(self) -> None:
+        # requires=["docker"] renders the docker recipe for each host's manager.
+        apt_out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        self.assertIn("dockerd-rootless-setuptool.sh", apt_out)
+        self.assertIn("apt-get install -y docker-ce", apt_out)
+        dnf_out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        self.assertIn("dockerd-rootless-setuptool.sh", dnf_out)
+        self.assertIn("dnf -y install docker-ce", dnf_out)
+        pac_out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        # pacman: docker packages fold into the install line; the static bundle into setup
+        self.assertIn("docker-buildx", pac_out)
+        self.assertIn("/usr/local/bin/dockerd-rootless-setuptool.sh", pac_out)
+
+    # --- byte-identity of the docker move (3.5b, D13.3) ------------------- #
+    def test_docker_block_bytes_unchanged_apt(self) -> None:
+        # The apt docker block — the byte-identical move of the former
+        # install.apt.tmpl `if ! command -v dockerd-rootless-setuptool.sh` guard,
+        # incl. the keyring/repo setup + the guarded docker-ce install. Asserted
+        # verbatim so a rewrite (vs a move) goes RED.
+        out = cloudinit.render_install_block(distro.get_profile("debian"), ("docker",))
+        expected = (
+            "  # docker-ce via the distro-correct repo path: debian (debian != ubuntu).\n"
+            "  if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+            "    install -m 0755 -d /etc/apt/keyrings\n"
+            '    curl -fsSL "https://download.docker.com/linux/debian/gpg" \\\n'
+            "      | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg\n"
+            "    chmod a+r /etc/apt/keyrings/docker.gpg\n"
+            '    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] '
+            'https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \\\n'
+            "      > /etc/apt/sources.list.d/docker.list\n"
+            "    apt-get update\n"
+            "    apt-get install -y docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+            "docker-compose-plugin docker-buildx-plugin\n"
+            "  fi"
+        )
+        self.assertIn(expected, out)
+
+    def test_docker_block_bytes_unchanged_dnf(self) -> None:
+        out = cloudinit.render_install_block(distro.get_profile("fedora"), ("docker",))
+        expected = (
+            "  if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+            "    dnf -y config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+            "      || dnf -y config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+            "      || curl -fsSL https://download.docker.com/linux/fedora/docker-ce.repo > /etc/yum.repos.d/docker-ce.repo\n"
+            "    dnf -y install docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+            "docker-compose-plugin docker-buildx-plugin\n"
+            "  fi"
+        )
+        self.assertIn(expected, out)
+
+    def test_docker_static_bundle_bytes_unchanged_pacman(self) -> None:
+        # The Arch static-bundle setup fragment — the byte-identical move of the
+        # former arch.extra_setup `if ! test -x …` guard (incl. all three guards:
+        # the static-bundle existence guard here, plus the apt/dnf command-v guards
+        # above). The pacman package-line intra-order is implementer's choice
+        # (D13 safe-to-leave) — only the docker *bytes* (the bundle) are pinned.
+        out = cloudinit.render_install_block(distro.get_profile("arch"), ("docker",))
+        expected = (
+            "if ! test -x /usr/local/bin/dockerd-rootless-setuptool.sh; then "
+            "ver=29.5.1; m=$(uname -m); d=$(mktemp -d); "
+            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-${ver}.tgz -o $d/docker.tgz; "
+            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-rootless-extras-${ver}.tgz -o $d/extras.tgz; "
+            "tar -C $d -xzf $d/docker.tgz; tar -C $d -xzf $d/extras.tgz; "
+            "install -m0755 $d/docker/* /usr/local/bin/; "
+            "install -m0755 $d/docker-rootless-extras/* /usr/local/bin/; "
+            "rm -rf $d; fi"
+        )
+        self.assertIn(expected, out)
+        # all the former arch docker packages are present on the install line
+        for pkg in ("docker", "docker-buildx", "docker-compose", "rootlesskit", "slirp4netns", "fuse-overlayfs"):
+            self.assertIn(pkg, out)
+
+    def test_recipe_injection_order_is_canonical(self) -> None:
+        # requires ordering must not perturb the rendered bytes (and so the cache
+        # key) — the recipes inject in canonical sorted-deduplicated order. Two
+        # capabilities are needed to truly exercise ordering, so this uses an
+        # injected two-capability registry whose recipes render distinguishable
+        # markers; the rendered capability_setup must be order-invariant.
+        from vmlease import capabilities
+        out_ab = cloudinit.render_install_block(distro.get_profile("ubuntu"), ("docker", "docker"))
+        out_ba = cloudinit.render_install_block(distro.get_profile("ubuntu"), ("docker",))
+        # dedup: ["docker","docker"] == ["docker"]
+        self.assertEqual(out_ab, out_ba)
+        # canonical order across a synthetic two-capability set via the public
+        # canonicalizer (the one source of order for every consumer)
+        self.assertEqual(
+            capabilities.canonical_requires(("b", "a", "b")),
+            capabilities.canonical_requires(("a", "b")),
+        )
+
     def test_operator_and_pubkey_injected(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "alice", "ssh-ed25519 KEY alice")
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "alice", "ssh-ed25519 KEY alice", ())
         self.assertIn("alice", out)
         self.assertIn("ssh-ed25519 KEY alice", out)
         # all logic inside a main function; no global-scope mutable vars
@@ -2088,25 +2203,25 @@ class TestCloudInit(unittest.TestCase):
         self.assertIn("visudo -c -f", out)
 
     def test_arch_extra_setup_nf_tables(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         self.assertIn("nf_tables", out)
         self.assertIn("pacman", out)
 
     def test_fedora_dnf(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA", ())
         self.assertIn("dnf -y install", out)
 
     def test_unknown_manager_raises(self) -> None:
         bad = distro.DistroProfile(key="x", default_image="img", package_manager="zypper", packages=("p",))
         with self.assertRaises(cloudinit.CloudInitError):
-            cloudinit.render_install_block(bad)
+            cloudinit.render_install_block(bad, ())
 
     # --- finalize fragment: native-image distros set the sentinel in place -- #
     def test_native_distro_finalize_is_byte_identical_ending(self) -> None:
         # The default finalize fragment must reproduce the pre-fragment ending
         # EXACTLY — non-rescue provisioning is unchanged in render, not just
         # behavior. Capture the expected final-step text and assert equality.
-        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ())
         expected_ending = (
             "  # --- readiness sentinel the harness polls for over SSH ------------------\n"
             "  touch /var/lib/vmlease-ready\n"
@@ -2135,7 +2250,7 @@ class TestCloudInit(unittest.TestCase):
         self.assertEqual(arch.finalize_fragment, distro.FINALIZE_FRAGMENT_RESCUE_WRITE)
 
     def test_arch_finalize_reboots_and_defers_sentinel(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         # (a) kernel-bump detection via the running kernel's modules.dep going missing
         self.assertIn('test -f "/lib/modules/$(uname -r)/modules.dep"', out)
         # (b) once-only reboot guard marker — written AND the reboot branch is
@@ -2164,7 +2279,7 @@ class TestCloudInit(unittest.TestCase):
         # reboot — the harness must not connect until the upgraded kernel runs.
         # Assert the reboot precedes the (sole) post-reboot touch in the rendered
         # script's bumped-kernel branch.
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         reboot_at = out.index("systemctl reboot")
         # The finalizing sentinel is the bare, indented `touch` command in the
         # else-branch — distinct from the oneshot unit's `ExecStart=/usr/bin/touch`
@@ -2178,7 +2293,7 @@ class TestCloudInit(unittest.TestCase):
         # native distro — no unfilled or extra slots.
         for key in ("ubuntu", "arch"):
             with self.subTest(distro=key):
-                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA")
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA", ())
                 self.assertNotIn("@@", out)
 
     def test_unknown_finalize_fragment_raises(self) -> None:
@@ -3027,8 +3142,11 @@ class TestExecute(unittest.TestCase):
 
     def test_cloudinit_rendered_per_distro(self) -> None:
         prov = FakeProvider()
+        # The distro-specific docker repo path (linux/<distro>) is now part of the
+        # docker capability recipe, so render the docker variant to assert it.
+        m = runner.Matrix(_demo_workload(), ("debian", "ubuntu"), "cpx22", "run-xyz", requires=("docker",))
         with tempfile.TemporaryDirectory() as d:
-            runner.execute(self._matrix(("debian", "ubuntu")), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
+            runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertIn("linux/debian", prov.cloud_inits[0])
         self.assertIn("linux/ubuntu", prov.cloud_inits[1])
 
@@ -3596,7 +3714,7 @@ class TestCliRun(unittest.TestCase):
 
         prov = FakeProvider()
         prov.images["img-cache"] = _cached_run_image(
-            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
         )
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
@@ -3610,6 +3728,61 @@ class TestCliRun(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(prov.created[0].image, "img-cache")
             self.assertEqual(prov.created_images, [])  # run never builds
+
+    def test_run_docker_battery_hits_docker_cache_image(self) -> None:
+        # 4.4b: a `build-image --requires docker` image (docker requires-hash +
+        # docker-rendered key) is restored by a `requires=["docker"]` battery run
+        # — the docker variant cache-hits for a docker battery.
+        from unittest import mock
+
+        prov = FakeProvider()
+        docker_key = imagecache.content_key(
+            distro.get_profile("ubuntu"), "x86", "probe", ("docker",), _null_deps()
+        )
+        prov.images["img-docker"] = _cached_run_image(
+            key=docker_key, requires=("docker",), img_id="img-docker"
+        )
+        docker_battery = "requires = ['''docker''']\n" + _DEMO_BATTERY
+        with tempfile.TemporaryDirectory() as d:
+            bat = _write_battery_bundle(d, docker_battery)
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", bat, "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(prov.created[0].image, "img-docker")  # docker variant restored
+            self.assertEqual(prov.created_images, [])  # run never builds
+
+    def test_run_docker_less_battery_misses_docker_cache_image(self) -> None:
+        # 4.4b: the OTHER side of the guard — a docker-less (no `requires`) run
+        # does NOT hit a docker cache image (its key is the docker-less render),
+        # so it cold-paths instead of wrongly restoring the docker variant.
+        from unittest import mock
+
+        prov = FakeProvider()
+        docker_key = imagecache.content_key(
+            distro.get_profile("ubuntu"), "x86", "probe", ("docker",), _null_deps()
+        )
+        prov.images["img-docker"] = _cached_run_image(
+            key=docker_key, requires=("docker",), img_id="img-docker"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            bat = _write_battery_bundle(d, _DEMO_BATTERY)  # NO requires
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", bat, "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            # cold path: a brand-new host was created (NOT the docker snapshot).
+            self.assertNotEqual(prov.created[0].image, "img-docker")
 
     def test_run_success_writes_results(self) -> None:
         # stub the provider + keypair + ssh so the run path executes end-to-end
@@ -4571,19 +4744,24 @@ def _rescue_profile(spec: object) -> distro.DistroProfile:
     base = distro.get_profile("arch")
     return distro.DistroProfile(
         key=base.key, default_image=base.default_image, package_manager=base.package_manager,
-        packages=base.packages, docker_repo_slug=base.docker_repo_slug, extra_setup=base.extra_setup,
+        packages=base.packages, extra_setup=base.extra_setup,
         system_update_override=base.system_update_override, rescue_image=spec, notes=base.notes,
     )
 
 
-def _cache_image(*, distro_key: str, arch: str, key: str, img_id: str = "img-1") -> Image:
-    """A cache Image carrying the supersession-relevant labels."""
+def _cache_image(
+    *, distro_key: str, arch: str, key: str, img_id: str = "img-1",
+    requires: tuple[str, ...] = (),
+) -> Image:
+    """A cache Image carrying the supersession-relevant labels (incl. requires-hash)."""
     return Image(
         id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
         labels={
             imagecache.LABEL_DISTRO: distro_key,
             imagecache.LABEL_ARCH: arch,
             imagecache.LABEL_CACHE_KEY: key,
+            imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+            imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
         },
     )
 
@@ -4618,8 +4796,8 @@ class TestImageCacheBaseFingerprint(unittest.TestCase):
 class TestImageCacheContentKey(unittest.TestCase):
     def test_same_recipe_same_key(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
-        k1 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
-        k2 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        k1 = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
+        k2 = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
         self.assertEqual(k1, k2)
         self.assertTrue(k1.startswith("v1-ubuntu-"))
         self.assertEqual(len(k1), len("v1-ubuntu-") + 32)
@@ -4629,45 +4807,75 @@ class TestImageCacheContentKey(unittest.TestCase):
         mutated = distro.DistroProfile(
             key=ubuntu.key, default_image=ubuntu.default_image, package_manager=ubuntu.package_manager,
             packages=(*ubuntu.packages, "htop"),  # a recipe change
-            docker_repo_slug=ubuntu.docker_repo_slug,
         )
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(mutated, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(mutated, "x86", "probe", (), _null_deps()),
         )
 
     def test_different_arch_changes_key(self) -> None:
         # native's slug is arch-blind, so the arch-fold is what makes the key vary.
         ubuntu = distro.get_profile("ubuntu")
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(ubuntu, "arm", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "arm", "probe", (), _null_deps()),
         )
 
     def test_operator_changes_key(self) -> None:
         # operator is part of the canonical render (baked user), so it is in the key.
         ubuntu = distro.get_profile("ubuntu")
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(ubuntu, "x86", "alice", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "alice", (), _null_deps()),
         )
 
     def test_pinned_algorithm_exact_key(self) -> None:
         # A pinned exact-key assertion: this goes RED if the algorithm (SHA-256,
         # [:32], arch-fold, \0 separators, sentinel) or the sentinel value drifts.
         ubuntu = distro.get_profile("ubuntu")
-        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY)
+        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY, ())
         expected_payload = f"x86\0ubuntu-24.04\0{canonical}".encode()
         expected_digest = hashlib.sha256(expected_payload).hexdigest()[:32]
         expected = f"v1-ubuntu-{expected_digest}"
-        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", _null_deps()), expected)
+        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()), expected)
 
     def test_sentinel_value_is_pinned(self) -> None:
         self.assertEqual(imagecache._CACHE_KEY_CANONICAL_PUBKEY, "vmlease-cache-key-canonical-pubkey")
 
+    def test_requires_change_changes_key(self) -> None:
+        # 4.4b: docker vs docker-less render distinct cloud-init ⇒ distinct keys
+        # (the docker/docker-less cache entries are kept separate, D4/D-D).
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps()),
+        )
+
+    def test_requires_order_invariant_key(self) -> None:
+        # 4.4b: the key is invariant to requires ORDER/dups — the render
+        # canonicalizes (sorted+deduped), so build-image's flag order and a
+        # battery's declared order fold to one key (no silent permanent miss).
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker", "docker"), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps()),
+        )
+
+    def test_build_and_run_derive_identical_key(self) -> None:
+        # 4.4b: build-image's split derivation (content_key_from_base_fp, the
+        # label path) and run's full content_key derive the SAME key for the same
+        # requires — the determinism contract that makes a built docker image
+        # cache-hit on a docker run.
+        ubuntu = distro.get_profile("ubuntu")
+        base_fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
+        build_key = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe", ("docker",))
+        run_key = imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps())
+        self.assertEqual(build_key, run_key)
+
 
 def _cached_run_image(
-    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache"
+    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache",
+    requires: tuple[str, ...] = (),
 ) -> Image:
     """A purpose-labelled cache Image for the run-restore lookup (key + arch + disk)."""
     return Image(
@@ -4677,6 +4885,8 @@ def _cached_run_image(
             imagecache.LABEL_CACHE_KEY: key,
             imagecache.LABEL_DISTRO: "ubuntu",
             imagecache.LABEL_ARCH: arch,
+            imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+            imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
         },
     )
 
@@ -4694,14 +4904,14 @@ class TestLookupCacheImage(unittest.TestCase):
         return distro.get_profile("ubuntu")
 
     def _key(self, arch: str = "x86") -> str:
-        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+        return imagecache.content_key(self._ubuntu(), arch, "probe", (), _null_deps())
 
     def _call(self, prov: providers.Provider, *, arch: str = "x86", target_disk: float = 40.0,
               warn: Callable[[str], None] | None = None) -> Image | None:
         warns: list[str] = []
         return runner._lookup_cache_image(
             self._ubuntu(),
-            operator="probe", arch=arch, target_disk=target_disk,
+            operator="probe", arch=arch, requires=(), target_disk=target_disk,
             provider=prov, deps=_null_deps(),
             warn=warn if warn is not None else warns.append,
         )
@@ -4762,7 +4972,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         return distro.get_profile("ubuntu")
 
     def _key(self, arch: str = "x86") -> str:
-        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+        return imagecache.content_key(self._ubuntu(), arch, "probe", (), _null_deps())
 
     def _matrix(self) -> runner.Matrix:
         return runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
@@ -4979,7 +5189,7 @@ class TestPlanZeroProviderCalls(unittest.TestCase):
 
         prov = _NoCallProvider()
         prov.images["img-cache"] = _cached_run_image(
-            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
         )
         # plan takes no provider at all — it is call-free by construction. Asserting
         # the matrix plans without touching the provider object is the guarantee.
@@ -4994,6 +5204,7 @@ class TestImageCacheLabels(unittest.TestCase):
         ubuntu = distro.get_profile("ubuntu")
         labels = imagecache.cache_labels(
             ubuntu, "x86", key="v1-ubuntu-abc", source_fp="ubuntu-24.04", run_token="run-xyz",
+            requires=(),
         )
         self.assertEqual(labels, {
             "vmlease-purpose": "image-cache",
@@ -5003,19 +5214,25 @@ class TestImageCacheLabels(unittest.TestCase):
             "vmlease-arch": "x86",
             "vmlease-source-fp": "ubuntu-24.04",
             "vmlease-built": "run-xyz",
+            "vmlease-requires-hash": imagecache.requires_hash(()),
+            "vmlease-requires": "",
         })
 
     def test_no_per_run_reap_label(self) -> None:
         # the data-loss guard: a persistent cache image must NOT carry vmlease=<run-id>.
         ubuntu = distro.get_profile("ubuntu")
-        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp="fp", run_token="run-1")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="k", source_fp="fp", run_token="run-1", requires=(),
+        )
         self.assertNotIn("vmlease", labels)
 
     def test_long_value_truncated_to_63(self) -> None:
         # a 64-hex sha source-fp would overflow the provider's ≤63-char limit.
         ubuntu = distro.get_profile("ubuntu")
         sha = "f" * 64
-        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp=sha, run_token="run-1")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="k", source_fp=sha, run_token="run-1", requires=(),
+        )
         self.assertEqual(len(labels["vmlease-source-fp"]), 63)
         self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
 
@@ -5040,8 +5257,8 @@ class TestImageCacheSupersession(unittest.TestCase):
         keys = imagecache.resolve_current_keys(
             [img], distro.get_profile, "probe", _null_deps(), warnings.append,
         )
-        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
-        self.assertEqual(keys, {("ubuntu", "x86"): expected})
+        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
+        self.assertEqual(keys, {("ubuntu", "x86", imagecache.requires_hash(())): expected})
         self.assertEqual(warnings, [])
 
     def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
@@ -5061,8 +5278,8 @@ class TestImageCacheSupersession(unittest.TestCase):
             [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
         )
         # ubuntu resolved; arch skipped (kept) with a warning.
-        self.assertIn(("ubuntu", "x86"), keys)
-        self.assertNotIn(("arch", "x86"), keys)
+        self.assertIn(("ubuntu", "x86", imagecache.requires_hash(())), keys)
+        self.assertNotIn(("arch", "x86", imagecache.requires_hash(())), keys)
         self.assertEqual(len(warnings), 1)
         self.assertIn("arch", warnings[0])
 
@@ -5249,8 +5466,8 @@ class TestContentKeyFromBaseFp(unittest.TestCase):
         # the split derivation hashes the SAME bytes as content_key.
         ubuntu = distro.get_profile("ubuntu")
         base_fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
-        derived = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe")
-        whole = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        derived = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe", ())
+        whole = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
         self.assertEqual(derived, whole)
 
 
@@ -5260,11 +5477,11 @@ class TestCliBuildImage(unittest.TestCase):
     def _key(self, distro_key: str = "ubuntu", arch: str = "x86", operator: str = "probe") -> str:
         prof = distro.get_profile(distro_key)
         base_fp = imagecache.base_fingerprint(prof, arch, _null_deps())
-        return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator)
+        return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator, ())
 
     def _cache_img(
         self, *, key: str, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
-        created: str = "2024-01-01T00:00:00+00:00",
+        created: str = "2024-01-01T00:00:00+00:00", requires: tuple[str, ...] = (),
     ) -> Image:
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
@@ -5273,6 +5490,8 @@ class TestCliBuildImage(unittest.TestCase):
                 imagecache.LABEL_DISTRO: distro_key,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+                imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
             },
         )
 
@@ -5383,6 +5602,31 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(prov.created_images), 1)  # built
         self.assertIn("img-old", prov.deleted_images)  # then pruned S
+
+    def test_build_docker_variant_does_not_prune_docker_less(self) -> None:
+        # 4.4b build-image prune data-loss guard: building the `--requires docker`
+        # variant prunes only the same-(distro, arch, requires-hash) group's stale
+        # images — the live docker-less cache image is a DIFFERENT group and must
+        # survive the prune.
+        prov = FakeProvider()
+        prov.images["dl-cur"] = self._cache_img(
+            key="v1-ubuntu-DLCUR", img_id="dl-cur", requires=(),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--requires", "docker", "--run-token", "bird", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(prov.created_images), 1)  # docker image built
+        # the docker image carries the docker requires-hash...
+        built_labels = prov.created_images[0][2]
+        self.assertEqual(
+            built_labels.get(imagecache.LABEL_REQUIRES_HASH), imagecache.requires_hash(("docker",)),
+        )
+        # ...and the docker-less variant was NOT pruned (distinct group).
+        self.assertNotIn("dl-cur", prov.deleted_images)
 
     def test_at_cap_s_nonempty_prunes_then_builds(self) -> None:
         prov = FakeProvider()
@@ -5571,6 +5815,7 @@ class TestCliReapImages(unittest.TestCase):
     def _img(
         self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
         key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
+        requires: tuple[str, ...] = (),
     ) -> Image:
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
@@ -5579,12 +5824,14 @@ class TestCliReapImages(unittest.TestCase):
                 imagecache.LABEL_DISTRO: distro_key,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+                imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
             },
         )
 
     def _run(
         self, prov: FakeProvider, argv: list[str], *,
-        resolve_current_keys: Callable[..., dict[tuple[str, str], str]] | None = None,
+        resolve_current_keys: Callable[..., dict[tuple[str, str, str], str]] | None = None,
     ) -> tuple[int, str, str]:
         from contextlib import ExitStack
         from unittest import mock
@@ -5673,7 +5920,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -5687,7 +5934,7 @@ class TestCliReapImages(unittest.TestCase):
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
             warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -5702,11 +5949,33 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}  # no image carries CUR
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(prov.deleted_images), ["o1", "o2"])
+
+    def test_superseded_docker_variant_does_not_supersede_docker_less(self) -> None:
+        # 4.4b reap data-loss guard: a docker and a docker-less image of the SAME
+        # distro+arch are DISTINCT supersession groups (distinct requires-hash),
+        # so reaping the off-key image of one group must NOT touch the live image
+        # of the other. Each group keeps its own current image.
+        prov = FakeProvider()
+        prov.images["dl-cur"] = self._img(img_id="dl-cur", key="v1-ubuntu-DLCUR", requires=())
+        prov.images["dl-old"] = self._img(img_id="dl-old", key="v1-ubuntu-DLOLD", requires=())
+        prov.images["dk-cur"] = self._img(img_id="dk-cur", key="v1-ubuntu-DKCUR", requires=("docker",))
+        prov.images["dk-old"] = self._img(img_id="dk-old", key="v1-ubuntu-DKOLD", requires=("docker",))
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {
+                ("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
+                ("ubuntu", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
+            }
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        # only the off-key image of each group is reaped; BOTH current images survive.
+        self.assertEqual(sorted(prov.deleted_images), ["dk-old", "dl-old"])
 
     # --- list failure -------------------------------------------------------- #
     def test_list_images_failure_exits_1(self) -> None:
@@ -5742,7 +6011,9 @@ class TestCacheImagePerRunReapIsolation(unittest.TestCase):
 
     def test_cache_image_carries_content_labels_not_run_label(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
-        labels = imagecache.cache_labels(ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird", requires=(),
+        )
         # content-addressed labels present...
         self.assertEqual(labels[imagecache.LABEL_PURPOSE], imagecache.PURPOSE_IMAGE_CACHE)
         self.assertEqual(labels[imagecache.LABEL_CACHE_KEY], "v1-ubuntu-K")
@@ -5756,6 +6027,7 @@ class TestCacheImagePerRunReapIsolation(unittest.TestCase):
         # a cache image carrying ONLY content labels (no vmlease=<run-id>).
         cache_labels = imagecache.cache_labels(
             distro.get_profile("ubuntu"), "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird",
+            requires=(),
         )
         cache_img = Image(
             id="cache-1", created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch="x86", labels=cache_labels,

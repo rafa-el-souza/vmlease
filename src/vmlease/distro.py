@@ -40,13 +40,16 @@ class DistroProfile:
         key: Stable selector (e.g. ``"ubuntu"``, ``"debian"``, ``"fedora"``, ``"arch"``).
         default_image: Provider image slug for this distro.
         package_manager: ``"apt" | "dnf" | "pacman"`` — selects the install template.
-        packages: Base packages to install (the rootless-docker prerequisite set).
-        docker_repo_slug: The ``download.docker.com/linux/<slug>`` path component —
-            ``"debian"`` vs ``"ubuntu"`` diverge here under the SAME apt mechanics;
-            ``""`` when the manager template does not use a docker repo.
+        packages: Base packages to install (the generic, battery-agnostic distro
+            box). Optional vmlease-provided capabilities (e.g. docker) are NOT
+            here — they are layered per-manager as capability recipes selected by
+            a battery's ``requires`` (see :mod:`vmlease.capabilities`).
         extra_setup: Profile-supplied shell steps appended to the install block
-            for genuinely per-distro work that is not a package install (e.g.
-            Arch's ``modprobe nf_tables`` + static docker bundle). Empty for most.
+            for genuinely per-distro work that is not a package install AND is
+            always-on substrate independent of any capability (e.g. Arch's
+            ``modprobe nf_tables`` kernel-module load). Empty for most. Capability
+            setup (e.g. docker's static bundle) is NOT here — it lives in the
+            capability recipe.
         system_update_override: When set, the exact system-refresh command for
             this distro, overriding the package-manager default
             (:func:`system_update_command`). Empty for most (the manager default
@@ -66,7 +69,6 @@ class DistroProfile:
     default_image: str
     package_manager: str
     packages: tuple[str, ...]
-    docker_repo_slug: str = ""
     extra_setup: tuple[str, ...] = ()
     system_update_override: str = ""
     rescue_image: RescueImageSpec | None = None
@@ -112,9 +114,9 @@ _PROFILES: dict[str, DistroProfile] = {
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
             "procps", "sudo", "curl", "ca-certificates", "gnupg", "uidmap",
         ),
-        docker_repo_slug="ubuntu",
-        notes="docker-ce via the ubuntu repo path (NOT debian); uidmap is "
-        "a separate pkg the rootless setuptool needs.",
+        notes="base apt box; uidmap is a separate pkg the rootless setuptool "
+        "needs. docker (when required) is a capability recipe via the ubuntu repo "
+        "path (NOT debian).",
     ),
     "debian": DistroProfile(
         key="debian",
@@ -124,9 +126,8 @@ _PROFILES: dict[str, DistroProfile] = {
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
             "procps", "sudo", "curl", "ca-certificates", "gnupg", "uidmap",
         ),
-        docker_repo_slug="debian",
-        notes="same apt mechanics as ubuntu but the debian docker repo path; "
-        "uidmap is a separate pkg.",
+        notes="same apt mechanics as ubuntu; uidmap is a separate pkg. docker "
+        "(when required) is a capability recipe via the debian repo path.",
     ),
     "fedora": DistroProfile(
         key="fedora",
@@ -164,33 +165,23 @@ _PROFILES: dict[str, DistroProfile] = {
         package_manager="pacman",
         packages=(
             "systemd", "rsync", "acl", "e2fsprogs", "procps-ng", "shadow",
-            "docker", "docker-buildx", "docker-compose", "rootlesskit",
-            "slirp4netns", "fuse-overlayfs", "git", "base-devel", "curl",
+            "git", "base-devel", "curl",
         ),
         extra_setup=(
-            # (1) rootless setuptool's iptables preflight needs nf_tables/ip_tables;
-            # a fresh minimal Arch VM does not auto-load them (found on a real host).
+            # rootless setuptool's iptables preflight needs nf_tables/ip_tables;
+            # a fresh minimal Arch VM does not auto-load them (found on a real
+            # host). Always-on substrate independent of any capability, so it
+            # stays in profile extra_setup (NOT in the docker recipe). The docker
+            # packages + static rootless bundle moved to the docker capability
+            # recipe (see :mod:`vmlease.capabilities`).
             "modprobe nf_tables ip_tables || true",
             "echo nf_tables > /etc/modules-load.d/zz-vmlease-nf_tables.conf",
             "echo ip_tables >> /etc/modules-load.d/zz-vmlease-nf_tables.conf",
-            # (2) Arch's `docker` pacman package does NOT ship
-            # dockerd-rootless-setuptool.sh. Lay the upstream STATIC docker +
-            # rootless-extras bundle onto /usr/local/bin (first on PATH) — the exact
-            # set the upstream installer produces. Guarded so a pre-staged bundle is
-            # not re-downloaded. (Found on a real host: 'dockerd-rootless-setuptool.sh:
-            # command not found', 2026-06-01.)
-            "if ! test -x /usr/local/bin/dockerd-rootless-setuptool.sh; then "
-            "ver=29.5.1; m=$(uname -m); d=$(mktemp -d); "
-            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-${ver}.tgz -o $d/docker.tgz; "
-            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-rootless-extras-${ver}.tgz -o $d/extras.tgz; "
-            "tar -C $d -xzf $d/docker.tgz; tar -C $d -xzf $d/extras.tgz; "
-            "install -m0755 $d/docker/* /usr/local/bin/; "
-            "install -m0755 $d/docker-rootless-extras/* /usr/local/bin/; "
-            "rm -rf $d; fi",
         ),
-        notes="needs modprobe nf_tables+ip_tables (rootless iptables preflight); the "
-        "`docker` pacman pkg has NO rootless setuptool, so the static docker + "
-        "rootless-extras bundle is laid on /usr/local/bin. "
+        notes="needs modprobe nf_tables+ip_tables (rootless iptables preflight), "
+        "kept as always-on substrate. docker (when required) is a capability "
+        "recipe: the `docker` pacman pkg has NO rootless setuptool, so the static "
+        "docker + rootless-extras bundle is laid on /usr/local/bin. "
         "Arch image is built by rescue-write (no native Hetzner image).",
     ),
 }

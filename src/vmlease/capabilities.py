@@ -48,21 +48,82 @@ class CapabilityRecipe:
     setup: tuple[str, ...] = ()
 
 
+# The docker recipe SETUP fragments — a **byte-identical move** (D13.3) of the
+# apt/dnf docker install blocks (formerly the ``if ! command -v
+# dockerd-rootless-setuptool.sh`` guards in ``install.{apt,dnf}.tmpl``) and Arch's
+# static-bundle ``extra_setup`` block (formerly in ``distro.arch.extra_setup``).
+# Each fragment is rendered verbatim into the cloud-init ``@@capability_setup@@``
+# slot (the renderer fills any recipe-local ``@@…@@`` slot — apt's
+# ``@@docker_repo_slug@@`` — from the host's profile so the debian↔ubuntu repo
+# path is preserved). The bytes here, once substituted, are identical to the
+# pre-change rendered docker bytes — proven by a byte-identity test (3.5b).
+_DOCKER_SETUP_APT = (
+    "# docker-ce via the distro-correct repo path: @@docker_repo_slug@@ (debian != ubuntu).\n"
+    "  if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+    "    install -m 0755 -d /etc/apt/keyrings\n"
+    '    curl -fsSL "https://download.docker.com/linux/@@docker_repo_slug@@/gpg" \\\n'
+    "      | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg\n"
+    "    chmod a+r /etc/apt/keyrings/docker.gpg\n"
+    '    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] '
+    'https://download.docker.com/linux/@@docker_repo_slug@@ '
+    '$(. /etc/os-release && echo "$VERSION_CODENAME") stable" \\\n'
+    "      > /etc/apt/sources.list.d/docker.list\n"
+    "    apt-get update\n"
+    "    apt-get install -y docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+    "docker-compose-plugin docker-buildx-plugin\n"
+    "  fi"
+)
+
+_DOCKER_SETUP_DNF = (
+    "if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+    "    dnf -y config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+    "      || dnf -y config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+    "      || curl -fsSL https://download.docker.com/linux/fedora/docker-ce.repo > /etc/yum.repos.d/docker-ce.repo\n"
+    "    dnf -y install docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+    "docker-compose-plugin docker-buildx-plugin\n"
+    "  fi"
+)
+
+# Arch's `docker` pacman package does NOT ship dockerd-rootless-setuptool.sh. Lay
+# the upstream STATIC docker + rootless-extras bundle onto /usr/local/bin (first on
+# PATH) — the exact set the upstream installer produces. Guarded so a pre-staged
+# bundle is not re-downloaded. (Found on a real host: 'dockerd-rootless-setuptool.sh:
+# command not found', 2026-06-01.)
+_DOCKER_SETUP_PACMAN = (
+    "if ! test -x /usr/local/bin/dockerd-rootless-setuptool.sh; then "
+    "ver=29.5.1; m=$(uname -m); d=$(mktemp -d); "
+    "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-${ver}.tgz -o $d/docker.tgz; "
+    "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-rootless-extras-${ver}.tgz -o $d/extras.tgz; "
+    "tar -C $d -xzf $d/docker.tgz; tar -C $d -xzf $d/extras.tgz; "
+    "install -m0755 $d/docker/* /usr/local/bin/; "
+    "install -m0755 $d/docker-rootless-extras/* /usr/local/bin/; "
+    "rm -rf $d; fi"
+)
+
+# The docker packages installed on pacman via the host's main install line (apt/dnf
+# install docker-ce *inside* their guarded setup blocks above, so their recipes
+# carry no top-line packages — preserving the pre-change rendered bytes + the
+# idempotency guard; only pacman folds its docker packages into ``@@packages@@``).
+_DOCKER_PACKAGES_PACMAN = (
+    "docker", "docker-buildx", "docker-compose", "rootlesskit",
+    "slirp4netns", "fuse-overlayfs",
+)
+
 # The capability registry: ``capability → package_manager → recipe``. Both levels
 # are frozen (``MappingProxyType``) — a static registry populated once at import;
 # a runtime mutation would be a bug, so the type system + runtime both forbid it
 # (immutability rule; global-state hygiene), mirroring ``distro.PROFILES``.
 #
-# Docker is the v1 vocabulary (the only capability). The recipe CONTENT is the
-# byte-identical move of the apt/dnf docker install blocks + Arch's static bundle
-# out of the install templates / profile data — that move lands in a later task;
-# the KEYS (docker for apt/dnf/pacman) are registered here so every consumer can
-# import the registry and gate on ``requires`` now.
+# Docker is the v1 vocabulary (the only capability). The recipe content is the
+# byte-identical move of the apt/dnf docker install blocks + Arch's static bundle +
+# Arch's docker package set out of the install templates / profile data (D13.3).
 _CAPABILITIES: dict[str, dict[str, CapabilityRecipe]] = {
     "docker": {
-        "apt": CapabilityRecipe(),
-        "dnf": CapabilityRecipe(),
-        "pacman": CapabilityRecipe(),
+        "apt": CapabilityRecipe(setup=(_DOCKER_SETUP_APT,)),
+        "dnf": CapabilityRecipe(setup=(_DOCKER_SETUP_DNF,)),
+        "pacman": CapabilityRecipe(
+            packages=_DOCKER_PACKAGES_PACMAN, setup=(_DOCKER_SETUP_PACMAN,)
+        ),
     },
 }
 

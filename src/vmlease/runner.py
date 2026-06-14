@@ -350,7 +350,7 @@ def _run_one_host(
         # SAME cloud-init; the written cloudimg re-applies it from the hetzner
         # datasource. cloud-init is rendered (+ validated) before create, so a
         # template defect fails before spend.
-        cloud_init = render_cloudinit(_profile, operator, keypair.public_key)
+        cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
         return _profile.default_image, cloud_init, _profile.needs_rescue_write
 
     # Build the candidate list. The cold candidate is ALWAYS the fallback; a cache
@@ -476,6 +476,7 @@ def _resolve_cache_hit_image(
         profile,
         operator=operator,
         arch=arch,
+        requires=spec.requires,
         target_disk=target_disk,
         provider=provider,
         deps=deps,
@@ -489,6 +490,7 @@ def _lookup_cache_image(
     *,
     operator: str,
     arch: str,
+    requires: tuple[str, ...],
     target_disk: float,
     provider: Provider,
     deps: ResolveDeps,
@@ -497,7 +499,9 @@ def _lookup_cache_image(
     """Find the cached snapshot to restore from for this group, or ``None`` (a miss).
 
     Pure cache lookup (D6/D9): compute the content key for
-    ``(profile, arch, operator, recipe, upstream)``, ``list_images`` the cache, and
+    ``(profile, arch, operator, requires, recipe, upstream)`` — ``requires`` is the
+    D-H spine read, so a docker run looks up the docker variant and a docker-less
+    run the docker-less one — ``list_images`` the cache, and
     pick the first **match** — an image whose ``vmlease-cache-key`` equals the key,
     whose architecture equals ``arch``, AND whose ``disk_size`` is ``<= target_disk``
     (the restore disk-bound, D9: a snapshot restores only onto a server whose disk is
@@ -511,7 +515,7 @@ def _lookup_cache_image(
     (``None``). A cache problem NEVER fails the host.
     """
     try:
-        key = content_key(profile, arch, operator, deps)
+        key = content_key(profile, arch, operator, requires, deps)
         images = provider.list_images(label_selector_purpose())
     except Exception as exc:  # lookup failure → advisory miss, never a host failure
         warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
@@ -838,7 +842,7 @@ def build_one_image(
         # build-image is ALWAYS cold: the cold default image + the full cloud-init +
         # the profile's own rescue flag (a rescue-write distro's builder is written
         # then prepped before the snapshot captures it).
-        cloud_init = render_cloudinit(_profile, operator, keypair.public_key)
+        cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
         return _profile.default_image, cloud_init, _profile.needs_rescue_write
 
     return _with_ready_host(
