@@ -3622,6 +3622,241 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# ProbeWorkload — the [prep] phase (packages + setup) before the probe loop (E-014)
+# --------------------------------------------------------------------------- #
+class _ScriptedPrepSsh:
+    """An SshRunner recording every command, with per-probe-id scripted exits.
+
+    ``exits`` maps a probe id to the exit code its ``run_probe`` returns
+    (anything absent returns 0). ``ran`` records the ordered (id) sequence and
+    ``commands`` the ordered command text — so a test can assert prep ran before
+    probes, packages before setup, and which steps were skipped.
+    """
+
+    def __init__(self, exits: dict[str, int] | None = None) -> None:
+        self._exits = exits or {}
+        self.ran: list[str] = []
+        self.commands: list[str] = []
+
+    def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+        self.ran.append(probe.id)
+        self.commands.append(probe.command)
+        code = self._exits.get(probe.id, 0)
+        return make_probe_result(probe.id, probe.tag, code, "", f"err-{probe.id}" if code else "")
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+    def wait_until_ready(self, host: Host) -> None:
+        return None
+
+    def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+        return 0
+
+    def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+
+class TestProbeWorkloadPrepPhase(unittest.TestCase):
+    """Prep runs after readiness, before probes; hard fail returns (not raises)."""
+
+    _PROBE = "\n[[probe]]\nid = '''P1'''\ntitle = '''t'''\ntag = '''read-only'''\nrun = '''c'''\n"
+
+    def _battery(self, prep_body: str) -> model.Battery:
+        return _resolve_toml(f"name = '''b'''\n{prep_body}{self._PROBE}")
+
+    def _spec(self, distro_key: str = "ubuntu") -> model.HostSpec:
+        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key=distro_key)
+
+    def _host(self) -> Host:
+        return Host(id="1", name="n", ipv4="9.9.9.9")
+
+    def test_no_prep_host_runs_probes_with_empty_prep_phase(self) -> None:
+        # a battery with no [prep] runs the probe loop unchanged; prep_phase is ().
+        wl = workload.ProbeWorkload(self._battery(""))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.prep_phase, ())
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])
+
+    def test_prep_runs_before_probes_packages_before_setup(self) -> None:
+        # packages pass -> setup step -> probe loop, in that order (5.5a).
+        prep = (
+            "[prep.packages]\napt = ['''pkg-a''']\n"
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo s1'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        # _detail first, then the package pass, then the setup step, then the probe
+        self.assertEqual(ssh_fake.ran, ["_detail", "_packages", "s1", "P1"])
+        # apt-get update runs FIRST inside the package command (D13.2)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertTrue(pkg_cmd.startswith("sudo apt-get update && "))
+        self.assertIn("apt-get install -y pkg-a", pkg_cmd)
+        # prep_phase carries both prep outcomes in order; probe captured separately
+        self.assertEqual([p.id for p in run.prep_phase], ["_packages", "s1"])
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])
+
+    def test_package_pass_union_manager_and_distro_selectors(self) -> None:
+        # union(manager-list, distro-list), deduped manager-first, one install pass.
+        prep = "[prep.packages]\napt = ['''a''', '''shared''']\nubuntu = ['''shared''', '''u''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertIn("apt-get install -y a shared u", pkg_cmd)
+
+    def test_distros_excluded_step_absent_from_prep_phase(self) -> None:
+        # a step whose distros allowlist excludes this host is skipped entirely.
+        prep = (
+            "[[prep.setup]]\nid = '''arch-only'''\nrun = '''c'''\ndistros = ['''arch''']\n"
+            "[[prep.setup]]\nid = '''everywhere'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
+        self.assertNotIn("arch-only", ssh_fake.ran)
+        self.assertEqual([p.id for p in run.prep_phase], ["everywhere"])
+
+    def test_hard_package_fail_returns_zero_probe_hostrun_with_prep_phase(self) -> None:
+        # the package pass is always hard: a non-zero exit aborts before any setup
+        # or probe, returning (NOT raising) a HostRun carrying prep_phase + 0 probes.
+        prep = (
+            "[prep.packages]\napt = ['''bad''']\n"
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"_packages": 100})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.results, ())          # zero probes
+        self.assertNotIn("s1", ssh_fake.ran)       # setup never reached
+        self.assertNotIn("P1", ssh_fake.ran)       # probe never reached
+        self.assertEqual([p.id for p in run.prep_phase], ["_packages"])
+        self.assertEqual(run.prep_phase[0].exit, 100)
+        self.assertTrue(run.prep_phase[0].required)
+
+    def test_hard_required_setup_fail_returns_zero_probe_hostrun(self) -> None:
+        # a required setup step's non-zero exit is a hard abort: prep_phase carries
+        # the failing step, probes are skipped, the HostRun is RETURNED not raised.
+        prep = (
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\n"
+            "[[prep.setup]]\nid = '''s2'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"s1": 7})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.results, ())
+        self.assertNotIn("s2", ssh_fake.ran)   # the loop stopped at the hard fail
+        self.assertNotIn("P1", ssh_fake.ran)
+        self.assertEqual([p.id for p in run.prep_phase], ["s1"])
+        self.assertEqual(run.prep_phase[0].exit, 7)
+
+    def test_soft_setup_fail_recorded_and_probes_continue(self) -> None:
+        # a required=false step that fails is recorded but the phase + probes go on.
+        prep = (
+            "[[prep.setup]]\nid = '''soft'''\nrun = '''c'''\nrequired = false\n"
+            "[[prep.setup]]\nid = '''after'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"soft": 3})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([p.id for p in run.prep_phase], ["soft", "after"])
+        self.assertEqual(run.prep_phase[0].exit, 3)
+        self.assertFalse(run.prep_phase[0].required)
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])  # probes ran
+
+    def test_setup_step_timeout_default_is_1800(self) -> None:
+        # an explicit step timeout overrides; an absent one uses DEFAULT_PREP_TIMEOUT.
+        prep = (
+            "[[prep.setup]]\nid = '''d'''\nrun = '''c'''\n"
+            "[[prep.setup]]\nid = '''o'''\nrun = '''c'''\ntimeout = 42\n"
+        )
+        seen: dict[str, float | None] = {}
+
+        class _TimeoutRecordingSsh(_ScriptedPrepSsh):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                seen[probe.id] = probe.timeout
+                return super().run_probe(host, probe)
+
+        wl = workload.ProbeWorkload(self._battery(prep))
+        wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
+        self.assertEqual(seen["d"], workload.DEFAULT_PREP_TIMEOUT)
+        self.assertEqual(seen["d"], 1800.0)
+        self.assertEqual(seen["o"], 42.0)
+
+
+# --------------------------------------------------------------------------- #
+# results.serialize_run — prep_phase is always present (D13.5 / D-I.2)
+# --------------------------------------------------------------------------- #
+class TestSerializeRunPrepPhase(unittest.TestCase):
+    def _spec(self) -> model.HostSpec:
+        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+
+    def test_prep_phase_emitted_as_list_of_dicts(self) -> None:
+        hr = model.HostRun(
+            host_spec=self._spec(),
+            detail="d",
+            results=(),
+            prep_phase=(
+                model.PrepStepResult(id="uv", exit=0, required=True, stderr=""),
+                model.PrepStepResult(id="tlog", exit=5, required=False, stderr="boom"),
+            ),
+        )
+        doc = json.loads(results.serialize_run("r1", "ts", [hr]))
+        prep = doc["hosts"][0]["prep_phase"]
+        self.assertEqual(prep, [
+            {"id": "uv", "exit": 0, "required": True, "stderr": ""},
+            {"id": "tlog", "exit": 5, "required": False, "stderr": "boom"},
+        ])
+
+    def test_prep_phase_always_present_empty_when_no_prep(self) -> None:
+        hr = model.HostRun(host_spec=self._spec(), detail="d", results=())
+        doc = json.loads(results.serialize_run("r1", "ts", [hr]))
+        self.assertEqual(doc["hosts"][0]["prep_phase"], [])
+
+
+# --------------------------------------------------------------------------- #
+# shellcheck — the lint driver also iterates [[prep.setup]] steps (5.4)
+# --------------------------------------------------------------------------- #
+class TestShellcheckPrepSteps(unittest.TestCase):
+    def _runner(
+        self, stdout: str
+    ) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        calls: list[tuple[list[str], str | None]] = []
+
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, stdin_text))
+            return subprocess.CompletedProcess(argv, 1, stdout, "")
+
+        self.calls = calls
+        return _run
+
+    def test_lint_flags_a_prep_setup_finding(self) -> None:
+        # a [[prep.setup]] step is fed to shellcheck and a finding is located to it.
+        battery = model.Battery(
+            name="t",
+            probes=(Probe(id="P", title="p", command="echo ok", tag=ProbeTag.READ_ONLY, source="<inline>"),),
+            prep=model.Prep(
+                setup=(
+                    model.PrepStep(id="prep-s", command="x=$(date)", source="prep.sh"),
+                ),
+            ),
+        )
+        findings = shellcheck_mod.shellcheck_battery(
+            battery, runner=self._runner("-:1:7: warning: masked [SC2155]\n")
+        )
+        assert isinstance(findings, tuple)
+        # both the probe AND the prep step were fed to shellcheck (two calls)
+        self.assertEqual([stdin for _, stdin in self.calls], ["echo ok", "x=$(date)"])
+        # the prep-step finding is located back to the step (id + source)
+        prep_findings = [f for f in findings if f.probe_id == "prep-s"]
+        self.assertEqual(len(prep_findings), 1)
+        self.assertEqual(prep_findings[0].location, "prep.sh")
+        self.assertEqual(prep_findings[0].code, "SC2155")
+
+
+# --------------------------------------------------------------------------- #
 # cli — run (confirm gate) / reap / status, with provider + ssh stubbed
 # --------------------------------------------------------------------------- #
 class TestCliRun(unittest.TestCase):

@@ -16,10 +16,10 @@ the timestamp and run-id come from the raw document, never the clock. The split
 mirrors ``results.py`` — a pure :func:`summarize_results` builder + a thin
 :func:`write_summary` I/O wrapper + a deterministic :func:`summary_filename`.
 
-Summary shape (``schema_version`` ``"2"``)::
+Summary shape (``schema_version`` ``"3"``)::
 
     {
-      "schema_version": "2",
+      "schema_version": "3",
       "source_raw": "<path or name of the raw file, informational>",
       "run_id": "<from the raw doc>",
       "timestamp": "<from the raw doc>",
@@ -27,6 +27,9 @@ Summary shape (``schema_version`` ``"2"``)::
       "hosts": [
         {
           "name": "...", "distro": "...", "image": "...", "detail": "...",
+          "prep_phase": {                  # step-id-keyed; {} when no [prep]
+            "uv": {"exit": 0, "required": true, "verdict": "", "stderr_tail": ""}
+          },
           "probes": [
             {
               "id": "start",
@@ -47,7 +50,8 @@ Summary shape (``schema_version`` ``"2"``)::
         }
       ],
       "matrix": {"sandbox start": {"ubuntu": "FAIL", "fedora": "PASS"}},
-      "totals": {"PASS": 3, "FAIL": 1, "TIMEOUT": 0, "PASS_NO_ASSERTIONS": 2}
+      "totals": {"PASS": 3, "FAIL": 1, "TIMEOUT": 0, "PASS_NO_ASSERTIONS": 2,
+                 "PREP_SOFT_FAIL": 0, "PREP_HARD_FAIL": 0}
     }
 
 Verdict rule (per probe, deterministic precedence):
@@ -78,21 +82,31 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 # Constants — single source of truth for verdict strings + the contract knobs
 # --------------------------------------------------------------------------- #
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 PASS = "PASS"
 FAIL = "FAIL"
 TIMEOUT = "TIMEOUT"
 PASS_NO_ASSERTIONS = "PASS_NO_ASSERTIONS"
 
+#: Prep-phase verdicts (D13.4). A hard prep failure (a ``required`` step or the
+#: package pass exited non-zero) aborts the host with zero probes — it forces a
+#: non-zero overall exit. A soft prep failure (a ``required=false`` step) is
+#: surfaced in ``totals`` but does NOT, alone, force a non-zero exit.
+PREP_SOFT_FAIL = "PREP_SOFT_FAIL"
+PREP_HARD_FAIL = "PREP_HARD_FAIL"
+
 #: Worst-of collapse order (most severe first) for matrix-cell reduction.
 VERDICT_SEVERITY: tuple[str, ...] = (TIMEOUT, FAIL, PASS_NO_ASSERTIONS, PASS)
 
 #: All verdicts, in a stable order, so ``totals`` always carries every key.
-ALL_VERDICTS: tuple[str, ...] = (PASS, FAIL, TIMEOUT, PASS_NO_ASSERTIONS)
+ALL_VERDICTS: tuple[str, ...] = (
+    PASS, FAIL, TIMEOUT, PASS_NO_ASSERTIONS, PREP_SOFT_FAIL, PREP_HARD_FAIL
+)
 
-#: Verdicts that make the overall run (and the CLI exit code) non-zero.
-FAILING_VERDICTS: frozenset[str] = frozenset({FAIL, TIMEOUT})
+#: Verdicts that make the overall run (and the CLI exit code) non-zero. A hard
+#: prep failure joins FAIL/TIMEOUT (the zero-probe host that must not read exit 0).
+FAILING_VERDICTS: frozenset[str] = frozenset({FAIL, TIMEOUT, PREP_HARD_FAIL})
 
 #: Last N chars of each stream kept in the summary (full streams stay in raw).
 TAIL_LEN = 2000
@@ -244,6 +258,38 @@ def _summarize_probe(raw_probe: dict[str, Any], command_map: dict[str, str]) -> 
     }
 
 
+def _summarize_prep_phase(
+    raw_prep: list[Any], totals: dict[str, int]
+) -> dict[str, dict[str, Any]]:
+    """Pivot a host's raw ``prep_phase`` list into a step-id-keyed summary object.
+
+    Each raw step (``{id, exit, required, stderr}``) becomes
+    ``{exit, required, verdict, stderr_tail}`` under its ``id``. A non-zero exit
+    yields a verdict — :data:`PREP_HARD_FAIL` when the step was ``required``, else
+    :data:`PREP_SOFT_FAIL` — tallied into ``totals``. A zero exit is a pass and is
+    not tallied (prep passes are not a ``totals`` verdict; only failures are).
+    """
+    summary: dict[str, dict[str, Any]] = {}
+    for raw_step in raw_prep:
+        if not isinstance(raw_step, dict):
+            continue
+        step_id = str(raw_step.get("id", ""))
+        exit_code = int(raw_step.get("exit", 0))
+        required = bool(raw_step.get("required", True))
+        stderr = str(raw_step.get("stderr", ""))
+        verdict_str = ""
+        if exit_code != 0:
+            verdict_str = PREP_HARD_FAIL if required else PREP_SOFT_FAIL
+            totals[verdict_str] += 1
+        summary[step_id] = {
+            "exit": exit_code,
+            "required": required,
+            "verdict": verdict_str,
+            "stderr_tail": stderr[-TAIL_LEN:],
+        }
+    return summary
+
+
 def summarize_results(
     raw_doc: dict[str, Any], *, battery: Battery | None = None, source_raw: str = ""
 ) -> dict[str, Any]:
@@ -284,11 +330,17 @@ def summarize_results(
             cell = matrix_acc.setdefault(probe["command"], {}).setdefault(distro, [])
             cell.append(probe["verdict"])
 
+        raw_prep = raw_host.get("prep_phase", [])
+        prep_phase = _summarize_prep_phase(
+            raw_prep if isinstance(raw_prep, list) else [], totals
+        )
+
         host_record: dict[str, Any] = {
             "name": str(raw_host.get("name", "")),
             "distro": distro,
             "image": str(raw_host.get("image", "")),
             "detail": str(raw_host.get("detail", "")),
+            "prep_phase": prep_phase,
             "probes": probes,
         }
         if battery is not None:

@@ -140,7 +140,7 @@ class TestVerdict(unittest.TestCase):
 class TestSummarizeResults(unittest.TestCase):
     def test_schema_and_top_level_fields(self) -> None:
         s = summary.summarize_results(_raw_doc([]), source_raw="r.json")
-        self.assertEqual(s["schema_version"], "2")
+        self.assertEqual(s["schema_version"], "3")
         self.assertEqual(s["run_id"], "r1")
         self.assertEqual(s["timestamp"], "20260601T000000Z")
         self.assertEqual(s["source_raw"], "r.json")
@@ -186,7 +186,13 @@ class TestSummarizeResults(unittest.TestCase):
             _probe("attach", timed_out=True),               # TIMEOUT
         ]}])
         s = summary.summarize_results(doc)
-        self.assertEqual(s["totals"], {"PASS": 1, "FAIL": 1, "TIMEOUT": 1, "PASS_NO_ASSERTIONS": 1})
+        self.assertEqual(
+            s["totals"],
+            {
+                "PASS": 1, "FAIL": 1, "TIMEOUT": 1, "PASS_NO_ASSERTIONS": 1,
+                "PREP_SOFT_FAIL": 0, "PREP_HARD_FAIL": 0,
+            },
+        )
 
     def test_tail_bounding(self) -> None:
         big = "x" * (summary.TAIL_LEN + 500)
@@ -375,6 +381,72 @@ class TestOverallExitCode(unittest.TestCase):
     def test_nonzero_on_timeout(self) -> None:
         self.assertEqual(summary.overall_exit_code({"totals": {"TIMEOUT": 1}}), 1)
 
+    def test_nonzero_on_prep_hard_fail(self) -> None:
+        self.assertEqual(summary.overall_exit_code({"totals": {"PREP_HARD_FAIL": 1}}), 1)
+
+    def test_zero_on_prep_soft_fail_alone(self) -> None:
+        self.assertEqual(summary.overall_exit_code({"totals": {"PREP_SOFT_FAIL": 1}}), 0)
+
+
+def _prep_step(pid: str, exit_code: int = 0, required: bool = True, stderr: str = "") -> dict[str, object]:
+    return {"id": pid, "exit": exit_code, "required": required, "stderr": stderr}
+
+
+class TestPrepPhaseSummary(unittest.TestCase):
+    """The prep_phase pivot (D-F/D13.4): hard -> non-zero exit; soft -> surfaced."""
+
+    def test_schema_version_is_three(self) -> None:
+        s = summary.summarize_results(_raw_doc([]))
+        self.assertEqual(s["schema_version"], "3")
+
+    def test_totals_always_carry_prep_keys(self) -> None:
+        s = summary.summarize_results(_raw_doc([]))
+        self.assertIn("PREP_SOFT_FAIL", s["totals"])
+        self.assertIn("PREP_HARD_FAIL", s["totals"])
+
+    def test_hard_prep_fail_counted_and_forces_nonzero_exit(self) -> None:
+        # the zero-probe host (hard prep abort) → PREP_HARD_FAIL → exit 1, fixing
+        # the zero-probe → all-zero → exit-0 hole.
+        doc = _raw_doc([{
+            "distro": "ubuntu", "image": "u", "detail": "",
+            "prep_phase": [_prep_step("_packages", exit_code=100, required=True)],
+            "probes": [],
+        }])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["totals"]["PREP_HARD_FAIL"], 1)
+        self.assertEqual(s["hosts"][0]["prep_phase"]["_packages"]["verdict"], "PREP_HARD_FAIL")
+        self.assertEqual(summary.overall_exit_code(s), 1)
+
+    def test_soft_prep_fail_surfaced_but_exit_zero(self) -> None:
+        doc = _raw_doc([{
+            "distro": "ubuntu", "image": "u", "detail": "",
+            "prep_phase": [_prep_step("tlog", exit_code=3, required=False, stderr="nope")],
+            "probes": [_probe("start", stdout="A_OK")],
+        }])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["totals"]["PREP_SOFT_FAIL"], 1)
+        step = s["hosts"][0]["prep_phase"]["tlog"]
+        self.assertEqual(step["verdict"], "PREP_SOFT_FAIL")
+        self.assertEqual(step["stderr_tail"], "nope")
+        self.assertEqual(summary.overall_exit_code(s), 0)  # soft alone does not fail
+
+    def test_passing_prep_step_has_empty_verdict_and_not_tallied(self) -> None:
+        doc = _raw_doc([{
+            "distro": "ubuntu", "image": "u", "detail": "",
+            "prep_phase": [_prep_step("uv", exit_code=0)],
+            "probes": [],
+        }])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["hosts"][0]["prep_phase"]["uv"]["verdict"], "")
+        self.assertEqual(s["totals"]["PREP_SOFT_FAIL"], 0)
+        self.assertEqual(s["totals"]["PREP_HARD_FAIL"], 0)
+
+    def test_prep_phase_present_and_empty_for_no_prep_host(self) -> None:
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "",
+                         "probes": [_probe("start")]}])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["hosts"][0]["prep_phase"], {})
+
 
 class TestSummaryFilename(unittest.TestCase):
     def test_derives_summary_json(self) -> None:
@@ -407,7 +479,7 @@ class TestCliSummarize(unittest.TestCase):
             self.assertIn(str(companion), buf.getvalue())
             self.assertEqual(raw.read_bytes(), before)  # raw byte-for-byte unchanged
             doc = json.loads(companion.read_text(encoding="utf-8"))
-            self.assertEqual(doc["schema_version"], "2")
+            self.assertEqual(doc["schema_version"], "3")
 
     def test_explicit_out_path(self) -> None:
         with tempfile.TemporaryDirectory() as d:

@@ -32,6 +32,15 @@ def serialize_run(run_id: str, timestamp: str, host_runs: list[HostRun]) -> str:
                 "distro": hr.host_spec.distro_key,
                 "image": hr.host_spec.image,
                 "detail": hr.detail,
+                "prep_phase": [
+                    {
+                        "id": ps.id,
+                        "exit": ps.exit,
+                        "required": ps.required,
+                        "stderr": ps.stderr,
+                    }
+                    for ps in hr.prep_phase
+                ],
                 "probes": [
                     {
                         "id": r.probe_id,
