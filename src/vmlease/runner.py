@@ -10,7 +10,7 @@ same generator, so the plan is byte-faithful to what a real run would do.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, TypeVar
 
 from vmlease.capabilities import canonical_requires
@@ -671,15 +671,11 @@ def _replace_image(spec: HostSpec, image: str) -> HostSpec:
     The scaffold's ``plan_create`` may resolve a different image than the spec
     carries (a cache-restore snapshot id vs the cold default) — the host is created
     from that resolved image, so the spec is rebuilt rather than mutated.
+
+    Uses :func:`dataclasses.replace` so every other field (incl. ``requires``)
+    rides along verbatim and a new field can't silently drop out of the copy.
     """
-    return HostSpec(
-        name=spec.name,
-        image=image,
-        server_type=spec.server_type,
-        distro_key=spec.distro_key,
-        labels=dict(spec.labels),
-        firewall=spec.firewall,
-    )
+    return replace(spec, image=image)
 
 
 def _best_effort_destroy(provider: Provider, host: Host) -> str:

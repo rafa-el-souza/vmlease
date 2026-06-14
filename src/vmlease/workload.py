@@ -65,12 +65,6 @@ _HOST_DETAIL_COMMAND = (
 # of N*timeout. K=2 (not 1) so one slow probe never ends an otherwise-fine battery.
 MAX_CONSECUTIVE_TIMEOUTS = 2
 
-# The per-step prep wall-clock bound (seconds) when a ``[[prep.setup]]`` step
-# carries no explicit ``timeout``. 1800s (30 min) is the design default (D13.1) —
-# generous enough for the slowest legitimate prep (e.g. debian-13's ~1800s tlog
-# source build) while still bounding a wedged step.
-DEFAULT_PREP_TIMEOUT = 1800.0
-
 
 def _effective_packages(
     packages: Mapping[str, tuple[str, ...]], manager: str, distro_key: str
@@ -233,17 +227,17 @@ class ProbeWorkload:
     def _run_setup_step(self, host: Host, ssh: SshRunner, step: PrepStep, /) -> PrepStepResult:
         """Run one ``[[prep.setup]]`` step and capture it as a :class:`PrepStepResult`.
 
-        The step's effective per-step timeout is its own ``timeout`` when set, else
-        :data:`DEFAULT_PREP_TIMEOUT` (D13.1). The command runs verbatim over SSH
-        (the author writes ``sudo`` inline where root is needed).
+        The step's ``timeout`` is loader-resolved — the D13.1 1800s default is
+        applied at battery load (:data:`vmlease.battery._PREP_STEP_DEFAULT_TIMEOUT`)
+        when a step omits ``timeout``. The command runs verbatim over SSH (the
+        author writes ``sudo`` inline where root is needed).
         """
-        timeout = step.timeout if step.timeout is not None else DEFAULT_PREP_TIMEOUT
         probe = Probe(
             id=step.id,
             title=step.title,
             command=step.command,
             tag=ProbeTag.MUTATING_HOST_ROOT,
-            timeout=timeout,
+            timeout=step.timeout,
         )
         outcome = ssh.run_probe(host, probe)
         return PrepStepResult(

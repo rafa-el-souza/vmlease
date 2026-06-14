@@ -3771,7 +3771,9 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
         self.assertEqual([r.probe_id for r in run.results], ["P1"])  # probes ran
 
     def test_setup_step_timeout_default_is_1800(self) -> None:
-        # an explicit step timeout overrides; an absent one uses DEFAULT_PREP_TIMEOUT.
+        # an explicit step timeout overrides; an absent one takes the loader-resolved
+        # default (battery._PREP_STEP_DEFAULT_TIMEOUT, 1800s) — verified end-to-end at
+        # the probe the workload submits.
         prep = (
             "[[prep.setup]]\nid = '''d'''\nrun = '''c'''\n"
             "[[prep.setup]]\nid = '''o'''\nrun = '''c'''\ntimeout = 42\n"
@@ -3785,7 +3787,6 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
 
         wl = workload.ProbeWorkload(self._battery(prep))
         wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
-        self.assertEqual(seen["d"], workload.DEFAULT_PREP_TIMEOUT)
         self.assertEqual(seen["d"], 1800.0)
         self.assertEqual(seen["o"], 42.0)
 

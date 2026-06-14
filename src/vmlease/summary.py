@@ -365,7 +365,9 @@ def summarize_results(
 
 
 def overall_exit_code(summary: dict[str, Any]) -> int:
-    """``1`` iff any probe verdict is FAIL/TIMEOUT (per ``totals``), else ``0``."""
+    """``1`` iff any failing verdict (probe FAIL/TIMEOUT or ``PREP_HARD_FAIL``) is
+    present per ``totals``, else ``0``. A ``PREP_SOFT_FAIL`` alone does not force
+    non-zero."""
     totals = summary.get("totals", {})
     if any(totals.get(v, 0) for v in FAILING_VERDICTS):
         return 1
