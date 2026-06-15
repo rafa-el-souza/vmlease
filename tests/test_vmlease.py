@@ -3510,7 +3510,7 @@ class _ZeroProbeWorkload:
 
     plan_summary = "prep-abort"
 
-    def run(self, spec: HostSpec, host: Host, ssh: ssh.SshRunner, /) -> model.HostRun:
+    def run(self, spec: HostSpec, host: Host, runner_ssh: ssh.SshRunner, /) -> model.HostRun:
         return model.HostRun(
             host_spec=spec, detail="prep packages install failed (hard abort)", results=()
         )
@@ -3529,6 +3529,7 @@ class _SpyKeypair(keypair.Keypair):
         priv = d / "id_ed25519"
         priv.write_text("PRIV", encoding="utf-8")
         kp = _SpyKeypair(directory=d, private_key_path=priv, public_key="ssh-ed25519 AAAA probe")
+        # Keypair is a frozen dataclass; set the spy's `cleaned` field past that guard.
         object.__setattr__(kp, "cleaned", [])
         return kp
 
@@ -3690,6 +3691,36 @@ class TestKeepFlag(unittest.TestCase):
                 rc = cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
             self.assertEqual(rc, 0)
             self.assertEqual(len(generated), 1)  # proceeded → keypair generated
+
+    def test_cli_keep_renders_consolidated_live_host_block_on_stderr(self) -> None:
+        # 8: --keep --yes drives _cmd_run end-to-end → the consolidated live-host
+        # block is rendered to STDERR (header + count, an `ssh -i` KEPT note, the
+        # backticked reap hint, and the surviving key-dir note). Exit 0; the kept
+        # host is NEVER destroyed.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu", "--keep", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            kept_kp = _fake_keypair(Path(d))
+            prov = FakeProvider()
+            fssh = FakeSshRunner()
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", lambda _rid: kept_kp), \
+                    mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: fssh), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(rc, 0)
+            self.assertEqual(prov.destroyed, [])  # kept → never torn down
+            block = err.getvalue()
+            self.assertIn("WARNING: --keep left 1 billable host(s) LIVE", block)
+            self.assertIn("ssh -i ", block)  # a KEPT note's ssh line
+            self.assertIn("`vmlease reap --run-token cli-keep`", block)  # backticked reap hint
+            self.assertIn(str(kept_kp.directory), block)  # surviving key-dir note
 
 
 class _ScriptedTimeoutSsh:

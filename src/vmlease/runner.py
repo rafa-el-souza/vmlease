@@ -31,6 +31,8 @@ from vmlease.safety import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from vmlease.distro import DistroProfile
     from vmlease.keypair import Keypair
     from vmlease.model import Host, Image, UploadSpec
@@ -57,7 +59,7 @@ TEARDOWN_WARNING_PREFIX = "WARNING: teardown of"
 KEPT_HOST_PREFIX = "KEPT:"
 
 
-def _kept_note(host: Host, operator: str, key_path: object) -> str:
+def _kept_note(host: Host, operator: str, key_path: Path) -> str:
     """The single note a kept host leaves: how to SSH into the live machine."""
     return (
         f"{KEPT_HOST_PREFIX} {host.name} ({host.id}) is LIVE at {host.ipv4} "
@@ -210,7 +212,7 @@ def execute(
     reap_bad_cache_image: bool = False,
     keep: bool = False,
 ) -> list[HostRun]:
-    """Per host: provision -> (rescue-write) -> run workload -> **tear down immediately**.
+    """Per host: provision -> (rescue-write) -> run workload -> tear down (unless ``keep``).
 
     Each host is **isolated**: it is created, transformed, run, and destroyed in
     its own ``try/finally`` BEFORE the next host starts — so a host dies seconds
@@ -220,7 +222,8 @@ def execute(
     detail and zero results (NOT a raise), so :func:`execute` always returns
     one ``HostRun`` per requested host and the caller always writes a results file.
     The injected ``matrix.workload`` owns what runs on each ready host. The keypair
-    is cleaned once at the end.
+    is cleaned once at the end — UNLESS ``keep`` is set, which leaves the host(s)
+    standing and skips that cleanup (see ``keep`` below).
 
     ``ssh_factory`` builds an :class:`~vmlease.ssh.SshRunner` for the operator
     + keypair (injected so tests pass a fake). ``rescue_writer`` (injected) is
@@ -254,6 +257,9 @@ def execute(
     ``reap_bad_cache_image`` (opt-in, default off) reaps the source image when a
     *restored* host fails readiness (G4); default is a hint only (the image is
     named in the failure detail but kept, so a real fault is not masked).
+    ``keep`` (opt-in, default off) leaves every host RUNNING (billable) instead of
+    tearing it down — each kept host carries a KEPT note (how to SSH in) and the
+    keypair is NOT cleaned, so the printed ``ssh -i <path>`` points at a live file.
     """
     validate_uploads(matrix)
     specs = build_host_specs(matrix)

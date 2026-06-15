@@ -358,7 +358,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
                     if KEPT_HOST_PREFIX in line:
                         print(f"  - {line}", file=sys.stderr)
             print(
-                f"DESTROY ALL when done:  vmlease reap --run-token {args.run_token}",
+                f"DESTROY ALL when done: `vmlease reap --run-token {args.run_token}`",
                 file=sys.stderr,
             )
             print(
