@@ -20,12 +20,39 @@ capture structured results, and guarantee teardown.
 - **Deterministic & testable.** No wall-clock reads or RNG in the library — run-ids and timestamps are
   injected; all external I/O sits behind injected seams.
 
+## Quickstart
+
+The repo ships a real battery — `examples/compose-plugin-check/` — that verifies a freshly-provisioned host
+has a working `docker compose` v2 plugin. The full loop is **lint → plan → run → summarize** (prerequisite:
+an active `hcloud` context, configured out of band — `run` is billable, the rest are free):
+
+```bash
+# 1. lint: shellcheck the battery's probe (+ any prep) scripts and assert it has a verdict source. Free.
+vmlease lint --battery examples/compose-plugin-check/battery.toml
+
+# 2. plan: dry-run the matrix — what WOULD provision. Zero provider calls, free.
+vmlease plan --battery examples/compose-plugin-check/battery.toml --run-token compose-check
+
+# 3. run: provision one host per distro, run the battery, ALWAYS tear down. Billable; confirm-gated.
+vmlease run  --battery examples/compose-plugin-check/battery.toml --run-token compose-check \
+        --results-dir ./results --timestamp 2026-06-15T1200 --distros ubuntu,debian --yes
+
+# 4. summarize: the ONE canonical reader → a .summary.json companion; its exit code is the pass/fail gate.
+vmlease summarize ./results/vmlease-compose-check-2026-06-15T1200.json \
+        --battery examples/compose-plugin-check/battery.toml; echo $?   # 0 = green
+```
+
+`--run-token` and `--timestamp` are determinism seams (the library never reads the clock): the same token →
+the same run-id and the same results filename. Gate CI on **`summarize`'s** exit code, never on `run`'s
+(see *CI integration & exit codes* below).
+
 ## CLI
 
 ```
 vmlease plan   --battery <battery.toml> --run-token <slug>      # dry-run: what WOULD provision (zero provider calls)
-vmlease run    --battery <battery.toml> --run-token <slug> \    # provision -> probe -> ALWAYS tear down (billable)
-               --operator probe --results-dir <dir> [--yes]
+vmlease run    --battery <battery.toml> --run-token <slug> --results-dir <dir> --timestamp <ts> \  # provision -> probe -> ALWAYS tear down (billable)
+               [--operator probe] [--distros ubuntu,debian,fedora,arch] [--parallel N] \
+               [--upload LOCAL[:REMOTE]] [--ssh-key <name> --ssh-key-path <path>] [--max-hosts 8] [--firewall <name>] [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
 vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
@@ -36,7 +63,15 @@ vmlease summarize <raw-results.json> [--battery <battery.toml>] [--out <s.json>]
 
 The Hetzner provider relies on the operator's active `hcloud` context (configured out of band).
 
-### Authoring a battery
+> **`--parallel`** (on `run`, default `1` = serial) runs up to N hosts concurrently. It is **same cost,
+> ~Nx faster wall-clock**: each host is an independent create/probe/teardown with its own `try/finally`, and
+> the only shared state (the throwaway key + the gpg keyring) is read-only after setup, so the
+> teardown-always guarantee holds per thread. Results are returned in matrix order regardless of completion
+> order. `--parallel` and the cost guard's `--max-hosts` cap are independent: `--max-hosts` bounds how many
+> hosts the matrix may request at all; `--parallel` only bounds how many of them run at once (it is clamped
+> to the host count).
+
+## Authoring a battery
 
 A battery is a **TOML bundle**: a `battery.toml` manifest (a `name` plus a `[[probe]]` array) alongside any
 co-located shell scripts. Each probe declares a stable `id`, a `title`, a `tag`, an optional `classifies`
@@ -51,17 +86,105 @@ as **bash**. See `examples/compose-plugin-check/battery.toml`.
 - **A probe's `ok` is its command's exit code** — so gate assertions with `exit $rc` (`plan`/`run` emit a
   non-fatal `warning:` for an un-gated token-printing probe; see `lint_battery`). A command ending in
   `… && echo OK || echo FAIL` always exits 0, so `ok` is `true` no matter which token it printed.
+- **Or declare the verdict structurally with `[probe.assert]`** (next subsection) — the recommended way to
+  avoid the exit-code footgun entirely.
 
-Migrating a pre-TOML (JSON) battery? See [`docs/battery-toml-migration.md`](docs/battery-toml-migration.md)
-— field mapping, a one-time extraction helper, the authoring-order check, and a troubleshooting table.
+### Declarative verdicts: `[probe.assert]`
 
-### Host prerequisites: `requires` and `[prep]`
+Instead of the `*_OK`/`*_FAIL` token convention, a probe may carry a `[probe.assert]` table of declarative
+predicates. When a probe declares **any** assertion: its `ok` becomes the **AND of all the assertions**, the
+raw exit code is **ignored** (no `exit $rc` gating needed), and the probe is **exempt** from the un-gated-token
+`lint`/`run` warning. The full key set:
+
+| Key | Value | Holds when |
+|-----|-------|------------|
+| `exit` | int | the command's exit code **equals** the value |
+| `exit_not` | int | the command's exit code is **not** the value |
+| `stdout_has` / `stderr_has` | string or `[string]` | the stream **contains** the substring (every one, if a list) |
+| `stdout_lacks` / `stderr_lacks` | string or `[string]` | the stream contains **none** of the substrings |
+| `stdout_matches` / `stderr_matches` | string or `[string]` | an **RE2** pattern matches the stream (every one, if a list) |
+| `stdout_matches_not` / `stderr_matches_not` | string or `[string]` | **no** RE2 pattern matches the stream |
+| `stdout_empty` / `stderr_empty` | bool | the (whitespace-stripped) stream is empty (`true`) / non-empty (`false`) |
+
+```toml
+[[probe]]
+id = "compose-v2"
+title = "docker compose v2 plugin is present"
+tag = "read-only"
+run = '''docker compose version'''
+
+[probe.assert]
+exit = 0
+stdout_matches = '''Docker Compose version v2\.'''   # RE2, unanchored
+stderr_lacks = "unknown shorthand flag"
+```
+
+- **List values conjoin (AND).** A list value means *every* element must hold; an **empty list is rejected**
+  at battery load (a no-op assertion is a footgun, not a pass).
+- **`_lacks` / `_matches_not` / `_empty` on an empty stream.** A `_lacks` / `_matches_not` over an empty
+  stream is **vacuously true** (nothing present to forbid); a `_has` / `_matches` over an empty stream is
+  **false** (the substring/pattern can't be present). `stdout_empty = true` holds iff the stream is
+  whitespace-empty.
+
+> **Regex dialect is RE2, not Python `re`.** Patterns compile through [RE2](https://github.com/google/re2):
+> matching is **unanchored** (a `search` — `^`/`$` anchor to the whole text unless you use `(?m)`),
+> consistent with substring `_has`. RE2 has **no backreferences and no lookaround** (the features that make
+> a regex vulnerable to catastrophic backtracking), and each compiled pattern is bounded by an **8 MiB**
+> automaton memory budget. A malformed pattern, an unsupported backreference/lookaround, or an over-budget
+> automaton is a hard battery-load error naming the probe and the pattern — caught at parse, never at
+> evaluation.
+
+### Uploads: `--upload`
+
+`--upload LOCAL[:REMOTE]` (on `plan`/`run`, **repeatable**) stages a local file onto **every** host. With no
+`:REMOTE`, the remote defaults to `~/<basename(local)>`. Every upload is validated **fail-closed before any
+spend** — a bad `--upload` aborts in `plan` and at the top of `execute`, before a single host is created
+(the validation is host-independent, so it runs once for the whole run).
+
+- **`--upload` takes a regular file.** The source must be a plain, readable, non-symlinked regular file; a
+  directory (or FIFO / socket / device) is refused fail-closed (`is not a regular file`). The transport
+  layer *does* carry a recursive directory push (`upload_dir`, via `rsync --safe-links`, with its own
+  dir-source validator that drops out-of-tree symlinks), but the `--upload` flag is wired only to the
+  single-file path — directory staging is not yet exposed on the CLI.
+- **Symlinks are refused.** The source entry itself, or any symlink component anywhere in its resolved path,
+  is rejected — a symlink's target is never read or shipped.
+- **The remote destination is guarded.** No `..` path segment (traversal), no leading `-` (scp
+  option-injection), and a conservative character allowlist (letters, digits, and `._/~@,=+-` — no
+  whitespace, no shell metacharacters).
+
+**Ordering — uploads land after readiness, before *both* prep and probes.** Per host, the runner waits for
+the readiness gate, **stages the uploads**, *then* runs the workload — which runs `[prep.packages]`, then the
+`[[prep.setup]]` steps, then the probe loop. So an uploaded file is on disk before prep runs, and **prep can
+consume an upload** (e.g. a `[[prep.setup]]` step that installs an uploaded artifact). The full host
+prerequisite order is therefore:
+
+```
+capabilities (requires, baked into cloud-init) → readiness gate → UPLOADS
+  → [prep.packages] → [[prep.setup]] (authoring order) → probe loop
+```
+
+### Linting a battery: `vmlease lint`
+
+`vmlease lint --battery <battery.toml>` does **two** independent things and gates a single exit code on both:
+
+- **shellcheck** every probe command **and** every `[[prep.setup]]` step (fed through
+  `shellcheck --shell=bash`). `--severity` (default `error`; one of `error`/`warning`/`note`) sets the
+  threshold — any finding at or above it fails the gate (exit `1`). If the `shellcheck` binary is missing,
+  lint prints a notice and **skips** that part (exit `0`) — unless `--require-shellcheck` is given, which
+  makes a missing binary fail (exit `1`).
+- a **structural no-verdict-source** check, which is **always fatal** (exit `1`) regardless of shellcheck
+  availability or `--severity`. It flags a probe that declares **no** `[probe.assert]` and whose command
+  prints `*_OK`/`*_FAIL` tokens without an explicit `exit $rc` — such a probe's `ok` is always its exit code
+  (`0`), so it has no real source of truth. A probe that declares assertions or exit-gates its command is
+  exempt. (The same finding is an advisory `warning:` at plan/run time; `lint` is where it becomes fatal.)
+
+## Host prerequisites: `requires` and `[prep]`
 
 A battery declares its host prerequisites **declaratively**: the vmlease-provided capabilities it opts
 into (`requires`) and the packages + setup steps it brings itself (`[prep]`). Both are optional and
 additive to the manifest. The provisioning order per host is: capabilities (`requires`, baked into
-cloud-init at create time) → readiness gate → `[prep.packages]` → `[[prep.setup]]` (authoring order) →
-the probe loop.
+cloud-init at create time) → readiness gate → uploads → `[prep.packages]` → `[[prep.setup]]` (authoring
+order) → the probe loop.
 
 #### `requires` — opt into vmlease-provided capabilities (default-off)
 
@@ -85,7 +208,7 @@ distinct cache entries automatically (see *Caching* below).
 
 `[prep]` is host *setup*, not a test (distinct from probes — it carries no `tag` and no assertions). It
 runs once per host over SSH as the operator (`sudo` written inline where root is needed), after readiness
-and before the first probe.
+(and after any uploads) and before the first probe.
 
 ```toml
 [prep.packages]
@@ -142,32 +265,112 @@ run = '''curl -LsSf https://astral.sh/uv/install.sh | sudo sh'''  # inline; or `
   **`PREP_SOFT_FAIL`** — a distinct, visible state in `totals` that does **not** by itself force a non-zero
   exit (a CI gate may still choose to fail on it). The summary `schema_version` is `"3"`.
 
-> **CI gates on `summarize`, never on `run`.** `vmlease run`'s exit code reflects only the run mechanics
-> (it does not parse `*_OK`/`*_FAIL` tokens, and a soft prep fail leaves it running). The trustworthy
-> pass/fail verdict — including `PREP_HARD_FAIL` → non-zero — lives in `summarize`'s exit code. Always
-> gate on `vmlease summarize <raw>; echo $?`, not on `run`.
+## Results & summary
 
-### Summarizing results (`vmlease summarize`)
+`vmlease run` writes a raw, per-host × per-probe transcript; `vmlease summarize` reads it and writes a
+versioned `.summary.json` companion whose **exit code** is the gate (see *CI integration & exit codes*). The
+raw file is the source of truth and is **never mutated**.
 
-A raw results file records each probe's `ok` as *only its exit code* — but the real "did it pass?" lives
-in `*_OK` / `*_FAIL` assertion tokens the probe prints to stdout (the vacuous-ok footgun). `summarize` is
-the ONE canonical reader: it writes a versioned `<stem>.summary.json` companion beside the raw file (the
-raw file is never mutated) and exits with the overall verdict so a caller can gate without parsing:
+### The raw results file (`results.py`)
 
+```jsonc
+{
+  "run_id": "...", "timestamp": "...",
+  "hosts": [
+    {
+      "name": "...", "distro": "ubuntu", "image": "ubuntu-24.04",
+      "restored_image": null,          // snapshot id if a cache hit restored this host, else null (cold miss)
+      "detail": "...",                 // the self-describing host-detail snapshot (os-release, kernel, …)
+      "prep_phase": [                  // one entry per executed prep step; [] for a no-prep host
+        { "id": "_packages", "exit": 0, "required": true, "stderr": "..." },
+        { "id": "INSTALL_UV", "exit": 0, "required": true, "stderr": "..." }
+      ],
+      "probes": [
+        {
+          "id": "compose-v2", "tag": "read-only", "exit_code": 0,
+          "has_assertions": true,      // did the probe declare [probe.assert]?
+          "assertion_failures": [],    // describe() of each FAILED assertion (empty = all held)
+          "ok": true,                  // AND-of-assertions if has_assertions, else just exit_code == 0
+          "timed_out": false,
+          "stdout": "...", "stderr": "..."   // full streams (the summary keeps only bounded tails)
+        }
+      ]
+    }
+  ]
+}
 ```
-vmlease summarize results/vmlease-run-ts.json; echo $?   # 0 = all PASS/PASS_NO_ASSERTIONS, non-zero otherwise
+
+### The summary file (`summary.py`)
+
+`summarize` adds `schema_version: "3"`, a computed per-probe `verdict`, the four token buckets, bounded
+stream tails (last 2000 chars), a `matrix` pivot (command × distro, collapsed worst-of), and `totals` by
+verdict:
+
+```jsonc
+{
+  "schema_version": "3",
+  "run_id": "...", "timestamp": "...", "battery": "vmlease-compose-plugin-check",  // battery is null without --battery
+  "hosts": [
+    {
+      "name": "...", "distro": "ubuntu", "image": "ubuntu-24.04", "detail": "...",
+      "prep_phase": {                  // step-id-keyed (raw is a list); {} for a no-prep host
+        "INSTALL_UV": { "exit": 0, "required": true, "verdict": "", "stderr_tail": "..." }
+      },
+      "probes": [
+        {
+          "id": "compose-v2", "command": "...", "tag": "read-only",
+          "exit_code": 0, "ok": true, "timed_out": false,
+          "verdict": "PASS",           // the ONE canonical computed verdict
+          "assertion_failures": [],
+          "ok_tokens": [], "fail_tokens": [], "info_tokens": [], "review_tokens": [],
+          "stdout_tail": "...", "stderr_tail": "..."
+        }
+      ],
+      "not_run": []                    // declared-but-not-run probe ids — only when --battery is supplied
+    }
+  ],
+  "matrix": { "<command>": { "ubuntu": "PASS", "debian": "FAIL" } },
+  "totals": { "PASS": 3, "FAIL": 1, "TIMEOUT": 0, "PASS_NO_ASSERTIONS": 2,
+              "PREP_SOFT_FAIL": 0, "PREP_HARD_FAIL": 0 }
+}
 ```
 
-The summary carries `schema_version: "3"`; per host its `distro`/`image`/`detail` + a probe record each
-with a computed `verdict`, the four harvested token buckets, and bounded stdout/stderr tails; a `prep_phase`
-section (per executed prep step → its outcome; see *Host prerequisites* above); a `matrix` pivot (canonical
-command × distro, collapsed worst-of); and `totals` by verdict (including `PREP_HARD_FAIL`/`PREP_SOFT_FAIL`).
-The per-probe verdict is deterministic: `timed_out` → `TIMEOUT`; else any `*_FAIL` token or non-zero exit →
-`FAIL`; else zero exit with a `*_OK` token → `PASS`; else (zero exit, no assertion tokens) →
-`PASS_NO_ASSERTIONS`. A hard prep abort forces a non-zero exit; a soft prep fail is surfaced but does not.
-Pass
-`--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes per host;
-without it a built-in probe-id→command map is the fallback. See `src/vmlease/summary.py` for the full shape.
+The per-probe `verdict` is deterministic, in precedence order: `timed_out` → **`TIMEOUT`**; else if the
+probe declared `[probe.assert]`, the runner-stored `ok` (the AND of those assertions) is authoritative —
+**`PASS`** iff it holds, else **`FAIL`** (overriding exit-code and tokens both ways); else any `*_FAIL` token
+or non-zero exit → **`FAIL`**; else a zero exit with an `*_OK` token → **`PASS`**; else (zero exit, no
+assertion tokens) → **`PASS_NO_ASSERTIONS`**. A hard prep abort is **`PREP_HARD_FAIL`** (forces a non-zero
+exit); a soft prep fail is **`PREP_SOFT_FAIL`** (surfaced, but does not by itself force non-zero).
+
+Pass `--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes
+per host (the `not_run` list); without it a built-in probe-id→command map is the fallback. See
+`src/vmlease/summary.py` for the full shape.
+
+## CI integration & exit codes
+
+> **CI gates on `summarize`, never on `run`.** `vmlease run`'s exit code reflects only the run *mechanics*
+> (provisioning / teardown) — it does **not** parse `*_OK`/`*_FAIL` tokens or assertion verdicts, and a soft
+> prep fail leaves it running. The trustworthy pass/fail verdict — including `PREP_HARD_FAIL` → non-zero —
+> lives in `summarize`'s exit code. Always gate on `vmlease summarize <raw>; echo $?`, not on `run`.
+
+Per-verb exit codes:
+
+| Verb | `0` | non-zero |
+|------|-----|----------|
+| `plan` | plan rendered | `2` on a battery-load / cost-guard / upload-validation error |
+| `run` | run completed (mechanics OK) | `1` on a provisioning/teardown failure; `2` on a load/guard/key error. **Never reflects probe verdicts.** |
+| `lint` | clean (no finding ≥ `--severity`, no structural violation) | `1` on any finding at/above severity **OR** the structural no-verdict-source violation (always fatal) |
+| `summarize` | all probes `PASS` / `PASS_NO_ASSERTIONS` (and no `PREP_HARD_FAIL`) | `1` iff any **failing verdict** is present; `2` on unreadable/invalid raw input or a bad `--battery` |
+| `reap-images` | reaped (or `--dry-run`) | `1` on a delete/list failure; `2` on a usage refusal (no selector given) |
+
+The **failing verdicts** that make `summarize` exit non-zero are `FAIL`, `TIMEOUT`, and `PREP_HARD_FAIL`.
+A `PREP_SOFT_FAIL` is surfaced in `totals` but does **not** by itself force a non-zero exit (your CI may
+still choose to fail on it by inspecting the summary).
+
+```bash
+vmlease run       --battery b.toml --run-token ci --results-dir ./out --timestamp "$CI_RUN" --yes
+vmlease summarize ./out/vmlease-ci-"$CI_RUN".json --battery b.toml   # THIS exit code is your CI gate
+```
 
 ## Caching (snapshot image cache)
 
@@ -188,12 +391,15 @@ content-addressed labelled snapshot, and deletes the builder. Building is **alwa
 
 ```
 vmlease build-image --distro <key> --run-token <slug> \
-        [--server-type cpx22] [--operator probe] [--rebuild] [--max-images 10] \
+        [--server-type cpx22] [--operator probe] [--requires docker] [--rebuild] [--max-images 10] \
         [--ssh-key <name> --ssh-key-path <path>] [--firewall <name>] [--yes]
 ```
 
 - `--distro` — the distro key to build (e.g. `ubuntu`, `arch`); an unknown key exits 2.
 - `--server-type` — builder instance size; **defaults to `cpx22`** (cost-guard allowlisted).
+- `--requires` — capability to bake into this variant (e.g. `docker`); repeatable; default builds the
+  capability-less variant. A `--requires docker` image is a distinct cache key and never supersedes the
+  docker-less one.
 - `--rebuild` — replace the existing same-key image (drops the older-created same-key image).
 - `--max-images` — vmlease's own self-cap (default `10`); see *No auto-TTL* below.
 - `--ssh-key` / `--ssh-key-path` — the hcloud-registered key name + matching local private key, **required
@@ -205,7 +411,9 @@ vmlease build-image --distro <key> --run-token <slug> \
 A `run` automatically restores from a cached image when one **matches** — same content key, same
 architecture, and the snapshot fits the chosen server's disk. On a hit, the host is created directly from
 the snapshot with a **minimal key-only cloud-init**, skipping both the rescue-write *and* the package
-install. A `run` **consumes but never builds** — it makes zero `create_image` calls.
+install. A `run` **consumes but never builds** — it makes zero `create_image` calls. Each host's results
+record **`restored_image`** — the snapshot id it restored from on a hit, or `null` on a cold miss — so a
+cache hit/miss is observable in the results (a permanent silent miss can't hide behind passing probes).
 
 The cache is **advisory, never load-bearing**: a miss — no matching image, an oversized image, a vanished
 snapshot, or any cache/lookup failure — is a **graceful fall-back to the cold path**. It just doesn't save
@@ -228,6 +436,8 @@ vmlease reap-images [--distro <key>] [--older-than <ISO-8601>] [--superseded] [-
 - `--superseded` — reap off-current-key images; each group's current key is resolved fail-safe, and any
   unresolvable group is **kept and warned**, never blindly deleted.
 - `--dry-run` — report what *would* be deleted and delete nothing (the preview/safety gate).
+
+A bare `reap-images` with no selector is **refused** (exit `2`) — never an implicit whole-cache wipe.
 
 ### The content key
 
@@ -256,6 +466,22 @@ The cache is **fully backward compatible and opt-in**. Adopting it requires no c
 change — a `run` with no matching cached image behaves exactly as before. To **roll back**: stop running
 `build-image`, and/or `reap-images` the existing snapshots — `run` reverts to the cold path automatically,
 with no code change.
+
+### Arch / rescue-write: the SSH key requirement
+
+A `run` or `build-image` whose matrix touches a **rescue-write distro** (currently only `arch`, which has no
+native Hetzner image and is written via the GPG-verified rescue system) requires **two distinct SSH keys**,
+both validated **before any spend**:
+
+- `--ssh-key` — the name of an **hcloud-registered** key, injected into the rescue system so its root login
+  accepts you;
+- `--ssh-key-path` — the **matching local private key**, used for the root SSH into that rescue system.
+
+Both are required **up front**, even for a `run` that is likely to be a cache hit: the hit/miss decision is
+only known *after* provisioning, so a miss can still fall through to a rescue-write, and the harness refuses
+to provision anything it might not be able to finish. These two keys are **distinct from** the throwaway,
+per-run keypair vmlease generates for the operator's (`probe`) probe SSH — that one is created and cleaned up
+automatically and is never the rescue key.
 
 ## Development
 
