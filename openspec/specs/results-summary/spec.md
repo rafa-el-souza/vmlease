@@ -1,7 +1,10 @@
 # results-summary Specification
 
 ## Purpose
-TBD - created by archiving change results-summarize. Update Purpose after archive.
+Define the `summarize` verdict layer over a raw results file: a versioned companion summary carrying
+per-host probe and `prep_phase` verdicts, a matrix pivot, and totals, plus the overall exit code that
+makes a run gate-able (non-zero on any failing probe verdict or a `PREP_HARD_FAIL`). CI gates on
+`summarize`, never on `run`.
 ## Requirements
 ### Requirement: Summarize subcommand reads a raw results file and writes a versioned companion
 

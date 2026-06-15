@@ -1,7 +1,12 @@
 # battery-prep Specification
 
 ## Purpose
-TBD - created by archiving change battery-prep-and-requires. Update Purpose after archive.
+Define the battery's optional `[prep]` phase — a runtime, SSH-executed step (after host readiness,
+before probes) that installs `[prep.packages]` and runs `[[prep.setup]]` steps to bring a host to the
+state a workload needs. Specifies the schema (manager/distro package selectors, per-step `run`/`script`,
+`distros` allowlist, `required`, `timeout`), the execution order, and the soft/hard failure semantics
+(a `required=false` step records and continues; a hard failure returns a zero-probe run that summarize
+counts and exits non-zero on).
 ## Requirements
 ### Requirement: A battery may declare a prep phase of per-distro packages and setup steps
 

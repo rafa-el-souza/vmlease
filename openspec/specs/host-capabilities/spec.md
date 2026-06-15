@@ -1,7 +1,11 @@
 # host-capabilities Specification
 
 ## Purpose
-TBD - created by archiving change battery-prep-and-requires. Update Purpose after archive.
+Define vmlease-provided host capabilities — opt-in, default-off prerequisites (v1: `docker`) a battery
+declares via `requires`. Each capability is a per-package-manager recipe (packages + an optional setup
+fragment) held in a read-only registry and injected into the host's rendered cloud-init only when
+required, so a host is docker-free unless it asks for docker. Covers the registry model, the
+required-only render, and the unsupported-on-this-manager error.
 ## Requirements
 ### Requirement: A battery opts in to vmlease-provided capabilities via `requires`, default-off
 
