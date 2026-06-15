@@ -432,8 +432,14 @@ def _run_one_host(
     # ``Exception`` mapped above, or raised a ``BaseException`` (which re-propagated
     # past the scaffold; in that case this fold does not run, but neither does the
     # caller need a HostRun — the abort unwinds).
+    # Stamp the restore decision so the results are observable: a host created from
+    # the restore candidate (chosen index 0 == restored_index) carries the snapshot
+    # id; a cold/miss provision carries None. Covers the success path AND G4 (a
+    # restored host that failed after create — it WAS restored).
+    was_restored = bool(chosen) and chosen[0] == restored_index and restore_image_id is not None
+    run = replace(run, restored_image=restore_image_id if was_restored else None)
     if note_sink:
-        run = HostRun(host_spec=run.host_spec, detail=f"{run.detail}\n{note_sink[0]}", results=run.results)
+        run = replace(run, detail=f"{run.detail}\n{note_sink[0]}")
     return run
 
 

@@ -4012,6 +4012,9 @@ class TestCliRun(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(prov.created[0].image, "img-docker")  # docker variant restored
             self.assertEqual(prov.created_images, [])  # run never builds
+            # the restore is OBSERVABLE in the results (the cache-HIT oracle)
+            doc = json.loads(next((Path(d) / "r").glob("*.json")).read_text())
+            self.assertEqual(doc["hosts"][0]["restored_image"], "img-docker")
 
     def test_run_docker_less_battery_misses_docker_cache_image(self) -> None:
         # 4.4b: the OTHER side of the guard — a docker-less (no `requires`) run
@@ -4039,6 +4042,9 @@ class TestCliRun(unittest.TestCase):
             self.assertEqual(rc, 0)
             # cold path: a brand-new host was created (NOT the docker snapshot).
             self.assertNotEqual(prov.created[0].image, "img-docker")
+            # and the miss is OBSERVABLE: restored_image is null (not a false HIT)
+            doc = json.loads(next((Path(d) / "r").glob("*.json")).read_text())
+            self.assertIsNone(doc["hosts"][0]["restored_image"])
 
     def test_run_success_writes_results(self) -> None:
         # stub the provider + keypair + ssh so the run path executes end-to-end

@@ -355,12 +355,19 @@ class HostRun:
     failure returns a :class:`HostRun` carrying the failing step in ``prep_phase``
     with empty ``results`` — the failure is NOT raised, so the summary path can
     count it (raising would discard the workload's return value).
+
+    ``restored_image`` is the cached snapshot id the host was actually created from
+    on a cache HIT, else ``None`` (a cold/miss provision). It makes the
+    restore-vs-cold decision observable in the results so a smoke can assert the
+    cache was used (a permanent-miss bug otherwise passes silently — docker is
+    re-installed cold every run and every functional probe still goes green).
     """
 
     host_spec: HostSpec
     detail: str
     results: tuple[ProbeResult, ...]
     prep_phase: tuple[PrepStepResult, ...] = ()
+    restored_image: str | None = None
 
 
 @dataclass(frozen=True)
