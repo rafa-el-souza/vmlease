@@ -3722,6 +3722,43 @@ class TestKeepFlag(unittest.TestCase):
             self.assertIn("`vmlease reap --run-token cli-keep`", block)  # backticked reap hint
             self.assertIn(str(kept_kp.directory), block)  # surviving key-dir note
 
+    def test_cli_keep_abort_does_not_reap_kept_hosts(self) -> None:
+        # BLOCKER regression (F-010): a Ctrl-C during a --keep run must NOT reap the
+        # host the per-host teardown finally deliberately kept. Before the fix the
+        # abort backstop in _cmd_run reaped the run label UNCONDITIONALLY, destroying
+        # the very kept host the operator aborted in order to go SSH into. Drive
+        # _cmd_run with --keep --yes and a workload that raises KeyboardInterrupt
+        # mid-probe: the host is created, kept by the finally (it stays in the
+        # provider's live set), the KeyboardInterrupt re-raises out of _cmd_run, and
+        # the kept host is NEVER destroyed. Without the fix, reap() would find the
+        # still-live host by label and prov.destroyed would hold it.
+        from unittest import mock
+
+        class _InterruptingSsh(FakeSshRunner):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu", "--keep", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            kp = _fake_keypair(Path(d))
+            prov = FakeProvider()
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                    mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _InterruptingSsh()), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err), \
+                    self.assertRaises(KeyboardInterrupt):
+                cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(len(prov.created), 1)  # the host WAS provisioned...
+            self.assertEqual(prov.destroyed, [])  # ...and NOT reaped despite the abort
+            msg = err.getvalue()
+            self.assertIn("not reaped", msg)  # the operator is told it was left LIVE
+            self.assertIn("`vmlease reap --run-token cli-keep`", msg)  # + how to reap later
+
 
 class _ScriptedTimeoutSsh:
     """An SshRunner whose ``run_probe`` returns timed-out results for named probes.

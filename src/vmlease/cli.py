@@ -289,6 +289,22 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             keep=args.keep,
         )
     except (KeyboardInterrupt, SystemExit):
+        if args.keep:
+            # --keep deliberately leaves hosts standing — the per-host teardown
+            # ``finally`` already honoured keep and left the live host(s) up. The
+            # backstop reap MUST NOT undo that: reaping the run label here would
+            # destroy the very hosts the operator asked to keep (the whole point
+            # of aborting a --keep run is to go SSH into them). We cannot enumerate
+            # the live set here (``execute`` never returned), so point the operator
+            # at the run label + reap command instead of reaping, then RE-RAISE.
+            print(
+                f"aborted — --keep left host(s) labelled vmlease={run_id} LIVE "
+                f"(not reaped); reap when done: "
+                f"`vmlease reap --run-token {args.run_token}`",
+                file=sys.stderr,
+            )
+            print(f"partial results: {writer.path}", file=sys.stderr)
+            raise
         # Aborted mid-run: the per-host hosts that finished are already on disk
         # (writer.add ran for each). Reap the run label so no billable host is
         # left orphaned, note where the partial results are, then RE-RAISE so the
