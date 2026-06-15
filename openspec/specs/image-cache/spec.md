@@ -4,13 +4,20 @@
 TBD - created by archiving change snapshot-image-cache. Update Purpose after archive.
 ## Requirements
 ### Requirement: build-image produces a content-addressed snapshot of a prepped host
+
 The `vmlease build-image <distro>` command SHALL provision a builder host, run the full OS-level prep
 (rescue-write for rescue-write distros plus cloud-init package install), wait for readiness, sysprep the
 host, power it off, create a provider snapshot, and destroy the builder. The snapshot's labels SHALL be
 applied in the same provider call that creates it (atomic), so no cache image ever exists unlabelled.
 build-image SHALL carry a run token that labels its builder as a run host, so on abort or a
 builder-teardown failure the builder is reaped by that label, any already-created image is kept, and a
-teardown failure exits non-zero.
+teardown failure exits non-zero. Because the cache key reflects required capabilities, build-image SHALL
+accept a `--requires` option naming the capabilities to bake (default: none); the same capability set
+SHALL flow into the rendered cloud-init and the content key, and SHALL be recorded on the image's labels.
+A `build-image` with no `--requires` builds the capability-less variant; to cache a docker variant the
+builder is run with `--requires docker`. The `--requires` option SHALL be repeatable, and its values SHALL
+be canonicalized (sorted, deduplicated) by the **same helper** the run path uses to lift `requires` from the
+battery — so build-image and run cannot compute divergent keys from one parser inventing a different order.
 
 #### Scenario: Building a cache image for a native distro
 - **WHEN** `build-image ubuntu` runs and no image with the current content key exists
@@ -28,6 +35,10 @@ teardown failure exits non-zero.
 #### Scenario: An aborted build reaps the builder and keeps any created image
 - **WHEN** build-image is interrupted, or its builder teardown fails
 - **THEN** the builder is reaped by its run label, any already-created image is kept, and a teardown failure exits non-zero
+
+#### Scenario: A capability variant is built and matches at run
+- **WHEN** `build-image ubuntu --requires docker` runs, and later a `run` provisions ubuntu from a battery requiring docker
+- **THEN** both render the same docker cloud-init, compute the same content key, and the run restores the docker variant; a docker-less ubuntu run computes a different key and does not match this image
 
 ### Requirement: Sysprep precedes the snapshot and its failure aborts the build
 build-image SHALL clear `/etc/machine-id` (and the dbus machine-id) on the prepped host before powering
@@ -48,11 +59,17 @@ off state within that bound, build-image SHALL abort and tear down the builder.
 - **THEN** no snapshot is created and the build aborts
 
 ### Requirement: The content key is derived from the base-image fingerprint and the rendered cloud-init
+
 The cache content key SHALL be `v1-<distro>-<hash>`, where the hash covers the base-image fingerprint
 (rescue-write distro: the resolved image digest; native: the immutable provider image id; golden: the
 pinned digest) and the canonically-rendered cloud-init (rendered with a placeholder operator public key so
-the per-run key is excluded). The same key SHALL be produced by both build-image (to label) and run (to
-look up) from one shared function.
+the per-run key is excluded). Because the rendered cloud-init reflects the battery's required capabilities
+(a required capability's recipe is injected into the render, an unrequired one is absent), a change to the
+required-capability set changes the rendered cloud-init and therefore the key — there SHALL be no separate
+`requires` term in the hash. To keep the key stable, capability recipes SHALL be injected in a **canonical
+order — the sorted, deduplicated** required-capability set — so the declared order of `requires` (and any
+duplicates) cannot perturb the rendered bytes or the key. The same key SHALL be produced by both build-image
+(to label) and run (to look up) from one shared function.
 
 #### Scenario: Identical recipe yields an identical key
 - **WHEN** two build-image runs use the same distro, architecture, recipe, and resolved upstream
@@ -62,16 +79,37 @@ look up) from one shared function.
 - **WHEN** the distro profile's package set changes
 - **THEN** the content key changes and the next run rebuilds rather than reusing the stale image
 
+#### Scenario: A change to required capabilities yields a new key
+- **WHEN** a battery's `requires` changes (e.g. `[]` → `["docker"]`), altering the rendered cloud-init
+- **THEN** the content key changes, so a docker host and a docker-less host of the same distro occupy distinct cache entries
+
+#### Scenario: Required-capability order does not affect the key
+- **WHEN** two runs declare the same capabilities in different order or with duplicates (e.g. `["a","b"]` vs `["b","a","b"]`)
+- **THEN** recipes are injected in canonical sorted-deduplicated order and both runs compute the identical content key
+
 ### Requirement: build-image prunes its own superseded predecessors
-After building the current image for a (distro, architecture) group, build-image SHALL delete every cached
-image of that same group whose key differs from the new key, keeping at most one current image per group.
-When not at the image cap it SHALL build first then prune; when at the cap it SHALL prune the superseded
-set first to free slots then build, refusing only if no same-group superseded image exists. build-image
-SHALL NOT prune images of other distros.
+
+build-image SHALL prune superseded predecessors after building the current image: it SHALL delete every
+cached image of the same (distro, architecture, required-capability set) group whose key differs from the
+new key, keeping at most one current image per group. The required-capability set SHALL be part of the
+group identity, carried on the image labels as a **short stable hash of the sorted, deduplicated
+required-capability set** — `sha256` of the NUL-joined sorted-deduplicated set, first 16 hex, computed by
+the single shared helper used by both build-image and run (not the raw joined list — so the group identity
+stays collision-safe and within the label length bound as the capability vocabulary grows beyond the v1
+single `docker`). A docker image and a
+docker-less image of the same distro and architecture therefore hash to distinct groups and SHALL NOT
+supersede one another. When not at the image cap it
+SHALL build first then prune; when at the cap it SHALL prune the superseded set first to free slots then
+build, refusing only if no same-group superseded image exists. build-image SHALL NOT prune images of other
+distros, other architectures, or other required-capability sets.
 
 #### Scenario: Rebuilding a rolling distro reclaims the old slot
-- **WHEN** `build-image arch` builds a new key and an older Arch image with a different key exists
+- **WHEN** `build-image arch` builds a new key and an older Arch image with a different key but the same required-capability set exists
 - **THEN** the older Arch image is deleted and the new one is kept
+
+#### Scenario: A docker variant does not supersede the docker-less variant
+- **WHEN** `build-image ubuntu --requires docker` builds and a docker-less ubuntu image of the same architecture exists
+- **THEN** the docker-less image is NOT pruned (it is a different group)
 
 #### Scenario: At the cap with nothing to prune refuses before provisioning
 - **WHEN** at the image cap and no same-group superseded image exists
@@ -122,4 +160,21 @@ private half) and validate its presence BEFORE provisioning the builder or gener
 #### Scenario: Missing rescue key refuses early
 - **WHEN** `build-image arch` runs without the rescue key
 - **THEN** it refuses before provisioning any host
+
+### Requirement: A run records which cache image it restored from
+
+A `run` SHALL record, per host in its raw results document, the cache image id the host was restored
+from on a cache hit, or null when the host was provisioned cold (a miss). This makes the restore
+decision observable: a permanent cache miss — every run cold-rebuilding the prepped state — is
+otherwise indistinguishable from a hit because the host's probes pass either way. The recorded id
+SHALL be the snapshot the host was actually created from (the restore candidate), so a docker run
+that hits a docker variant records that image, and a docker-less run that does not match it records null.
+
+#### Scenario: A cache hit records the restored image id
+- **WHEN** a run provisions a host that matches an existing cache image and is created from that snapshot
+- **THEN** the host's results record the restored image id (equal to the snapshot's id)
+
+#### Scenario: A cache miss records no restored image
+- **WHEN** a run provisions a host cold (no matching cache image, or a different required-capability variant)
+- **THEN** the host's results record a null restored image
 
