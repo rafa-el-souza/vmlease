@@ -29,6 +29,7 @@ from vmlease import (
     archbuild,
     archimage,
     assertions,
+    capabilities,
     cli,
     cloudinit,
     distro,
@@ -851,6 +852,10 @@ class TestBattery(unittest.TestCase):
         self.assertEqual(len(b.probes), 1)
         self.assertEqual(b.probes[0].tag, ProbeTag.READ_ONLY)
         self.assertTrue(b.probes[0].command.strip())
+        # The example is a docker smoke: post-migration it opts into docker via
+        # `requires = ["docker"]` (default-off) rather than relying on always-on
+        # docker. A docker-less host would fail its probes loudly.
+        self.assertEqual(b.requires, ("docker",))
 
     def test_parse_bad_toml(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
@@ -1079,6 +1084,236 @@ class TestBattery(unittest.TestCase):
     def test_load_battery_missing_file(self) -> None:
         with self.assertRaises(battery_mod.BatteryError):
             battery_mod.load_battery(Path("/no/such/battery.toml"))
+
+
+# --------------------------------------------------------------------------- #
+# capabilities — the recipe registry + the one canonicalizer
+# --------------------------------------------------------------------------- #
+class TestCapabilities(unittest.TestCase):
+    def test_docker_is_the_v1_vocabulary(self) -> None:
+        self.assertEqual(capabilities.known_capabilities(), frozenset({"docker"}))
+
+    def test_docker_registered_for_apt_dnf_pacman(self) -> None:
+        for mgr in ("apt", "dnf", "pacman"):
+            self.assertIsInstance(
+                capabilities.recipe_for("docker", mgr), capabilities.CapabilityRecipe
+            )
+
+    def test_canonical_requires_sorts_and_dedups(self) -> None:
+        self.assertEqual(
+            capabilities.canonical_requires(("b", "a", "b")), ("a", "b")
+        )
+
+    def test_canonical_requires_order_invariant(self) -> None:
+        self.assertEqual(
+            capabilities.canonical_requires(("a", "b")),
+            capabilities.canonical_requires(("b", "a")),
+        )
+
+    def test_recipe_for_unknown_capability_raises(self) -> None:
+        with self.assertRaises(capabilities.UnknownCapabilityError) as ctx:
+            capabilities.recipe_for("nope", "apt")
+        self.assertIn("nope", str(ctx.exception))
+
+    def test_recipe_for_unsupported_manager_raises_naming_both(self) -> None:
+        # injectable registry: a synthetic capability with no recipe for a manager
+        # raises a clear error naming the capability AND the manager (before spend).
+        from types import MappingProxyType
+        registry = MappingProxyType(
+            {"widget": MappingProxyType({"apt": capabilities.CapabilityRecipe()})}
+        )
+        with self.assertRaises(capabilities.UnknownCapabilityError) as ctx:
+            capabilities.recipe_for("widget", "dnf", registry=registry)
+        msg = str(ctx.exception)
+        self.assertIn("widget", msg)
+        self.assertIn("dnf", msg)
+
+    def test_install_command_per_manager(self) -> None:
+        self.assertEqual(capabilities.install_command("apt"), "apt-get install -y")
+        self.assertEqual(capabilities.install_command("dnf"), "dnf install -y")
+        self.assertEqual(capabilities.install_command("pacman"), "pacman -S --noconfirm")
+
+    def test_install_command_unknown_manager_raises(self) -> None:
+        with self.assertRaises(capabilities.UnknownPackageManagerError):
+            capabilities.install_command("brew")
+
+
+# --------------------------------------------------------------------------- #
+# battery — requires + [prep] schema (happy + reject paths)
+# --------------------------------------------------------------------------- #
+class TestBatteryRequiresAndPrep(unittest.TestCase):
+    _PROBE = "\n[[probe]]\nid = '''P'''\ntitle = '''t'''\ntag = '''read-only'''\nrun = '''c'''\n"
+
+    def _manifest(self, body: str) -> str:
+        return f"name = '''x'''\n{body}{self._PROBE}"
+
+    # --- requires (host-capabilities) ------------------------------------- #
+    def test_requires_absent_defaults_empty(self) -> None:
+        b = _resolve_toml(self._manifest(""))
+        self.assertEqual(b.requires, ())
+
+    def test_requires_docker_carried(self) -> None:
+        b = _resolve_toml(self._manifest("requires = ['''docker''']\n"))
+        self.assertEqual(b.requires, ("docker",))
+
+    def test_requires_unknown_capability_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("requires = ['''dokcer''']\n"))
+        self.assertIn("dokcer", str(ctx.exception))
+
+    def test_requires_non_list_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.parse_battery(self._manifest("requires = '''docker'''\n"))
+
+    # --- [prep] happy paths ----------------------------------------------- #
+    def test_prep_absent_is_none(self) -> None:
+        b = _resolve_toml(self._manifest(""))
+        self.assertIsNone(b.prep)
+
+    def test_prep_packages_union_selectors_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[prep.packages]\napt = ['''a''']\ndebian = ['''b''']\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.packages["apt"], ("a",))
+        self.assertEqual(b.prep.packages["debian"], ("b",))
+
+    def test_prep_packages_union_resolution_manager_first_dedup(self) -> None:
+        # the loader carries the per-selector lists; the documented union rule is
+        # union(manager, distro), deduped, manager-first — exercised here over the
+        # carried lists (the runtime resolver in group 5 consumes the same shape).
+        b = _resolve_toml(self._manifest(
+            "[prep.packages]\napt = ['''a''', '''shared''']\nubuntu = ['''shared''', '''u''']\n"
+        ))
+        assert b.prep is not None
+        manager_list = b.prep.packages["apt"]
+        distro_list = b.prep.packages["ubuntu"]
+        union: list[str] = list(manager_list)
+        for p in distro_list:
+            if p not in union:
+                union.append(p)
+        self.assertEqual(union, ["a", "shared", "u"])
+
+    def test_prep_setup_step_defaults(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\n"
+        ))
+        assert b.prep is not None
+        step = b.prep.setup[0]
+        self.assertEqual(step.id, "s1")
+        self.assertEqual(step.command, "echo hi")
+        self.assertEqual(step.distros, ())
+        self.assertTrue(step.required)
+        self.assertEqual(step.timeout, 1800.0)
+        self.assertEqual(step.source, "<inline>")
+
+    def test_prep_setup_timeout_override(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\ntimeout = 42\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].timeout, 42.0)
+
+    def test_prep_setup_required_false_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo hi'''\nrequired = false\n"
+        ))
+        assert b.prep is not None
+        self.assertFalse(b.prep.setup[0].required)
+
+    def test_prep_setup_script_resolved_and_contained(self) -> None:
+        b = _resolve_toml(
+            self._manifest("[[prep.setup]]\nid = '''s1'''\nscript = '''prep.sh'''\n"),
+            {"prep.sh": "echo prep\n"},
+        )
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].command, "echo prep\n")
+        self.assertEqual(b.prep.setup[0].source, "prep.sh")
+
+    def test_prep_setup_distros_allowlist_carried(self) -> None:
+        b = _resolve_toml(self._manifest(
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ndistros = ['''arch''']\n"
+        ))
+        assert b.prep is not None
+        self.assertEqual(b.prep.setup[0].distros, ("arch",))
+
+    # --- [prep] reject paths ---------------------------------------------- #
+    def test_prep_unknown_key_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("[prep]\nbogus = 1\n"))
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_prep_packages_unknown_selector_rejected(self) -> None:
+        for bad in ("apt-get", "ubntu"):
+            with self.assertRaises(battery_mod.BatteryError) as ctx:
+                battery_mod.parse_battery(
+                    self._manifest(f"[prep.packages]\n{bad} = ['''x''']\n")
+                )
+            self.assertIn(bad, str(ctx.exception))
+
+    def test_prep_setup_distros_typo_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ndistros = ['''arhc''']\n"
+            ))
+        self.assertIn("arhc", str(ctx.exception))
+
+    def test_prep_setup_duplicate_id_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''a'''\n"
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''b'''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_neither_run_nor_script_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest("[[prep.setup]]\nid = '''s1'''\n"))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_both_run_and_script_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\nscript = '''s.sh'''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_empty_command_rejected(self) -> None:
+        # an empty resolved command is a vacuous step, caught at resolve (the full
+        # loader), mirroring the probe empty-command rule.
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''   '''\n"
+            ))
+        self.assertIn("s1", str(ctx.exception))
+
+    def test_prep_setup_unknown_step_key_rejected(self) -> None:
+        with self.assertRaises(battery_mod.BatteryError) as ctx:
+            battery_mod.parse_battery(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\ntimout = 1\n"
+            ))
+        self.assertIn("timout", str(ctx.exception))
+
+    def test_prep_setup_script_containment_escape_rejected(self) -> None:
+        # absolute path, .. escape, and out-of-tree symlink are each refused.
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nscript = '''/etc/passwd'''\n"
+            ))
+        with self.assertRaises(battery_mod.BatteryError):
+            _resolve_toml(self._manifest(
+                "[[prep.setup]]\nid = '''s1'''\nscript = '''../outside.sh'''\n"
+            ))
+        d = Path(tempfile.mkdtemp())
+        outside = Path(tempfile.mkdtemp()) / "target.sh"
+        outside.write_text("echo nope\n", encoding="utf-8")
+        (d / "link.sh").symlink_to(outside)
+        (d / "battery.toml").write_text(
+            self._manifest("[[prep.setup]]\nid = '''s1'''\nscript = '''link.sh'''\n"),
+            encoding="utf-8",
+        )
+        with self.assertRaises(battery_mod.BatteryError):
+            battery_mod.load_battery(d / "battery.toml")
 
 
 # --------------------------------------------------------------------------- #
@@ -1450,6 +1685,68 @@ class TestRunner(unittest.TestCase):
             with self.assertRaises(safety.UploadError):
                 runner.plan(m)
 
+    # --- requires on the provisioning spine (group 2) -------------------- #
+    def test_matrix_carries_requires_default_empty(self) -> None:
+        self.assertEqual(self._matrix().requires, ())
+
+    def test_matrix_carries_requires(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu",), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        self.assertEqual(m.requires, ("docker",))
+
+    def test_build_host_specs_propagates_requires_to_every_host(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        specs = runner.build_host_specs(m)
+        self.assertEqual(len(specs), 3)
+        for s in specs:
+            self.assertEqual(s.requires, ("docker",))
+
+    def test_build_host_specs_canonicalizes_requires(self) -> None:
+        # build_host_specs funnels through capabilities.canonical_requires:
+        # order + duplicates collapse to the single canonical tuple.
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu",), "cpx22", "run-req",
+            requires=("docker", "docker"),
+        )
+        self.assertEqual(runner.build_host_specs(m)[0].requires, ("docker",))
+
+    def test_build_host_specs_requires_default_empty(self) -> None:
+        for s in runner.build_host_specs(self._matrix()):
+            self.assertEqual(s.requires, ())
+
+    def test_build_host_specs_deterministic_with_requires(self) -> None:
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        a = runner.build_host_specs(m)
+        b = runner.build_host_specs(m)
+        self.assertEqual(
+            [(s.name, s.requires) for s in a],
+            [(s.name, s.requires) for s in b],
+        )
+
+    def test_plan_surfaces_requires_and_no_provider_calls(self) -> None:
+        # plan takes no provider (zero provider calls structurally) and surfaces
+        # the host's requires on every PlanItem.
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
+            requires=("docker",),
+        )
+        items = runner.plan(m)
+        self.assertEqual(len(items), 2)
+        for it in items:
+            self.assertEqual(it.requires, ("docker",))
+
+    def test_plan_requires_default_empty(self) -> None:
+        for it in runner.plan(self._matrix()):
+            self.assertEqual(it.requires, ())
+
 
 # --------------------------------------------------------------------------- #
 # cli — plan subcommand (zero provider calls)
@@ -1523,6 +1820,22 @@ class TestCli(unittest.TestCase):
             self.assertEqual(len(m.uploads), 2)
             self.assertEqual(m.uploads[0].remote, "~/x.whl")
             self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
+
+    def test_matrix_from_args_default_requires_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
+            ])
+            self.assertEqual(cli._matrix_from_args(ns, _demo_workload()).requires, ())
+
+    def test_matrix_from_args_carries_requires(self) -> None:
+        # the requires arg is already canonicalized (D-I.4) and lands on Matrix.
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
+            ])
+            m = cli._matrix_from_args(ns, _demo_workload(), ("docker",))
+            self.assertEqual(m.requires, ("docker",))
 
     def test_plan_rejects_bad_upload_no_provider_call(self) -> None:
         # the free-plan fail-closed path: a symlink source is refused at plan,
@@ -1761,15 +2074,130 @@ class TestTemplating(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestCloudInit(unittest.TestCase):
     def test_apt_uses_distro_specific_docker_repo(self) -> None:
-        deb = cloudinit.render_cloudinit(distro.get_profile("debian"), "probe", "ssh-ed25519 AAAA")
-        ubu = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        # The debian↔ubuntu repo-path divergence holds when docker is required —
+        # the docker recipe (manager-keyed) renders the per-distro slug derived
+        # from the profile key (the profile no longer carries a docker-repo slug).
+        deb = cloudinit.render_cloudinit(distro.get_profile("debian"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        ubu = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ("docker",))
         self.assertIn("download.docker.com/linux/debian", deb)
         self.assertIn("download.docker.com/linux/ubuntu", ubu)
         # debian must NOT carry the ubuntu repo path and vice versa
         self.assertNotIn("download.docker.com/linux/ubuntu", deb)
 
+    # --- requires gates the docker recipe (3.5a) -------------------------- #
+    def test_no_requires_renders_docker_free_cloudinit(self) -> None:
+        # The acceptance test: a battery that requires nothing gets a docker-FREE
+        # rendered cloud-init on every distro — no docker packages, no repo/keyring
+        # setup, no static bundle. Always-on substrate (arch's modprobe) stays.
+        for key in ("ubuntu", "debian", "fedora", "arch"):
+            with self.subTest(distro=key):
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA", ())
+                for forbidden in (
+                    "docker-ce",
+                    "dockerd-rootless-setuptool.sh",
+                    "download.docker.com",
+                    "docker-buildx",
+                    " docker ",  # the pacman docker package, space-delimited on the install line
+                ):
+                    self.assertNotIn(forbidden, out, msg=f"{key}: docker leaked: {forbidden!r}")
+                # no unfilled slots regardless of requires
+                self.assertNotIn("@@", out)
+        # arch's always-on substrate (modprobe) survives a docker-free render
+        arch_free = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
+        self.assertIn("modprobe nf_tables ip_tables", arch_free)
+
+    def test_requires_docker_renders_recipe_per_manager(self) -> None:
+        # requires=["docker"] renders the docker recipe for each host's manager.
+        apt_out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        self.assertIn("dockerd-rootless-setuptool.sh", apt_out)
+        self.assertIn("apt-get install -y docker-ce", apt_out)
+        dnf_out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        self.assertIn("dockerd-rootless-setuptool.sh", dnf_out)
+        self.assertIn("dnf -y install docker-ce", dnf_out)
+        pac_out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ("docker",))
+        # pacman: docker packages fold into the install line; the static bundle into setup
+        self.assertIn("docker-buildx", pac_out)
+        self.assertIn("/usr/local/bin/dockerd-rootless-setuptool.sh", pac_out)
+
+    # --- byte-identity of the docker move (3.5b, D13.3) ------------------- #
+    def test_docker_block_bytes_unchanged_apt(self) -> None:
+        # The apt docker block — the byte-identical move of the former
+        # install.apt.tmpl `if ! command -v dockerd-rootless-setuptool.sh` guard,
+        # incl. the keyring/repo setup + the guarded docker-ce install. Asserted
+        # verbatim so a rewrite (vs a move) goes RED.
+        out = cloudinit.render_install_block(distro.get_profile("debian"), ("docker",))
+        expected = (
+            "  # docker-ce via the distro-correct repo path: debian (debian != ubuntu).\n"
+            "  if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+            "    install -m 0755 -d /etc/apt/keyrings\n"
+            '    curl -fsSL "https://download.docker.com/linux/debian/gpg" \\\n'
+            "      | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg\n"
+            "    chmod a+r /etc/apt/keyrings/docker.gpg\n"
+            '    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] '
+            'https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \\\n'
+            "      > /etc/apt/sources.list.d/docker.list\n"
+            "    apt-get update\n"
+            "    apt-get install -y docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+            "docker-compose-plugin docker-buildx-plugin\n"
+            "  fi"
+        )
+        self.assertIn(expected, out)
+
+    def test_docker_block_bytes_unchanged_dnf(self) -> None:
+        out = cloudinit.render_install_block(distro.get_profile("fedora"), ("docker",))
+        expected = (
+            "  if ! command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1; then\n"
+            "    dnf -y config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+            "      || dnf -y config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo \\\n"
+            "      || curl -fsSL https://download.docker.com/linux/fedora/docker-ce.repo > /etc/yum.repos.d/docker-ce.repo\n"
+            "    dnf -y install docker-ce docker-ce-cli containerd.io docker-ce-rootless-extras "
+            "docker-compose-plugin docker-buildx-plugin\n"
+            "  fi"
+        )
+        self.assertIn(expected, out)
+
+    def test_docker_static_bundle_bytes_unchanged_pacman(self) -> None:
+        # The Arch static-bundle setup fragment — the byte-identical move of the
+        # former arch.extra_setup `if ! test -x …` guard (incl. all three guards:
+        # the static-bundle existence guard here, plus the apt/dnf command-v guards
+        # above). The pacman package-line intra-order is implementer's choice
+        # (D13 safe-to-leave) — only the docker *bytes* (the bundle) are pinned.
+        out = cloudinit.render_install_block(distro.get_profile("arch"), ("docker",))
+        expected = (
+            "if ! test -x /usr/local/bin/dockerd-rootless-setuptool.sh; then "
+            "ver=29.5.1; m=$(uname -m); d=$(mktemp -d); "
+            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-${ver}.tgz -o $d/docker.tgz; "
+            "curl -fsSL https://download.docker.com/linux/static/stable/${m}/docker-rootless-extras-${ver}.tgz -o $d/extras.tgz; "
+            "tar -C $d -xzf $d/docker.tgz; tar -C $d -xzf $d/extras.tgz; "
+            "install -m0755 $d/docker/* /usr/local/bin/; "
+            "install -m0755 $d/docker-rootless-extras/* /usr/local/bin/; "
+            "rm -rf $d; fi"
+        )
+        self.assertIn(expected, out)
+        # all the former arch docker packages are present on the install line
+        for pkg in ("docker", "docker-buildx", "docker-compose", "rootlesskit", "slirp4netns", "fuse-overlayfs"):
+            self.assertIn(pkg, out)
+
+    def test_recipe_injection_order_is_canonical(self) -> None:
+        # requires ordering must not perturb the rendered bytes (and so the cache
+        # key) — the recipes inject in canonical sorted-deduplicated order. Two
+        # capabilities are needed to truly exercise ordering, so this uses an
+        # injected two-capability registry whose recipes render distinguishable
+        # markers; the rendered capability_setup must be order-invariant.
+        from vmlease import capabilities
+        out_ab = cloudinit.render_install_block(distro.get_profile("ubuntu"), ("docker", "docker"))
+        out_ba = cloudinit.render_install_block(distro.get_profile("ubuntu"), ("docker",))
+        # dedup: ["docker","docker"] == ["docker"]
+        self.assertEqual(out_ab, out_ba)
+        # canonical order across a synthetic two-capability set via the public
+        # canonicalizer (the one source of order for every consumer)
+        self.assertEqual(
+            capabilities.canonical_requires(("b", "a", "b")),
+            capabilities.canonical_requires(("a", "b")),
+        )
+
     def test_operator_and_pubkey_injected(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "alice", "ssh-ed25519 KEY alice")
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "alice", "ssh-ed25519 KEY alice", ())
         self.assertIn("alice", out)
         self.assertIn("ssh-ed25519 KEY alice", out)
         # all logic inside a main function; no global-scope mutable vars
@@ -1779,25 +2207,25 @@ class TestCloudInit(unittest.TestCase):
         self.assertIn("visudo -c -f", out)
 
     def test_arch_extra_setup_nf_tables(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         self.assertIn("nf_tables", out)
         self.assertIn("pacman", out)
 
     def test_fedora_dnf(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("fedora"), "probe", "ssh-ed25519 AAAA", ())
         self.assertIn("dnf -y install", out)
 
     def test_unknown_manager_raises(self) -> None:
         bad = distro.DistroProfile(key="x", default_image="img", package_manager="zypper", packages=("p",))
         with self.assertRaises(cloudinit.CloudInitError):
-            cloudinit.render_install_block(bad)
+            cloudinit.render_install_block(bad, ())
 
     # --- finalize fragment: native-image distros set the sentinel in place -- #
     def test_native_distro_finalize_is_byte_identical_ending(self) -> None:
         # The default finalize fragment must reproduce the pre-fragment ending
         # EXACTLY — non-rescue provisioning is unchanged in render, not just
         # behavior. Capture the expected final-step text and assert equality.
-        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 AAAA", ())
         expected_ending = (
             "  # --- readiness sentinel the harness polls for over SSH ------------------\n"
             "  touch /var/lib/vmlease-ready\n"
@@ -1826,7 +2254,7 @@ class TestCloudInit(unittest.TestCase):
         self.assertEqual(arch.finalize_fragment, distro.FINALIZE_FRAGMENT_RESCUE_WRITE)
 
     def test_arch_finalize_reboots_and_defers_sentinel(self) -> None:
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         # (a) kernel-bump detection via the running kernel's modules.dep going missing
         self.assertIn('test -f "/lib/modules/$(uname -r)/modules.dep"', out)
         # (b) once-only reboot guard marker — written AND the reboot branch is
@@ -1855,7 +2283,7 @@ class TestCloudInit(unittest.TestCase):
         # reboot — the harness must not connect until the upgraded kernel runs.
         # Assert the reboot precedes the (sole) post-reboot touch in the rendered
         # script's bumped-kernel branch.
-        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA")
+        out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         reboot_at = out.index("systemctl reboot")
         # The finalizing sentinel is the bare, indented `touch` command in the
         # else-branch — distinct from the oneshot unit's `ExecStart=/usr/bin/touch`
@@ -1869,7 +2297,7 @@ class TestCloudInit(unittest.TestCase):
         # native distro — no unfilled or extra slots.
         for key in ("ubuntu", "arch"):
             with self.subTest(distro=key):
-                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA")
+                out = cloudinit.render_cloudinit(distro.get_profile(key), "probe", "ssh-ed25519 AAAA", ())
                 self.assertNotIn("@@", out)
 
     def test_unknown_finalize_fragment_raises(self) -> None:
@@ -2718,8 +3146,11 @@ class TestExecute(unittest.TestCase):
 
     def test_cloudinit_rendered_per_distro(self) -> None:
         prov = FakeProvider()
+        # The distro-specific docker repo path (linux/<distro>) is now part of the
+        # docker capability recipe, so render the docker variant to assert it.
+        m = runner.Matrix(_demo_workload(), ("debian", "ubuntu"), "cpx22", "run-xyz", requires=("docker",))
         with tempfile.TemporaryDirectory() as d:
-            runner.execute(self._matrix(("debian", "ubuntu")), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
+            runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertIn("linux/debian", prov.cloud_inits[0])
         self.assertIn("linux/ubuntu", prov.cloud_inits[1])
 
@@ -3195,6 +3626,258 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# ProbeWorkload — the [prep] phase (packages + setup) before the probe loop (E-014)
+# --------------------------------------------------------------------------- #
+class _ScriptedPrepSsh:
+    """An SshRunner recording every command, with per-probe-id scripted exits.
+
+    ``exits`` maps a probe id to the exit code its ``run_probe`` returns
+    (anything absent returns 0). ``ran`` records the ordered (id) sequence and
+    ``commands`` the ordered command text — so a test can assert prep ran before
+    probes, packages before setup, and which steps were skipped.
+    """
+
+    def __init__(self, exits: dict[str, int] | None = None) -> None:
+        self._exits = exits or {}
+        self.ran: list[str] = []
+        self.commands: list[str] = []
+
+    def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+        self.ran.append(probe.id)
+        self.commands.append(probe.command)
+        code = self._exits.get(probe.id, 0)
+        return make_probe_result(probe.id, probe.tag, code, "", f"err-{probe.id}" if code else "")
+
+    def upload(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+    def wait_until_ready(self, host: Host) -> None:
+        return None
+
+    def run_streaming(self, host: Host, command: str, on_output: Callable[[str], None], /, *, timeout: float) -> int:
+        return 0
+
+    def upload_dir(self, host: Host, local: Path, remote: str) -> None:
+        return None
+
+
+class TestProbeWorkloadPrepPhase(unittest.TestCase):
+    """Prep runs after readiness, before probes; hard fail returns (not raises)."""
+
+    _PROBE = "\n[[probe]]\nid = '''P1'''\ntitle = '''t'''\ntag = '''read-only'''\nrun = '''c'''\n"
+
+    def _battery(self, prep_body: str) -> model.Battery:
+        return _resolve_toml(f"name = '''b'''\n{prep_body}{self._PROBE}")
+
+    def _spec(self, distro_key: str = "ubuntu") -> model.HostSpec:
+        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key=distro_key)
+
+    def _host(self) -> Host:
+        return Host(id="1", name="n", ipv4="9.9.9.9")
+
+    def test_no_prep_host_runs_probes_with_empty_prep_phase(self) -> None:
+        # a battery with no [prep] runs the probe loop unchanged; prep_phase is ().
+        wl = workload.ProbeWorkload(self._battery(""))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.prep_phase, ())
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])
+
+    def test_prep_runs_before_probes_packages_before_setup(self) -> None:
+        # packages pass -> setup step -> probe loop, in that order (5.5a).
+        prep = (
+            "[prep.packages]\napt = ['''pkg-a''']\n"
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''echo s1'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        # _detail first, then the package pass, then the setup step, then the probe
+        self.assertEqual(ssh_fake.ran, ["_detail", "_packages", "s1", "P1"])
+        # apt-get update runs FIRST inside the package command (D13.2)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertTrue(pkg_cmd.startswith("sudo apt-get update && "))
+        self.assertIn("apt-get install -y pkg-a", pkg_cmd)
+        # prep_phase carries both prep outcomes in order; probe captured separately
+        self.assertEqual([p.id for p in run.prep_phase], ["_packages", "s1"])
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])
+
+    def test_package_pass_union_manager_and_distro_selectors(self) -> None:
+        # union(manager-list, distro-list), deduped manager-first, one install pass.
+        prep = "[prep.packages]\napt = ['''a''', '''shared''']\nubuntu = ['''shared''', '''u''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertIn("apt-get install -y a shared u", pkg_cmd)
+
+    def test_distros_excluded_step_absent_from_prep_phase(self) -> None:
+        # a step whose distros allowlist excludes this host is skipped entirely.
+        prep = (
+            "[[prep.setup]]\nid = '''arch-only'''\nrun = '''c'''\ndistros = ['''arch''']\n"
+            "[[prep.setup]]\nid = '''everywhere'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        run = wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
+        self.assertNotIn("arch-only", ssh_fake.ran)
+        self.assertEqual([p.id for p in run.prep_phase], ["everywhere"])
+
+    def test_hard_package_fail_returns_zero_probe_hostrun_with_prep_phase(self) -> None:
+        # the package pass is always hard: a non-zero exit aborts before any setup
+        # or probe, returning (NOT raising) a HostRun carrying prep_phase + 0 probes.
+        prep = (
+            "[prep.packages]\napt = ['''bad''']\n"
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"_packages": 100})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.results, ())          # zero probes
+        self.assertNotIn("s1", ssh_fake.ran)       # setup never reached
+        self.assertNotIn("P1", ssh_fake.ran)       # probe never reached
+        self.assertEqual([p.id for p in run.prep_phase], ["_packages"])
+        self.assertEqual(run.prep_phase[0].exit, 100)
+        self.assertTrue(run.prep_phase[0].required)
+
+    def test_hard_required_setup_fail_returns_zero_probe_hostrun(self) -> None:
+        # a required setup step's non-zero exit is a hard abort: prep_phase carries
+        # the failing step, probes are skipped, the HostRun is RETURNED not raised.
+        prep = (
+            "[[prep.setup]]\nid = '''s1'''\nrun = '''c'''\n"
+            "[[prep.setup]]\nid = '''s2'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"s1": 7})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual(run.results, ())
+        self.assertNotIn("s2", ssh_fake.ran)   # the loop stopped at the hard fail
+        self.assertNotIn("P1", ssh_fake.ran)
+        self.assertEqual([p.id for p in run.prep_phase], ["s1"])
+        self.assertEqual(run.prep_phase[0].exit, 7)
+
+    def test_soft_setup_fail_recorded_and_probes_continue(self) -> None:
+        # a required=false step that fails is recorded but the phase + probes go on.
+        prep = (
+            "[[prep.setup]]\nid = '''soft'''\nrun = '''c'''\nrequired = false\n"
+            "[[prep.setup]]\nid = '''after'''\nrun = '''c'''\n"
+        )
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh({"soft": 3})
+        run = wl.run(self._spec(), self._host(), ssh_fake)
+        self.assertEqual([p.id for p in run.prep_phase], ["soft", "after"])
+        self.assertEqual(run.prep_phase[0].exit, 3)
+        self.assertFalse(run.prep_phase[0].required)
+        self.assertEqual([r.probe_id for r in run.results], ["P1"])  # probes ran
+
+    def test_setup_step_timeout_default_is_1800(self) -> None:
+        # an explicit step timeout overrides; an absent one takes the loader-resolved
+        # default (battery.PREP_STEP_DEFAULT_TIMEOUT, 1800s) — verified end-to-end at
+        # the probe the workload submits.
+        prep = (
+            "[[prep.setup]]\nid = '''d'''\nrun = '''c'''\n"
+            "[[prep.setup]]\nid = '''o'''\nrun = '''c'''\ntimeout = 42\n"
+        )
+        seen: dict[str, float | None] = {}
+
+        class _TimeoutRecordingSsh(_ScriptedPrepSsh):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                seen[probe.id] = probe.timeout
+                return super().run_probe(host, probe)
+
+        wl = workload.ProbeWorkload(self._battery(prep))
+        wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
+        self.assertEqual(seen["d"], 1800.0)
+        self.assertEqual(seen["o"], 42.0)
+
+    def test_package_pass_uses_the_prep_timeout_default(self) -> None:
+        # the [prep.packages] install is prep work, so its synthetic _packages probe
+        # shares the prep-phase bound (1800s), not the shorter probe default.
+        prep = "[prep.packages]\napt = ['''jq''']\n"
+        seen: dict[str, float | None] = {}
+
+        class _TimeoutRecordingSsh(_ScriptedPrepSsh):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                seen[probe.id] = probe.timeout
+                return super().run_probe(host, probe)
+
+        wl = workload.ProbeWorkload(self._battery(prep))
+        wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
+        self.assertEqual(seen["_packages"], battery_mod.PREP_STEP_DEFAULT_TIMEOUT)
+        self.assertEqual(seen["_packages"], 1800.0)
+
+
+# --------------------------------------------------------------------------- #
+# results.serialize_run — prep_phase is always present (D13.5 / D-I.2)
+# --------------------------------------------------------------------------- #
+class TestSerializeRunPrepPhase(unittest.TestCase):
+    def _spec(self) -> model.HostSpec:
+        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+
+    def test_prep_phase_emitted_as_list_of_dicts(self) -> None:
+        hr = model.HostRun(
+            host_spec=self._spec(),
+            detail="d",
+            results=(),
+            prep_phase=(
+                model.PrepStepResult(id="uv", exit=0, required=True, stderr=""),
+                model.PrepStepResult(id="tlog", exit=5, required=False, stderr="boom"),
+            ),
+        )
+        doc = json.loads(results.serialize_run("r1", "ts", [hr]))
+        prep = doc["hosts"][0]["prep_phase"]
+        self.assertEqual(prep, [
+            {"id": "uv", "exit": 0, "required": True, "stderr": ""},
+            {"id": "tlog", "exit": 5, "required": False, "stderr": "boom"},
+        ])
+
+    def test_prep_phase_always_present_empty_when_no_prep(self) -> None:
+        hr = model.HostRun(host_spec=self._spec(), detail="d", results=())
+        doc = json.loads(results.serialize_run("r1", "ts", [hr]))
+        self.assertEqual(doc["hosts"][0]["prep_phase"], [])
+
+
+# --------------------------------------------------------------------------- #
+# shellcheck — the lint driver also iterates [[prep.setup]] steps (5.4)
+# --------------------------------------------------------------------------- #
+class TestShellcheckPrepSteps(unittest.TestCase):
+    def _runner(
+        self, stdout: str
+    ) -> Callable[[list[str], str | None], subprocess.CompletedProcess[str]]:
+        calls: list[tuple[list[str], str | None]] = []
+
+        def _run(argv: list[str], stdin_text: str | None) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, stdin_text))
+            return subprocess.CompletedProcess(argv, 1, stdout, "")
+
+        self.calls = calls
+        return _run
+
+    def test_lint_flags_a_prep_setup_finding(self) -> None:
+        # a [[prep.setup]] step is fed to shellcheck and a finding is located to it.
+        battery = model.Battery(
+            name="t",
+            probes=(Probe(id="P", title="p", command="echo ok", tag=ProbeTag.READ_ONLY, source="<inline>"),),
+            prep=model.Prep(
+                setup=(
+                    model.PrepStep(id="prep-s", command="x=$(date)", source="prep.sh"),
+                ),
+            ),
+        )
+        findings = shellcheck_mod.shellcheck_battery(
+            battery, runner=self._runner("-:1:7: warning: masked [SC2155]\n")
+        )
+        assert isinstance(findings, tuple)
+        # both the probe AND the prep step were fed to shellcheck (two calls)
+        self.assertEqual([stdin for _, stdin in self.calls], ["echo ok", "x=$(date)"])
+        # the prep-step finding is located back to the step (id + source)
+        prep_findings = [f for f in findings if f.probe_id == "prep-s"]
+        self.assertEqual(len(prep_findings), 1)
+        self.assertEqual(prep_findings[0].location, "prep.sh")
+        self.assertEqual(prep_findings[0].code, "SC2155")
+
+
+# --------------------------------------------------------------------------- #
 # cli — run (confirm gate) / reap / status, with provider + ssh stubbed
 # --------------------------------------------------------------------------- #
 class TestCliRun(unittest.TestCase):
@@ -3287,7 +3970,7 @@ class TestCliRun(unittest.TestCase):
 
         prov = FakeProvider()
         prov.images["img-cache"] = _cached_run_image(
-            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
         )
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
@@ -3301,6 +3984,67 @@ class TestCliRun(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(prov.created[0].image, "img-cache")
             self.assertEqual(prov.created_images, [])  # run never builds
+
+    def test_run_docker_battery_hits_docker_cache_image(self) -> None:
+        # 4.4b: a `build-image --requires docker` image (docker requires-hash +
+        # docker-rendered key) is restored by a `requires=["docker"]` battery run
+        # — the docker variant cache-hits for a docker battery.
+        from unittest import mock
+
+        prov = FakeProvider()
+        docker_key = imagecache.content_key(
+            distro.get_profile("ubuntu"), "x86", "probe", ("docker",), _null_deps()
+        )
+        prov.images["img-docker"] = _cached_run_image(
+            key=docker_key, requires=("docker",), img_id="img-docker"
+        )
+        docker_battery = "requires = ['''docker''']\n" + _DEMO_BATTERY
+        with tempfile.TemporaryDirectory() as d:
+            bat = _write_battery_bundle(d, docker_battery)
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", bat, "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(prov.created[0].image, "img-docker")  # docker variant restored
+            self.assertEqual(prov.created_images, [])  # run never builds
+            # the restore is OBSERVABLE in the results (the cache-HIT oracle)
+            doc = json.loads(next((Path(d) / "r").glob("*.json")).read_text())
+            self.assertEqual(doc["hosts"][0]["restored_image"], "img-docker")
+
+    def test_run_docker_less_battery_misses_docker_cache_image(self) -> None:
+        # 4.4b: the OTHER side of the guard — a docker-less (no `requires`) run
+        # does NOT hit a docker cache image (its key is the docker-less render),
+        # so it cold-paths instead of wrongly restoring the docker variant.
+        from unittest import mock
+
+        prov = FakeProvider()
+        docker_key = imagecache.content_key(
+            distro.get_profile("ubuntu"), "x86", "probe", ("docker",), _null_deps()
+        )
+        prov.images["img-docker"] = _cached_run_image(
+            key=docker_key, requires=("docker",), img_id="img-docker"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            bat = _write_battery_bundle(d, _DEMO_BATTERY)  # NO requires
+            with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))), \
+                 mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()):
+                rc = cli.main([
+                    "run", "--battery", bat, "--distros", "ubuntu",
+                    "--results-dir", str(Path(d) / "r"), "--timestamp", "20260601T000000Z",
+                    "--run-token", "cli-run", "--yes",
+                ])
+            self.assertEqual(rc, 0)
+            # cold path: a brand-new host was created (NOT the docker snapshot).
+            self.assertNotEqual(prov.created[0].image, "img-docker")
+            # and the miss is OBSERVABLE: restored_image is null (not a false HIT)
+            doc = json.loads(next((Path(d) / "r").glob("*.json")).read_text())
+            self.assertIsNone(doc["hosts"][0]["restored_image"])
 
     def test_run_success_writes_results(self) -> None:
         # stub the provider + keypair + ssh so the run path executes end-to-end
@@ -4262,19 +5006,24 @@ def _rescue_profile(spec: object) -> distro.DistroProfile:
     base = distro.get_profile("arch")
     return distro.DistroProfile(
         key=base.key, default_image=base.default_image, package_manager=base.package_manager,
-        packages=base.packages, docker_repo_slug=base.docker_repo_slug, extra_setup=base.extra_setup,
+        packages=base.packages, extra_setup=base.extra_setup,
         system_update_override=base.system_update_override, rescue_image=spec, notes=base.notes,
     )
 
 
-def _cache_image(*, distro_key: str, arch: str, key: str, img_id: str = "img-1") -> Image:
-    """A cache Image carrying the supersession-relevant labels."""
+def _cache_image(
+    *, distro_key: str, arch: str, key: str, img_id: str = "img-1",
+    requires: tuple[str, ...] = (),
+) -> Image:
+    """A cache Image carrying the supersession-relevant labels (incl. requires-hash)."""
     return Image(
         id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
         labels={
             imagecache.LABEL_DISTRO: distro_key,
             imagecache.LABEL_ARCH: arch,
             imagecache.LABEL_CACHE_KEY: key,
+            imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+            imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
         },
     )
 
@@ -4309,8 +5058,8 @@ class TestImageCacheBaseFingerprint(unittest.TestCase):
 class TestImageCacheContentKey(unittest.TestCase):
     def test_same_recipe_same_key(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
-        k1 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
-        k2 = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        k1 = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
+        k2 = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
         self.assertEqual(k1, k2)
         self.assertTrue(k1.startswith("v1-ubuntu-"))
         self.assertEqual(len(k1), len("v1-ubuntu-") + 32)
@@ -4320,45 +5069,75 @@ class TestImageCacheContentKey(unittest.TestCase):
         mutated = distro.DistroProfile(
             key=ubuntu.key, default_image=ubuntu.default_image, package_manager=ubuntu.package_manager,
             packages=(*ubuntu.packages, "htop"),  # a recipe change
-            docker_repo_slug=ubuntu.docker_repo_slug,
         )
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(mutated, "x86", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(mutated, "x86", "probe", (), _null_deps()),
         )
 
     def test_different_arch_changes_key(self) -> None:
         # native's slug is arch-blind, so the arch-fold is what makes the key vary.
         ubuntu = distro.get_profile("ubuntu")
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(ubuntu, "arm", "probe", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "arm", "probe", (), _null_deps()),
         )
 
     def test_operator_changes_key(self) -> None:
         # operator is part of the canonical render (baked user), so it is in the key.
         ubuntu = distro.get_profile("ubuntu")
         self.assertNotEqual(
-            imagecache.content_key(ubuntu, "x86", "probe", _null_deps()),
-            imagecache.content_key(ubuntu, "x86", "alice", _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "alice", (), _null_deps()),
         )
 
     def test_pinned_algorithm_exact_key(self) -> None:
         # A pinned exact-key assertion: this goes RED if the algorithm (SHA-256,
         # [:32], arch-fold, \0 separators, sentinel) or the sentinel value drifts.
         ubuntu = distro.get_profile("ubuntu")
-        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY)
+        canonical = cloudinit.render_cloudinit(ubuntu, "probe", imagecache._CACHE_KEY_CANONICAL_PUBKEY, ())
         expected_payload = f"x86\0ubuntu-24.04\0{canonical}".encode()
         expected_digest = hashlib.sha256(expected_payload).hexdigest()[:32]
         expected = f"v1-ubuntu-{expected_digest}"
-        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", _null_deps()), expected)
+        self.assertEqual(imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()), expected)
 
     def test_sentinel_value_is_pinned(self) -> None:
         self.assertEqual(imagecache._CACHE_KEY_CANONICAL_PUBKEY, "vmlease-cache-key-canonical-pubkey")
 
+    def test_requires_change_changes_key(self) -> None:
+        # 4.4b: docker vs docker-less render distinct cloud-init ⇒ distinct keys
+        # (the docker/docker-less cache entries are kept separate, D4/D-D).
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertNotEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps()),
+        )
+
+    def test_requires_order_invariant_key(self) -> None:
+        # 4.4b: the key is invariant to requires ORDER/dups — the render
+        # canonicalizes (sorted+deduped), so build-image's flag order and a
+        # battery's declared order fold to one key (no silent permanent miss).
+        ubuntu = distro.get_profile("ubuntu")
+        self.assertEqual(
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker", "docker"), _null_deps()),
+            imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps()),
+        )
+
+    def test_build_and_run_derive_identical_key(self) -> None:
+        # 4.4b: build-image's split derivation (content_key_from_base_fp, the
+        # label path) and run's full content_key derive the SAME key for the same
+        # requires — the determinism contract that makes a built docker image
+        # cache-hit on a docker run.
+        ubuntu = distro.get_profile("ubuntu")
+        base_fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
+        build_key = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe", ("docker",))
+        run_key = imagecache.content_key(ubuntu, "x86", "probe", ("docker",), _null_deps())
+        self.assertEqual(build_key, run_key)
+
 
 def _cached_run_image(
-    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache"
+    *, key: str, arch: str = "x86", disk_size: float = 40.0, img_id: str = "img-cache",
+    requires: tuple[str, ...] = (),
 ) -> Image:
     """A purpose-labelled cache Image for the run-restore lookup (key + arch + disk)."""
     return Image(
@@ -4368,6 +5147,8 @@ def _cached_run_image(
             imagecache.LABEL_CACHE_KEY: key,
             imagecache.LABEL_DISTRO: "ubuntu",
             imagecache.LABEL_ARCH: arch,
+            imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+            imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
         },
     )
 
@@ -4385,14 +5166,14 @@ class TestLookupCacheImage(unittest.TestCase):
         return distro.get_profile("ubuntu")
 
     def _key(self, arch: str = "x86") -> str:
-        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+        return imagecache.content_key(self._ubuntu(), arch, "probe", (), _null_deps())
 
     def _call(self, prov: providers.Provider, *, arch: str = "x86", target_disk: float = 40.0,
               warn: Callable[[str], None] | None = None) -> Image | None:
         warns: list[str] = []
         return runner._lookup_cache_image(
             self._ubuntu(),
-            operator="probe", arch=arch, target_disk=target_disk,
+            operator="probe", arch=arch, requires=(), target_disk=target_disk,
             provider=prov, deps=_null_deps(),
             warn=warn if warn is not None else warns.append,
         )
@@ -4453,7 +5234,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         return distro.get_profile("ubuntu")
 
     def _key(self, arch: str = "x86") -> str:
-        return imagecache.content_key(self._ubuntu(), arch, "probe", _null_deps())
+        return imagecache.content_key(self._ubuntu(), arch, "probe", (), _null_deps())
 
     def _matrix(self) -> runner.Matrix:
         return runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
@@ -4670,7 +5451,7 @@ class TestPlanZeroProviderCalls(unittest.TestCase):
 
         prov = _NoCallProvider()
         prov.images["img-cache"] = _cached_run_image(
-            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
+            key=imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
         )
         # plan takes no provider at all — it is call-free by construction. Asserting
         # the matrix plans without touching the provider object is the guarantee.
@@ -4685,6 +5466,7 @@ class TestImageCacheLabels(unittest.TestCase):
         ubuntu = distro.get_profile("ubuntu")
         labels = imagecache.cache_labels(
             ubuntu, "x86", key="v1-ubuntu-abc", source_fp="ubuntu-24.04", run_token="run-xyz",
+            requires=(),
         )
         self.assertEqual(labels, {
             "vmlease-purpose": "image-cache",
@@ -4694,19 +5476,25 @@ class TestImageCacheLabels(unittest.TestCase):
             "vmlease-arch": "x86",
             "vmlease-source-fp": "ubuntu-24.04",
             "vmlease-built": "run-xyz",
+            "vmlease-requires-hash": imagecache.requires_hash(()),
+            "vmlease-requires": "",
         })
 
     def test_no_per_run_reap_label(self) -> None:
         # the data-loss guard: a persistent cache image must NOT carry vmlease=<run-id>.
         ubuntu = distro.get_profile("ubuntu")
-        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp="fp", run_token="run-1")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="k", source_fp="fp", run_token="run-1", requires=(),
+        )
         self.assertNotIn("vmlease", labels)
 
     def test_long_value_truncated_to_63(self) -> None:
         # a 64-hex sha source-fp would overflow the provider's ≤63-char limit.
         ubuntu = distro.get_profile("ubuntu")
         sha = "f" * 64
-        labels = imagecache.cache_labels(ubuntu, "x86", key="k", source_fp=sha, run_token="run-1")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="k", source_fp=sha, run_token="run-1", requires=(),
+        )
         self.assertEqual(len(labels["vmlease-source-fp"]), 63)
         self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
 
@@ -4731,8 +5519,8 @@ class TestImageCacheSupersession(unittest.TestCase):
         keys = imagecache.resolve_current_keys(
             [img], distro.get_profile, "probe", _null_deps(), warnings.append,
         )
-        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", _null_deps())
-        self.assertEqual(keys, {("ubuntu", "x86"): expected})
+        expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
+        self.assertEqual(keys, {("ubuntu", "x86", imagecache.requires_hash(())): expected})
         self.assertEqual(warnings, [])
 
     def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
@@ -4752,8 +5540,8 @@ class TestImageCacheSupersession(unittest.TestCase):
             [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
         )
         # ubuntu resolved; arch skipped (kept) with a warning.
-        self.assertIn(("ubuntu", "x86"), keys)
-        self.assertNotIn(("arch", "x86"), keys)
+        self.assertIn(("ubuntu", "x86", imagecache.requires_hash(())), keys)
+        self.assertNotIn(("arch", "x86", imagecache.requires_hash(())), keys)
         self.assertEqual(len(warnings), 1)
         self.assertIn("arch", warnings[0])
 
@@ -4940,8 +5728,8 @@ class TestContentKeyFromBaseFp(unittest.TestCase):
         # the split derivation hashes the SAME bytes as content_key.
         ubuntu = distro.get_profile("ubuntu")
         base_fp = imagecache.base_fingerprint(ubuntu, "x86", _null_deps())
-        derived = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe")
-        whole = imagecache.content_key(ubuntu, "x86", "probe", _null_deps())
+        derived = imagecache.content_key_from_base_fp(base_fp, ubuntu, "x86", "probe", ())
+        whole = imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps())
         self.assertEqual(derived, whole)
 
 
@@ -4951,11 +5739,11 @@ class TestCliBuildImage(unittest.TestCase):
     def _key(self, distro_key: str = "ubuntu", arch: str = "x86", operator: str = "probe") -> str:
         prof = distro.get_profile(distro_key)
         base_fp = imagecache.base_fingerprint(prof, arch, _null_deps())
-        return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator)
+        return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator, ())
 
     def _cache_img(
         self, *, key: str, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
-        created: str = "2024-01-01T00:00:00+00:00",
+        created: str = "2024-01-01T00:00:00+00:00", requires: tuple[str, ...] = (),
     ) -> Image:
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
@@ -4964,6 +5752,8 @@ class TestCliBuildImage(unittest.TestCase):
                 imagecache.LABEL_DISTRO: distro_key,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+                imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
             },
         )
 
@@ -5074,6 +5864,31 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(prov.created_images), 1)  # built
         self.assertIn("img-old", prov.deleted_images)  # then pruned S
+
+    def test_build_docker_variant_does_not_prune_docker_less(self) -> None:
+        # 4.4b build-image prune data-loss guard: building the `--requires docker`
+        # variant prunes only the same-(distro, arch, requires-hash) group's stale
+        # images — the live docker-less cache image is a DIFFERENT group and must
+        # survive the prune.
+        prov = FakeProvider()
+        prov.images["dl-cur"] = self._cache_img(
+            key="v1-ubuntu-DLCUR", img_id="dl-cur", requires=(),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu", "--requires", "docker", "--run-token", "bird", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(prov.created_images), 1)  # docker image built
+        # the docker image carries the docker requires-hash...
+        built_labels = prov.created_images[0][2]
+        self.assertEqual(
+            built_labels.get(imagecache.LABEL_REQUIRES_HASH), imagecache.requires_hash(("docker",)),
+        )
+        # ...and the docker-less variant was NOT pruned (distinct group).
+        self.assertNotIn("dl-cur", prov.deleted_images)
 
     def test_at_cap_s_nonempty_prunes_then_builds(self) -> None:
         prov = FakeProvider()
@@ -5262,6 +6077,7 @@ class TestCliReapImages(unittest.TestCase):
     def _img(
         self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
         key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
+        requires: tuple[str, ...] = (),
     ) -> Image:
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
@@ -5270,12 +6086,14 @@ class TestCliReapImages(unittest.TestCase):
                 imagecache.LABEL_DISTRO: distro_key,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
+                imagecache.LABEL_REQUIRES: "\0".join(capabilities.canonical_requires(requires)),
             },
         )
 
     def _run(
         self, prov: FakeProvider, argv: list[str], *,
-        resolve_current_keys: Callable[..., dict[tuple[str, str], str]] | None = None,
+        resolve_current_keys: Callable[..., dict[tuple[str, str, str], str]] | None = None,
     ) -> tuple[int, str, str]:
         from contextlib import ExitStack
         from unittest import mock
@@ -5364,7 +6182,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -5378,7 +6196,7 @@ class TestCliReapImages(unittest.TestCase):
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
             warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -5393,11 +6211,33 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86"): "v1-ubuntu-CUR"}  # no image carries CUR
+            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(prov.deleted_images), ["o1", "o2"])
+
+    def test_superseded_docker_variant_does_not_supersede_docker_less(self) -> None:
+        # 4.4b reap data-loss guard: a docker and a docker-less image of the SAME
+        # distro+arch are DISTINCT supersession groups (distinct requires-hash),
+        # so reaping the off-key image of one group must NOT touch the live image
+        # of the other. Each group keeps its own current image.
+        prov = FakeProvider()
+        prov.images["dl-cur"] = self._img(img_id="dl-cur", key="v1-ubuntu-DLCUR", requires=())
+        prov.images["dl-old"] = self._img(img_id="dl-old", key="v1-ubuntu-DLOLD", requires=())
+        prov.images["dk-cur"] = self._img(img_id="dk-cur", key="v1-ubuntu-DKCUR", requires=("docker",))
+        prov.images["dk-old"] = self._img(img_id="dk-old", key="v1-ubuntu-DKOLD", requires=("docker",))
+
+        def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
+            return {
+                ("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
+                ("ubuntu", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
+            }
+
+        rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
+        self.assertEqual(rc, 0)
+        # only the off-key image of each group is reaped; BOTH current images survive.
+        self.assertEqual(sorted(prov.deleted_images), ["dk-old", "dl-old"])
 
     # --- list failure -------------------------------------------------------- #
     def test_list_images_failure_exits_1(self) -> None:
@@ -5433,7 +6273,9 @@ class TestCacheImagePerRunReapIsolation(unittest.TestCase):
 
     def test_cache_image_carries_content_labels_not_run_label(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
-        labels = imagecache.cache_labels(ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird")
+        labels = imagecache.cache_labels(
+            ubuntu, "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird", requires=(),
+        )
         # content-addressed labels present...
         self.assertEqual(labels[imagecache.LABEL_PURPOSE], imagecache.PURPOSE_IMAGE_CACHE)
         self.assertEqual(labels[imagecache.LABEL_CACHE_KEY], "v1-ubuntu-K")
@@ -5447,6 +6289,7 @@ class TestCacheImagePerRunReapIsolation(unittest.TestCase):
         # a cache image carrying ONLY content labels (no vmlease=<run-id>).
         cache_labels = imagecache.cache_labels(
             distro.get_profile("ubuntu"), "x86", key="v1-ubuntu-K", source_fp="fp", run_token="bird",
+            requires=(),
         )
         cache_img = Image(
             id="cache-1", created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch="x86", labels=cache_labels,

@@ -15,10 +15,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from vmlease.model import HostRun, Probe, ProbeTag
+from vmlease import capabilities, distro
+from vmlease.battery import PREP_STEP_DEFAULT_TIMEOUT
+from vmlease.model import HostRun, PrepStepResult, Probe, ProbeTag
 
 if TYPE_CHECKING:
-    from vmlease.model import Battery, Host, HostSpec, ProbeResult
+    from collections.abc import Mapping
+
+    from vmlease.model import Battery, Host, HostSpec, PrepStep, ProbeResult
     from vmlease.ssh import SshRunner
 
 
@@ -63,6 +67,23 @@ _HOST_DETAIL_COMMAND = (
 MAX_CONSECUTIVE_TIMEOUTS = 2
 
 
+def _effective_packages(
+    packages: Mapping[str, tuple[str, ...]], manager: str, distro_key: str
+) -> tuple[str, ...]:
+    """The effective per-host package set: union(manager-list, distro-list), deduped.
+
+    ``[prep.packages]`` keys are package-managers OR distros (disjoint, validated
+    at load). The effective set for one host is the union of its manager's list and
+    its distro's list, deduplicated in first-seen order with the manager entries
+    first (D-E). Selectors absent from the mapping contribute nothing.
+    """
+    ordered = (*packages.get(manager, ()), *packages.get(distro_key, ()))
+    seen: dict[str, None] = {}
+    for pkg in ordered:
+        seen.setdefault(pkg, None)
+    return tuple(seen)
+
+
 class ProbeWorkload:
     """The probe battery as a :class:`Workload`: host-detail snapshot + battery.
 
@@ -97,6 +118,24 @@ class ProbeWorkload:
             id="_detail", title="host detail", command=_HOST_DETAIL_COMMAND, tag=ProbeTag.READ_ONLY
         )
         detail = ssh.run_probe(host, detail_probe).stdout
+
+        # Prep phase (D-A layer 2): the battery's declared host prep, run once
+        # after readiness and BEFORE the probe loop — first the package install
+        # pass, then the ordered setup steps. A HARD failure (a package-pass
+        # failure or a ``required`` setup step) returns a HostRun carrying the
+        # captured ``prep_phase`` and zero probes — it does NOT raise (D-I.1):
+        # raising would route through the runner's error path, which discards the
+        # return value, so ``summarize`` could never count PREP_HARD_FAIL.
+        # Teardown still fires via the runner's existing ``finally``.
+        prep_phase: list[PrepStepResult] = []
+        if self._run_prep(spec, host, ssh, prep_phase):
+            return HostRun(
+                host_spec=spec,
+                detail=detail,
+                results=(),
+                prep_phase=tuple(prep_phase),
+            )
+
         results: list[ProbeResult] = []
         consecutive_timeouts = 0
         probes = self._battery.probes
@@ -111,4 +150,104 @@ class ProbeWorkload:
                     f"consecutive probe timeouts; probes {not_run} not run"
                 )
                 break
-        return HostRun(host_spec=spec, detail=detail, results=tuple(results))
+        return HostRun(
+            host_spec=spec,
+            detail=detail,
+            results=tuple(results),
+            prep_phase=tuple(prep_phase),
+        )
+
+    def _run_prep(
+        self,
+        spec: HostSpec,
+        host: Host,
+        ssh: SshRunner,
+        prep_phase: list[PrepStepResult],
+        /,
+    ) -> bool:
+        """Run the battery's prep phase; append outcomes to ``prep_phase`` in order.
+
+        Runs the ``[prep.packages]`` install pass first (always hard), then the
+        ``[[prep.setup]]`` steps in authoring order (skipping ``distros``-excluded
+        steps). Returns ``True`` when a HARD failure aborts the host (a package-pass
+        failure OR a ``required`` setup step exited non-zero) — the caller then
+        returns a zero-probe :class:`HostRun` carrying ``prep_phase``. A soft
+        (``required=false``) failure is recorded and the phase continues.
+        """
+        prep = self._battery.prep
+        if prep is None:
+            return False
+        profile = distro.get_profile(spec.distro_key)
+        manager = profile.package_manager
+
+        # 1) The package install pass — apt-get update first on apt (D13.2), then
+        # one ``<install> <pkgs>`` pass. Always hard: any non-zero exit aborts.
+        packages = _effective_packages(prep.packages, manager, spec.distro_key)
+        if packages and not self._run_package_pass(host, ssh, manager, packages, prep_phase):
+            return True
+
+        # 2) The ordered setup steps (authoring order); skip distros-excluded ones.
+        for step in prep.setup:
+            if step.distros and spec.distro_key not in step.distros:
+                continue
+            result = self._run_setup_step(host, ssh, step)
+            prep_phase.append(result)
+            if result.exit != 0 and step.required:
+                return True
+        return False
+
+    def _run_package_pass(
+        self,
+        host: Host,
+        ssh: SshRunner,
+        manager: str,
+        packages: tuple[str, ...],
+        prep_phase: list[PrepStepResult],
+        /,
+    ) -> bool:
+        """Run the single ``[prep.packages]`` install pass; record its outcome.
+
+        On apt, ``apt-get update`` runs FIRST (D13.2) so the install pass sees a
+        fresh index. Returns ``True`` on success, ``False`` on a non-zero exit
+        (a hard abort). The outcome is recorded in ``prep_phase`` under the
+        synthetic step id ``_packages`` (always ``required=True``). The install is
+        bounded by the prep-phase default (:data:`PREP_STEP_DEFAULT_TIMEOUT`) — a
+        heavy package set is prep work, so it shares the setup-step bound rather
+        than the shorter probe default.
+        """
+        install = capabilities.install_command(manager)
+        command = f"sudo {install} {' '.join(packages)}"
+        if manager == "apt":
+            command = f"sudo apt-get update && {command}"
+        probe = Probe(
+            id="_packages",
+            title="prep packages",
+            command=command,
+            tag=ProbeTag.MUTATING_HOST_ROOT,
+            timeout=PREP_STEP_DEFAULT_TIMEOUT,
+        )
+        outcome = ssh.run_probe(host, probe)
+        prep_phase.append(
+            PrepStepResult(id="_packages", exit=outcome.exit_code, required=True, stderr=outcome.stderr)
+        )
+        return outcome.exit_code == 0
+
+    def _run_setup_step(self, host: Host, ssh: SshRunner, step: PrepStep, /) -> PrepStepResult:
+        """Run one ``[[prep.setup]]`` step and capture it as a :class:`PrepStepResult`.
+
+        The step's ``timeout`` is loader-resolved — the D13.1 1800s default is
+        applied at battery load (:data:`vmlease.battery.PREP_STEP_DEFAULT_TIMEOUT`)
+        when a step omits ``timeout``. The command runs verbatim over SSH (the
+        author writes ``sudo`` inline where root is needed).
+        """
+        probe = Probe(
+            id=step.id,
+            title=step.title,
+            command=step.command,
+            tag=ProbeTag.MUTATING_HOST_ROOT,
+            timeout=step.timeout,
+        )
+        outcome = ssh.run_probe(host, probe)
+        return PrepStepResult(
+            id=step.id, exit=outcome.exit_code, required=step.required, stderr=outcome.stderr
+        )

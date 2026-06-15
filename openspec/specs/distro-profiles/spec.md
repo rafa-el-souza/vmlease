@@ -7,7 +7,11 @@ Per-distro provisioning: a read-only profile registry (image + package/repo prep
 
 The system SHALL resolve each distro key to a profile carrying its default provider image and its
 per-distro preparation (packages / repository / extra setup), exposed through a read-only registry, and
-SHALL raise a clear error for an unknown distro key.
+SHALL raise a clear error for an unknown distro key. A profile's preparation SHALL describe the **generic,
+battery-agnostic distro box** only; optional vmlease-provided capabilities (e.g. docker) SHALL NOT be part
+of profile preparation — they are layered per-distro as capability recipes selected by a battery's
+`requires` (see the `host-capabilities` capability). Substrate that every host of a distro needs regardless
+of capability (e.g. kernel-module loads) MAY remain in profile extra-setup.
 
 #### Scenario: A known distro resolves to its profile
 
@@ -19,18 +23,32 @@ SHALL raise a clear error for an unknown distro key.
 - **WHEN** an unknown distro key is looked up
 - **THEN** the system raises an unknown-distro error
 
+#### Scenario: Docker is not part of profile preparation
+
+- **WHEN** any distro profile's preparation is inspected
+- **THEN** it contains no docker packages, docker repository setup, or docker bundle (docker is a capability recipe, not profile prep), while always-on substrate such as kernel-module loads remains
+
 ### Requirement: Cloud-init is rendered with stdlib templating before create
 
 The system SHALL render each host's cloud-init from its distro profile using stdlib `@@name@@`
 placeholder substitution (no third-party templating), injecting the operator account and the throwaway
 public key, and SHALL render (and validate) it before any create call so a template defect fails before
-spend.
+spend. The render SHALL also inject, for the host's package manager, the recipe of each capability named in
+the battery's `requires`; a host whose battery requires no capability SHALL render no optional-capability
+content (e.g. a docker-less cloud-init). The required-capability set SHALL be a **required input** to the
+render, so the identical render feeds both provisioning and the cache-key computation (the key therefore
+varies with `requires` without a separate term).
 
 #### Scenario: Cloud-init carries operator access
 
 - **WHEN** cloud-init is rendered for a host
 - **THEN** it authorizes the throwaway public key for the operator account, and the same cloud-init is
   re-applied by a rescue-written image from the provider datasource
+
+#### Scenario: A required capability is rendered; a default host is capability-less
+
+- **WHEN** cloud-init is rendered for a host whose battery requires docker, and separately for a host whose battery requires nothing
+- **THEN** the first render contains the docker recipe for the host's manager and the second contains no docker content
 
 ### Requirement: Rescue-write provisions distros with no native provider image
 

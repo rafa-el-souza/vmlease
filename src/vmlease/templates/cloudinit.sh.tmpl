@@ -24,7 +24,7 @@ SUDOERS
   # sudo on a real host — validate before trusting it).
   visudo -c -f "$sudoers_file" >/dev/null
 
-  # --- install the rootless-docker prerequisite package set ---------------
+  # --- install the base package set + any required-capability recipes ------
   @@install_block@@
 
   # --- drop the throwaway probe public key for the operator ---------------

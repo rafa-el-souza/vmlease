@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-from vmlease.model import Battery, Probe
+from vmlease.model import Battery, PrepStep, Probe
 
 Severity = Literal["error", "warning", "note", "style"]
 
@@ -111,20 +111,26 @@ def shellcheck_battery(
     a driver that could not get a verdict from shellcheck reports exactly that, and
     the caller decides (skip vs. ``--require-shellcheck`` fail) uniformly.
 
-    Kept **per-script-ref**-shaped (iterates probes, one shellcheck call each) so a
-    future ``[[prep]]`` section (D7) reuses it verbatim.
+    Kept **per-script-ref**-shaped (one shellcheck call per item) so it covers BOTH
+    the battery's probes AND its ``[[prep.setup]]`` steps (D7) — a prep step carries
+    the same ``id`` / ``command`` / ``source`` shape, so each is fed to shellcheck
+    identically and located back the same way. (The structural verdict rules stay
+    probes-only; this driver only lints shell text.)
     """
     run = runner if runner is not None else _default_shellcheck_runner
     findings: list[ShellcheckFinding] = []
-    for probe in battery.probes:
+    items: list[Probe | PrepStep] = list(battery.probes)
+    if battery.prep is not None:
+        items.extend(battery.prep.setup)
+    for item in items:
         argv = ["shellcheck", "--shell=bash", "--format=gcc", "-"]
         try:
-            proc = run(argv, probe.command)
+            proc = run(argv, item.command)
         except FileNotFoundError:
             return SHELLCHECK_UNAVAILABLE
         except subprocess.TimeoutExpired:
             return SHELLCHECK_UNAVAILABLE
-        findings.extend(_parse_gcc_output(probe, proc.stdout))
+        findings.extend(_parse_gcc_output(item, proc.stdout))
     return tuple(findings)
 
 
@@ -147,12 +153,13 @@ def _default_shellcheck_runner(argv: list[str], stdin_text: str | None) -> subpr
     )
 
 
-def _parse_gcc_output(probe: Probe, output: str) -> list[ShellcheckFinding]:
+def _parse_gcc_output(probe: Probe | PrepStep, output: str) -> list[ShellcheckFinding]:
     """Parse ``shellcheck --format=gcc`` ``output`` into findings for ``probe``.
 
-    Non-matching lines (blank lines, banners) are tolerated and skipped. The SC
-    code is split off the trailing ``[SCnnnn]`` bracket; a line with no code keeps
-    an empty ``code``.
+    ``probe`` is any linted item — a :class:`~vmlease.model.Probe` or a
+    :class:`~vmlease.model.PrepStep` (both carry ``id`` / ``source``). Non-matching
+    lines (blank lines, banners) are tolerated and skipped. The SC code is split off
+    the trailing ``[SCnnnn]`` bracket; a line with no code keeps an empty ``code``.
     """
     findings: list[ShellcheckFinding] = []
     for raw in output.splitlines():

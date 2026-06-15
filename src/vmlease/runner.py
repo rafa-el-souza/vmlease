@@ -10,9 +10,10 @@ same generator, so the plan is byte-faithful to what a real run would do.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, TypeVar
 
+from vmlease.capabilities import canonical_requires
 from vmlease.cloudinit import SYSPREP_COMMAND, render_cloudinit, render_minimal_cloudinit
 from vmlease.distro import get_profile
 from vmlease.imagecache import (
@@ -65,6 +66,10 @@ class Matrix:
             (``""`` = none).
         uploads: Files scp'd onto every host after readiness, before the workload
             (``()`` = none). Validated host-independently before any spend.
+        requires: The vmlease-provided capabilities every host in the run needs
+            (a provisioning attribute, default-off — ``()`` means no capability).
+            The CLI lifts this from the battery and canonicalizes it; the runner
+            propagates it onto every :class:`~vmlease.model.HostSpec`.
     """
 
     workload: Workload
@@ -73,6 +78,7 @@ class Matrix:
     run_token: str
     firewall: str = ""
     uploads: tuple[UploadSpec, ...] = ()
+    requires: tuple[str, ...] = ()
 
 
 def build_host_specs(matrix: Matrix) -> list[HostSpec]:
@@ -85,6 +91,7 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
     """
     run_id = make_run_id(matrix.run_token)
     labels = run_label(run_id)
+    requires = canonical_requires(matrix.requires)
     specs: list[HostSpec] = []
     for key in matrix.distro_keys:
         profile = get_profile(key)
@@ -96,6 +103,7 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
                 distro_key=key,
                 labels=dict(labels),
                 firewall=matrix.firewall,
+                requires=requires,
             )
         )
     return specs
@@ -142,6 +150,7 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
             server_type=s.server_type,
             distro_key=s.distro_key,
             workload_summary=workload_summary,
+            requires=s.requires,
         )
         for s in specs
     ]
@@ -341,7 +350,7 @@ def _run_one_host(
         # SAME cloud-init; the written cloudimg re-applies it from the hetzner
         # datasource. cloud-init is rendered (+ validated) before create, so a
         # template defect fails before spend.
-        cloud_init = render_cloudinit(_profile, operator, keypair.public_key)
+        cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
         return _profile.default_image, cloud_init, _profile.needs_rescue_write
 
     # Build the candidate list. The cold candidate is ALWAYS the fallback; a cache
@@ -423,8 +432,14 @@ def _run_one_host(
     # ``Exception`` mapped above, or raised a ``BaseException`` (which re-propagated
     # past the scaffold; in that case this fold does not run, but neither does the
     # caller need a HostRun — the abort unwinds).
+    # Stamp the restore decision so the results are observable: a host created from
+    # the restore candidate (chosen index 0 == restored_index) carries the snapshot
+    # id; a cold/miss provision carries None. Covers the success path AND G4 (a
+    # restored host that failed after create — it WAS restored).
+    was_restored = bool(chosen) and chosen[0] == restored_index and restore_image_id is not None
+    run = replace(run, restored_image=restore_image_id if was_restored else None)
     if note_sink:
-        run = HostRun(host_spec=run.host_spec, detail=f"{run.detail}\n{note_sink[0]}", results=run.results)
+        run = replace(run, detail=f"{run.detail}\n{note_sink[0]}")
     return run
 
 
@@ -467,6 +482,7 @@ def _resolve_cache_hit_image(
         profile,
         operator=operator,
         arch=arch,
+        requires=spec.requires,
         target_disk=target_disk,
         provider=provider,
         deps=deps,
@@ -480,6 +496,7 @@ def _lookup_cache_image(
     *,
     operator: str,
     arch: str,
+    requires: tuple[str, ...],
     target_disk: float,
     provider: Provider,
     deps: ResolveDeps,
@@ -488,7 +505,9 @@ def _lookup_cache_image(
     """Find the cached snapshot to restore from for this group, or ``None`` (a miss).
 
     Pure cache lookup (D6/D9): compute the content key for
-    ``(profile, arch, operator, recipe, upstream)``, ``list_images`` the cache, and
+    ``(profile, arch, operator, requires, recipe, upstream)`` — ``requires`` is the
+    D-H spine read, so a docker run looks up the docker variant and a docker-less
+    run the docker-less one — ``list_images`` the cache, and
     pick the first **match** — an image whose ``vmlease-cache-key`` equals the key,
     whose architecture equals ``arch``, AND whose ``disk_size`` is ``<= target_disk``
     (the restore disk-bound, D9: a snapshot restores only onto a server whose disk is
@@ -502,7 +521,7 @@ def _lookup_cache_image(
     (``None``). A cache problem NEVER fails the host.
     """
     try:
-        key = content_key(profile, arch, operator, deps)
+        key = content_key(profile, arch, operator, requires, deps)
         images = provider.list_images(label_selector_purpose())
     except Exception as exc:  # lookup failure → advisory miss, never a host failure
         warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
@@ -658,15 +677,11 @@ def _replace_image(spec: HostSpec, image: str) -> HostSpec:
     The scaffold's ``plan_create`` may resolve a different image than the spec
     carries (a cache-restore snapshot id vs the cold default) — the host is created
     from that resolved image, so the spec is rebuilt rather than mutated.
+
+    Uses :func:`dataclasses.replace` so every other field (incl. ``requires``)
+    rides along verbatim and a new field can't silently drop out of the copy.
     """
-    return HostSpec(
-        name=spec.name,
-        image=image,
-        server_type=spec.server_type,
-        distro_key=spec.distro_key,
-        labels=dict(spec.labels),
-        firewall=spec.firewall,
-    )
+    return replace(spec, image=image)
 
 
 def _best_effort_destroy(provider: Provider, host: Host) -> str:
@@ -829,7 +844,7 @@ def build_one_image(
         # build-image is ALWAYS cold: the cold default image + the full cloud-init +
         # the profile's own rescue flag (a rescue-write distro's builder is written
         # then prepped before the snapshot captures it).
-        cloud_init = render_cloudinit(_profile, operator, keypair.public_key)
+        cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
         return _profile.default_image, cloud_init, _profile.needs_rescue_write
 
     return _with_ready_host(

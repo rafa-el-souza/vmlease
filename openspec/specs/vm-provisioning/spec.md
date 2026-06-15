@@ -7,7 +7,11 @@ The provision → (transform) → run-workload → always-teardown spine: build 
 
 The system SHALL turn a run request (a matrix of distro keys × one server type, plus a caller-supplied
 run token) into one labelled host spec per distro, deriving the run-id purely from the run token so the
-same token yields the same specs and labels.
+same token yields the same specs and labels. Each host spec SHALL also carry the run's **required
+capabilities** (the battery's `requires`, lifted onto the spec by the caller that builds the matrix), so
+that capability recipes can be rendered into the host's cloud-init at create time — before the workload
+exists. `requires` is a provisioning attribute of the host spec (alongside `distro_key`), not workload
+data; the runner reads it from the spec, never from the opaque workload.
 
 #### Scenario: One spec per distro, carrying the run label
 
@@ -20,11 +24,18 @@ same token yields the same specs and labels.
 - **WHEN** the same matrix (same token) is built twice
 - **THEN** the resulting host specs (names, images, labels) are identical, with no provider calls made
 
+#### Scenario: Host specs carry the run's required capabilities
+
+- **WHEN** a matrix is built from a battery declaring `requires = ["docker"]`
+- **THEN** each host spec carries that required-capability set, so the runner renders the docker recipe into cloud-init at create time
+
 ### Requirement: The plan dry-run makes zero provider calls
 
 The system SHALL render a `plan` that shows exactly what a real run would provision — one plan item per
-host, including image, server type, distro key, and a summary of the **injected workload** — while
-making **no** provider calls and running the cost guard so a guard refusal surfaces before any spend.
+host, including image, server type, distro key, the host's **required capabilities**, and a summary of the
+**injected workload** — while making **no** provider calls and running the cost guard so a guard refusal
+surfaces before any spend. Because required capabilities change the provisioned image (and therefore the
+cache key), the plan SHALL surface them so the dry-run reflects what the run will actually build.
 
 #### Scenario: Plan provisions nothing
 
@@ -41,6 +52,11 @@ making **no** provider calls and running the cost guard so a guard refusal surfa
 - **WHEN** `plan` is invoked with an injected workload
 - **THEN** each plan item includes that workload's summary (for the probe workload, its probe count)
   rather than assuming a probe battery
+
+#### Scenario: Plan surfaces required capabilities
+
+- **WHEN** `plan` is invoked for a battery requiring docker
+- **THEN** each plan item shows that docker is required, so the operator sees the docker variant will be provisioned
 
 ### Requirement: Per-host isolation never loses another host's results
 

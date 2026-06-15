@@ -67,14 +67,43 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from vmlease.assertions import _ASSERTIONS
-from vmlease.model import Assertion, Battery, Probe, ProbeTag
+from vmlease.capabilities import known_capabilities
+from vmlease.distro import _SYSTEM_UPDATE_BY_MANAGER, PROFILES
+from vmlease.model import (
+    Assertion,
+    Battery,
+    Prep,
+    PrepStep,
+    Probe,
+    ProbeTag,
+)
 
 _PROBE_KEYS = frozenset(
     {"id", "title", "tag", "classifies", "timeout", "run", "script", "assert"}
 )
-_ROOT_KEYS = frozenset({"name", "probe"})
+_ROOT_KEYS = frozenset({"name", "probe", "requires", "prep"})
+_PREP_KEYS = frozenset({"packages", "setup"})
+_PREP_STEP_KEYS = frozenset({"id", "run", "script", "distros", "required", "title", "timeout"})
+
+# The prep-phase ``timeout`` default (seconds) — longer than the probe-runner
+# default, since prep work includes source builds (e.g. debian-13's ~1800s tlog
+# source build). Applied at resolve time when a setup step omits ``timeout``, and
+# reused by the runtime package-install pass (workload). Public: it's the single
+# source of the prep-phase bound, shared across the loader and the runner.
+PREP_STEP_DEFAULT_TIMEOUT = 1800.0
+
+
+def _known_managers() -> frozenset[str]:
+    """The known package-manager selector set (the system-update map's keys)."""
+    return frozenset(_SYSTEM_UPDATE_BY_MANAGER)
+
+
+def _known_distros() -> frozenset[str]:
+    """The known distro selector / allowlist set (the profile registry's keys)."""
+    return frozenset(PROFILES)
 
 
 class BatteryError(ValueError):
@@ -93,11 +122,48 @@ class _BatterySpec:
     """The output of the pure shape pass: a battery name + its pre-resolution probe specs.
 
     Not a :class:`Battery` (no resolved commands, no filesystem touched) and not a
-    public type — :func:`_resolve` turns it into a :class:`Battery`.
+    public type — :func:`_resolve` turns it into a :class:`Battery`. ``requires``
+    is already validated against the capability registry; ``prep`` carries the
+    validated ``[prep.packages]`` mapping plus the pre-resolution prep-step specs
+    (``None`` when the manifest declares no ``[prep]``).
     """
 
     name: str
     probes: tuple[_ProbeSpec, ...]
+    requires: tuple[str, ...]
+    prep: _PrepSpec | None
+
+
+@dataclass(frozen=True)
+class _PrepSpec:
+    """The validated, pre-resolution prep phase — packages + prep-step specs.
+
+    ``packages`` is the validated ``{selector: tuple[str, ...]}`` mapping (keys
+    are known managers/distros); ``setup`` holds :class:`_PrepStepSpec` records
+    whose ``script`` is not yet resolved. :func:`_resolve` turns it into a
+    :class:`~vmlease.model.Prep`.
+    """
+
+    packages: dict[str, tuple[str, ...]]
+    setup: tuple[_PrepStepSpec, ...]
+
+
+@dataclass(frozen=True)
+class _PrepStepSpec:
+    """An internal, pre-resolution prep-step record (the pure shape pass output).
+
+    Carries exactly one of ``run`` (an inline block) or ``script`` (a path
+    string, not yet resolved); :func:`_resolve` turns a spec into a
+    :class:`~vmlease.model.PrepStep` whose ``command`` is resolved shell.
+    """
+
+    id: str
+    distros: tuple[str, ...]
+    required: bool
+    title: str
+    timeout: float | None
+    run: str | None
+    script: str | None
 
 
 @dataclass(frozen=True)
@@ -144,7 +210,223 @@ def parse_battery(text: str) -> _BatterySpec:
         raise BatteryError("battery requires a non-empty 'probe' array ([[probe]])")
     specs = tuple(_parse_probe(i, p) for i, p in enumerate(raw_probes))
     _assert_unique_ids(specs)
-    return _BatterySpec(name=name, probes=specs)
+    requires = _parse_requires(doc)
+    prep = _parse_prep(doc)
+    return _BatterySpec(name=name, probes=specs, requires=requires, prep=prep)
+
+
+def _parse_requires(doc: dict[str, object]) -> tuple[str, ...]:
+    """Parse + validate the root ``requires`` list (opt-in, default-off).
+
+    Absent → ``()``. Each entry must be a string naming a known capability
+    (``known_capabilities()``); a non-list, a non-string entry, or an unknown
+    capability is a malformed battery and raises :class:`BatteryError` naming the
+    offender. The order is preserved here (the canonicalizer normalizes it
+    downstream); validation is membership-only.
+    """
+    if "requires" not in doc:
+        return ()
+    raw = doc["requires"]
+    if not isinstance(raw, list):
+        raise BatteryError("'requires' must be a list of capability names")
+    known = known_capabilities()
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            raise BatteryError(f"'requires' entry must be a non-empty string, got {entry!r}")
+        if entry not in known:
+            raise BatteryError(
+                f"unknown capability {entry!r} in 'requires'; known: {sorted(known)}"
+            )
+        out.append(entry)
+    return tuple(out)
+
+
+def _parse_prep(doc: dict[str, object]) -> _PrepSpec | None:
+    """Parse + validate the root ``[prep]`` section (``None`` when absent).
+
+    Validates the strict shape: unknown keys at ``[prep]`` are rejected;
+    ``[prep.packages]`` (:func:`_parse_prep_packages`) and ``[[prep.setup]]``
+    (:func:`_parse_prep_setup`) are each validated. ``script`` steps are resolved
+    later (:func:`_resolve`) — this pure pass does no filesystem access.
+    """
+    if "prep" not in doc:
+        return None
+    raw = doc["prep"]
+    if not isinstance(raw, dict):
+        raise BatteryError("'prep' must be a table ([prep])")
+    unknown = set(raw) - _PREP_KEYS
+    if unknown:
+        raise BatteryError(f"[prep] has unrecognized key(s): {sorted(unknown)}")
+    packages = _parse_prep_packages(raw.get("packages"))
+    setup = _parse_prep_setup(raw.get("setup"))
+    return _PrepSpec(packages=packages, setup=setup)
+
+
+def _parse_prep_packages(raw: object) -> dict[str, tuple[str, ...]]:
+    """Validate ``[prep.packages]`` — a flat ``{selector: [pkg, ...]}`` table.
+
+    Absent → ``{}``. Every key must be a known package-manager OR a known distro
+    (the two name-sets are disjoint and closed); a key that is neither raises
+    :class:`BatteryError` naming it. Each value must be a list of non-empty
+    strings. Resolution to a per-host union is the runner's job, not the loader's.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise BatteryError("[prep.packages] must be a table")
+    valid = _known_managers() | _known_distros()
+    out: dict[str, tuple[str, ...]] = {}
+    for key, value in raw.items():
+        if key not in valid:
+            raise BatteryError(
+                f"[prep.packages] has unrecognized selector key {key!r}; "
+                f"must be a known package-manager or distro: {sorted(valid)}"
+            )
+        if not isinstance(value, list) or not all(
+            isinstance(p, str) and p for p in value
+        ):
+            raise BatteryError(
+                f"[prep.packages] {key!r} must be a list of non-empty package names"
+            )
+        out[key] = tuple(value)
+    return out
+
+
+def _parse_prep_setup(raw: object) -> tuple[_PrepStepSpec, ...]:
+    """Validate ``[[prep.setup]]`` — an ordered array of setup-step specs.
+
+    Absent → ``()``. Each element is parsed by :func:`_parse_prep_step`; step
+    ``id``s must be unique across the array (a duplicate raises naming it).
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise BatteryError("[[prep.setup]] must be an array of tables")
+    specs = tuple(_parse_prep_step(i, s) for i, s in enumerate(raw))
+    seen: set[str] = set()
+    for s in specs:
+        if s.id in seen:
+            raise BatteryError(f"duplicate prep setup id {s.id!r}")
+        seen.add(s.id)
+    return specs
+
+
+def _parse_prep_step(index: int, raw: object) -> _PrepStepSpec:
+    """Validate one ``[[prep.setup]]`` step into a pre-resolution spec.
+
+    Enforces: a table; only recognized keys; a required string ``id``; exactly
+    one of ``run``/``script``; an optional ``distros`` allowlist whose every value
+    is a known distro (a typo guard — fail loud, do not silently skip on every
+    host); an optional ``required`` bool (default ``True``); an optional string
+    ``title``; an optional positive-number ``timeout``.
+    """
+    if not isinstance(raw, dict):
+        raise BatteryError(f"prep setup step #{index} is not a table")
+    unknown = set(raw) - _PREP_STEP_KEYS
+    if unknown:
+        raise BatteryError(
+            f"prep setup step #{index} has unrecognized key(s): {sorted(unknown)}"
+        )
+    step_id = raw.get("id")
+    if not isinstance(step_id, str) or not step_id:
+        raise BatteryError(f"prep setup step #{index} requires a non-empty string 'id'")
+    run, script = _parse_prep_command_form(step_id, raw)
+    distros = _parse_prep_distros(step_id, raw)
+    required = _parse_prep_required(step_id, raw)
+    title = raw.get("title", "")
+    if not isinstance(title, str):
+        raise BatteryError(f"prep setup step {step_id!r} 'title' must be a string")
+    timeout = _parse_prep_timeout(step_id, raw)
+    return _PrepStepSpec(
+        id=step_id,
+        distros=distros,
+        required=required,
+        title=title,
+        timeout=timeout,
+        run=run,
+        script=script,
+    )
+
+
+def _parse_prep_command_form(
+    step_id: str, raw: dict[object, object]
+) -> tuple[str | None, str | None]:
+    """Enforce **exactly one of** ``run`` / ``script`` on a prep step.
+
+    Neither (vacuous) and both (ambiguous) are malformed and named by ``id``.
+    """
+    has_run = "run" in raw
+    has_script = "script" in raw
+    if has_run and has_script:
+        raise BatteryError(
+            f"prep setup step {step_id!r} declares both 'run' and 'script'; exactly one is required"
+        )
+    if not has_run and not has_script:
+        raise BatteryError(
+            f"prep setup step {step_id!r} declares neither 'run' nor 'script'; exactly one is required"
+        )
+    if has_run:
+        run = raw["run"]
+        if not isinstance(run, str):
+            raise BatteryError(f"prep setup step {step_id!r} 'run' must be a string")
+        return run, None
+    script = raw["script"]
+    if not isinstance(script, str) or not script:
+        raise BatteryError(f"prep setup step {step_id!r} 'script' must be a non-empty string")
+    return None, script
+
+
+def _parse_prep_distros(step_id: str, raw: dict[object, object]) -> tuple[str, ...]:
+    """Validate a step's optional ``distros`` allowlist (default ``()`` = all).
+
+    Each value must be a known distro key; an unknown distro is a typo and raises
+    naming it, rather than silently excluding the step on every host (D13.6).
+    """
+    if "distros" not in raw:
+        return ()
+    value = raw["distros"]
+    if not isinstance(value, list) or not all(isinstance(d, str) for d in value):
+        raise BatteryError(f"prep setup step {step_id!r} 'distros' must be a list of strings")
+    known = _known_distros()
+    for d in value:
+        if d not in known:
+            raise BatteryError(
+                f"prep setup step {step_id!r} 'distros' names unknown distro {d!r}; "
+                f"known: {sorted(known)}"
+            )
+    return tuple(value)
+
+
+def _parse_prep_required(step_id: str, raw: dict[object, object]) -> bool:
+    """Validate a step's optional ``required`` flag (default ``True``)."""
+    if "required" not in raw:
+        return True
+    value = raw["required"]
+    if not isinstance(value, bool):
+        raise BatteryError(f"prep setup step {step_id!r} 'required' must be a boolean")
+    return value
+
+
+def _parse_prep_timeout(step_id: str, raw: dict[object, object]) -> float | None:
+    """Validate a step's optional ``timeout`` (seconds); absent → ``None``.
+
+    Absent means ``None`` (the prep-step default applies at resolve time). A
+    present value must be a positive number; a bool, a non-number, or a
+    non-positive value raises :class:`BatteryError` (mirrors probe ``timeout``).
+    """
+    if "timeout" not in raw:
+        return None
+    value = raw["timeout"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BatteryError(
+            f"prep setup step {step_id!r} 'timeout' must be a positive number, got {value!r}"
+        )
+    if value <= 0:
+        raise BatteryError(
+            f"prep setup step {step_id!r} 'timeout' must be positive, got {value!r}"
+        )
+    return float(value)
 
 
 def load_battery(path: Path) -> Battery:
@@ -289,7 +571,47 @@ def _resolve(spec: _BatterySpec, base_dir: Path) -> Battery:
     the loader.
     """
     probes = tuple(_resolve_probe(s, base_dir) for s in spec.probes)
-    return Battery(name=spec.name, probes=probes)
+    prep = _resolve_prep(spec.prep, base_dir) if spec.prep is not None else None
+    return Battery(name=spec.name, probes=probes, requires=spec.requires, prep=prep)
+
+
+def _resolve_prep(spec: _PrepSpec, base_dir: Path) -> Prep:
+    """Resolve a prep spec into a :class:`~vmlease.model.Prep`.
+
+    Each setup step's ``script`` is read via :func:`_resolve_script_ref` (the same
+    bundle-containment + symlink-safe reader probes use), the ``run`` form is the
+    block verbatim; the resolved command is required **non-empty**. The packages
+    mapping is frozen (immutable). A step omitting ``timeout`` takes the prep-step
+    default (:data:`PREP_STEP_DEFAULT_TIMEOUT`).
+    """
+    setup = tuple(_resolve_prep_step(s, base_dir) for s in spec.setup)
+    return Prep(
+        packages=MappingProxyType(dict(spec.packages)),
+        setup=setup,
+    )
+
+
+def _resolve_prep_step(spec: _PrepStepSpec, base_dir: Path) -> PrepStep:
+    if spec.script is not None:
+        command = _resolve_script_ref(spec.id, spec.script, base_dir)
+        source = spec.script
+    else:
+        # ``run`` is guaranteed non-None here (exactly-one-of enforced at parse).
+        assert spec.run is not None
+        command = spec.run
+        source = "<inline>"
+    if not command.strip():
+        raise BatteryError(f"prep setup step {spec.id!r} has an empty command")
+    timeout = spec.timeout if spec.timeout is not None else PREP_STEP_DEFAULT_TIMEOUT
+    return PrepStep(
+        id=spec.id,
+        command=command,
+        distros=spec.distros,
+        required=spec.required,
+        title=spec.title,
+        timeout=timeout,
+        source=source,
+    )
 
 
 def _resolve_probe(spec: _ProbeSpec, base_dir: Path) -> Probe:

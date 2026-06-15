@@ -274,8 +274,13 @@ block (a literal shell string) or a `script` reference to a co-located shell fil
 named predicate over the captured `(exit_code, stdout, stderr)`; the manifest SHALL accept the assertion
 keys `exit`, `exit_not`, `stdout_has`, `stdout_lacks`, `stderr_has`, `stderr_lacks`, `stdout_matches`,
 `stdout_matches_not`, `stderr_matches`, `stderr_matches_not`, `stdout_empty`, and `stderr_empty`. The
-system SHALL raise a clear error for a malformed battery — invalid TOML, a missing required field, an
-unknown tag, an **unrecognized key** at the root, on a probe, or **in the `[probe.assert]` table** (a typo
+manifest SHALL also accept, at the **root**, an optional `requires` list and an optional `[prep]` section;
+these are recognized root keys and SHALL NOT be rejected as unknown. Their detailed schema and semantics
+are defined by the `host-capabilities` capability (`requires`) and the `battery-prep` capability (`[prep]`);
+this requirement only establishes that the loader accepts them at the root alongside `name` and the
+`[[probe]]` array. The system SHALL raise a clear error for a malformed battery — invalid TOML, a missing
+required field, an unknown tag, an **unrecognized key** at the root (any root key other than `name`,
+`probe`, `requires`, `prep`), on a probe, or **in the `[probe.assert]` table** (a typo
 like `timout` or `stdout_have` SHALL fail loud, naming the key, rather than silently falling back to a
 default), a probe declaring **neither** `run` nor `script`, a probe declaring **both**, an assertion whose
 value has the wrong shape (e.g. a non-integer `exit`, a non-string `stdout_has`, a non-boolean
@@ -299,6 +304,11 @@ assertions; the results document this feeds remains JSON.
 
 - **WHEN** a probe declares `[probe.assert]` with `exit = 0` and `stdout_has = "SETUP_OK"`
 - **THEN** the battery loads and that probe carries both assertions for the runner's ok evaluation
+
+#### Scenario: requires and [prep] are accepted at the root
+
+- **WHEN** a manifest carries a root-level `requires` list and/or a `[prep]` section alongside `name` and `[[probe]]`
+- **THEN** the battery loads (the keys are recognized, validated per the host-capabilities and battery-prep capabilities), not rejected as unknown root keys
 
 #### Scenario: A malformed battery is rejected
 
@@ -333,7 +343,7 @@ assertions; the results document this feeds remains JSON.
 
 #### Scenario: An unrecognized key is rejected
 
-- **WHEN** a manifest carries a key the schema does not define (e.g. a `timout` typo for `timeout`)
+- **WHEN** a manifest carries a key the schema does not define (e.g. a `timout` typo for `timeout`, or an unknown root key that is not `requires`/`prep`)
 - **THEN** the system raises a battery-load error naming the unrecognized key
 
 ### Requirement: Probes run in authoring order
@@ -399,17 +409,18 @@ does not alter how it runs; only its provenance is retained for linting and erro
 ### Requirement: A battery is shellchecked via a severity-gated lint command
 
 The system SHALL provide a `lint` command that loads a battery bundle and runs `shellcheck` over **every**
-probe's resolved shell text, in bash mode, labelling each finding with the probe's provenance (the script
+probe's resolved shell text **and over every `[[prep.setup]]` step's resolved shell text** (both inline `run`
+blocks and `script` references), in bash mode, labelling each finding with its provenance (the script
 file path — whose reported `line:col` aligns with the file, since the resolved text is the file's
-content — or the probe's id for an inline block). In addition to the shellcheck pass, the `lint` command
+content — or the probe/prep-step id for an inline block). In addition to the shellcheck pass, the `lint` command
 SHALL enforce the **structural verdict-source rule as a hard failure**: a probe that declares no assertions
 and contains an un-gated token-printing `echo` (a `&& echo`/`|| echo` anywhere, or a trailing-`echo` final
 statement, with no statement-level `exit` — the same detection the load-time advisory uses) SHALL cause the
 command to **exit non-zero**, naming the probe — so a battery whose `ok` would be vacuous cannot pass the
-gate (at load the same footgun is only an advisory warning; the `lint` command is where it is fatal). The command SHALL report the
+gate (at load the same footgun is only an advisory warning; the `lint` command is where it is fatal). The structural verdict-source rule applies to probes only (prep steps carry no verdict). The command SHALL report the
 findings and SHALL **exit non-zero when any shellcheck finding is at or above a configurable severity
 threshold (default `error`)**, so it is usable as a CI gate; the threshold SHALL be selectable (`error`,
-`warning`, or `note`) so a stricter gate can be opted into. Probe commands are authored as **bash** — the
+`warning`, or `note`) so a stricter gate can be opted into. Probe and prep commands are authored as **bash** — the
 dialect lint checks; guaranteeing that dialect at the execution transport is a separate follow-up change.
 When `shellcheck` is not installed, the command SHALL surface a notice and skip the shellcheck pass (still
 running the structural and advisory checks) rather than crashing — unless the caller passes a strict flag
@@ -418,9 +429,14 @@ green merely because the linter is missing.
 
 #### Scenario: A clean battery passes the gate
 
-- **WHEN** `lint` runs over a battery whose probes have no shellcheck findings at or above the threshold
+- **WHEN** `lint` runs over a battery whose probes and prep steps have no shellcheck findings at or above the threshold
   and no structural verdict-source violation
 - **THEN** the findings (if any, below threshold) are reported and the command exits zero
+
+#### Scenario: A prep script with a threshold finding fails the gate
+
+- **WHEN** `lint` runs over a battery whose `[[prep.setup]]` script has a shellcheck finding at or above the active threshold
+- **THEN** the finding is reported, labelled with the prep step's provenance, and the command exits non-zero
 
 #### Scenario: A battery with a threshold finding fails the gate
 

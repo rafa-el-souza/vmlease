@@ -48,14 +48,17 @@ from vmlease.battery import (
     load_battery,
     structural_violations,
 )
+from vmlease.capabilities import canonical_requires
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
 from vmlease.imagecache import (
-    LABEL_ARCH,
     LABEL_CACHE_KEY,
     LABEL_DISTRO,
+    LABEL_REQUIRES_HASH,
     base_fingerprint,
     cache_labels,
     content_key_from_base_fp,
+    group_of,
+    requires_hash,
     resolve_current_keys,
     superseded,
 )
@@ -151,7 +154,11 @@ def _parse_upload(value: str) -> UploadSpec:
     return UploadSpec(local=local, remote=remote)
 
 
-def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
+def _matrix_from_args(
+    args: argparse.Namespace,
+    workload: Workload,
+    requires: tuple[str, ...] = (),
+) -> Matrix:
     distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
     uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
     return Matrix(
@@ -161,6 +168,7 @@ def _matrix_from_args(args: argparse.Namespace, workload: Workload) -> Matrix:
         run_token=args.run_token,
         firewall=args.firewall,
         uploads=uploads,
+        requires=requires,
     )
 
 
@@ -173,7 +181,9 @@ def _warn_battery(battery: Battery) -> None:
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(args, ProbeWorkload(battery))
+        matrix = _matrix_from_args(
+            args, ProbeWorkload(battery), canonical_requires(battery.requires)
+        )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -182,7 +192,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}")
+        requires_note = f"  requires={list(it.requires)}" if it.requires else ""
+        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
     return 0
 
 
@@ -197,7 +208,9 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
 def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(args, ProbeWorkload(battery))
+        matrix = _matrix_from_args(
+            args, ProbeWorkload(battery), canonical_requires(battery.requires)
+        )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -207,7 +220,8 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}")
+        requires_note = f"  requires={list(it.requires)}" if it.requires else ""
+        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}{requires_note}")
     if not _confirm("Proceed with provisioning? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0
@@ -391,6 +405,11 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
 
     run_id = make_run_id(args.run_token)
     arch = server_type_arch(args.server_type)
+    # The capability variant to bake (D13.7): canonicalized through the SAME helper
+    # the run path uses to lift `requires` from the battery, so build-image and run
+    # can never compute divergent keys from a second parser inventing a different
+    # order. `--requires` is repeatable; default `()` builds the capability-less variant.
+    requires = canonical_requires(tuple(args.requires or ()))
     provider = HetznerProvider()
 
     # Resolve the base fingerprint ONCE (the expensive, network/gpg step for a
@@ -401,7 +420,7 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     try:
         deps = _build_image_resolve_deps(profile, keyring_dir)
         base_fp = base_fingerprint(profile, arch, deps)
-        key = content_key_from_base_fp(base_fp, profile, arch, args.operator)
+        key = content_key_from_base_fp(base_fp, profile, arch, args.operator, requires)
     except ArchBuildError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -423,12 +442,17 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
         print(f"already cached (key {key}); nothing to do")
         return 0
 
-    # Quota + D8(B) prune ordering. S = same-(distro,arch) cache images whose key
-    # differs from K_new (this group's superseded predecessors).
+    # Quota + D8(B) prune ordering. S = same-(distro, arch, requires-hash) cache
+    # images whose key differs from K_new (this group's superseded predecessors).
+    # The required-capability set is part of the group identity (D-D correction),
+    # so a `--requires docker` build never prunes the docker-less variant.
+    group_requires_hash = requires_hash(requires)
     same_group = [
         img
         for img in images
-        if img.labels.get(LABEL_DISTRO) == profile.key and img.arch == arch
+        if img.labels.get(LABEL_DISTRO) == profile.key
+        and img.arch == arch
+        and img.labels.get(LABEL_REQUIRES_HASH, "") == group_requires_hash
     ]
     s_prune = superseded(same_group, key)
     guard = ImageQuotaGuard(max_images=args.max_images)
@@ -479,10 +503,11 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
             distro_key=args.distro,
             labels=run_label(run_id),
             firewall=args.firewall,
+            requires=requires,
         )
         on_ready = make_snapshot_on_ready(
             description=f"vmlease cache {args.distro} {key}",
-            labels=cache_labels(profile, arch, key, base_fp, args.run_token),
+            labels=cache_labels(profile, arch, key, base_fp, args.run_token, requires),
             sleep=time.sleep,
         )
         note_sink: list[str] = []
@@ -664,11 +689,7 @@ def _reap_images_superseded_set(
         current_keys = resolve_current_keys(images, get_profile, operator, deps, warn)
         superseded_ids: set[str] = set()
         for group, current_key in current_keys.items():
-            group_imgs = [
-                img
-                for img in images
-                if (img.labels.get(LABEL_DISTRO, ""), img.labels.get(LABEL_ARCH, "")) == group
-            ]
+            group_imgs = [img for img in images if group_of(img) == group]
             for img in superseded(group_imgs, current_key):
                 superseded_ids.add(img.id)
         return superseded_ids
@@ -922,6 +943,11 @@ def build_parser() -> argparse.ArgumentParser:
         "build-image", help="build a content-addressed snapshot cache image (billable; confirm-gated)"
     )
     build_p.add_argument("--distro", required=True, help="distro key to build a cache image for (e.g. ubuntu, arch)")
+    build_p.add_argument(
+        "--requires", action="append", metavar="CAPABILITY",
+        help="vmlease-provided capability to bake into this variant (e.g. docker); "
+        "repeatable; default none builds the capability-less variant",
+    )
     build_p.add_argument("--server-type", default="cpx22", help="builder instance size (default: cpx22)")
     build_p.add_argument("--operator", default="probe", help="non-root operator account baked into the image")
     build_p.add_argument("--run-token", required=True, help="determinism seam for the builder run-id / reap label")
