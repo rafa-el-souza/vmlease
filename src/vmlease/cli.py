@@ -67,6 +67,7 @@ from vmlease.model import Battery, HostRun, HostSpec, Image, UploadSpec
 from vmlease.providers import HetznerProvider, Provider, ProviderError, ProviderQuotaError
 from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import (
+    KEPT_HOST_PREFIX,
     TEARDOWN_WARNING_PREFIX,
     Matrix,
     RescueWriter,
@@ -226,6 +227,16 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         print("aborted — nothing provisioned.")
         return 0
 
+    if args.keep and not _confirm(
+        "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
+        f"reaped manually (`vmlease reap --run-token {args.run_token}`). Continue? [y/N]: ",
+        assume_yes=args.yes,
+        reader=reader,
+    ):
+        # Abort BEFORE any provider call / generate_keypair so nothing is provisioned.
+        print("aborted — nothing provisioned.")
+        return 0
+
     run_id = make_run_id(args.run_token)
     try:
         keypair = generate_keypair(run_id)
@@ -275,6 +286,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
             max_parallel=args.parallel, on_host_complete=_persist,
             resolve_deps=resolve_deps, reap_bad_cache_image=args.reap_bad_cache_image,
+            keep=args.keep,
         )
     except (KeyboardInterrupt, SystemExit):
         # Aborted mid-run: the per-host hosts that finished are already on disk
@@ -329,6 +341,30 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             print(f"  - {hr.host_spec.name}: {hr.detail}", file=sys.stderr)
         print(f"results: {writer.path}", file=sys.stderr)
         return 1
+
+    if args.keep:
+        # ``--keep`` left host(s) standing on purpose (no teardown note, so the
+        # teardown-failure block above never fired). Surface a consolidated,
+        # actionable LIVE-host block. Exit code is unchanged — a kept run with
+        # passing probes still returns 0.
+        kept = [hr for hr in host_runs if KEPT_HOST_PREFIX in hr.detail]
+        if kept:
+            print(
+                f"WARNING: --keep left {len(kept)} billable host(s) LIVE",
+                file=sys.stderr,
+            )
+            for hr in kept:
+                for line in hr.detail.splitlines():
+                    if KEPT_HOST_PREFIX in line:
+                        print(f"  - {line}", file=sys.stderr)
+            print(
+                f"DESTROY ALL when done:  vmlease reap --run-token {args.run_token}",
+                file=sys.stderr,
+            )
+            print(
+                f"  (the temp ssh key dir survives on disk: {keypair.directory})",
+                file=sys.stderr,
+            )
 
     print(f"results: {writer.path}")
     return 0
@@ -932,6 +968,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="default per-probe ssh timeout in seconds (a probe's own timeout overrides; default 600)",
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
+    run_p.add_argument(
+        "--keep", action="store_true",
+        help="leave provisioned host(s) RUNNING (billable) after the run and print how to SSH in; "
+        "reap with `vmlease reap --run-token <token>` when done",
+    )
     run_p.add_argument(
         "--reap-bad-cache-image", action="store_true",
         help="if a restored host fails readiness, reap the source cache image (default: hint only — "

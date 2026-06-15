@@ -3495,6 +3495,203 @@ class TestWorkloadSeam(unittest.TestCase):
         self.assertEqual(items[0].workload_summary, wl.plan_summary)
 
 
+class _RaisingWorkload:
+    """A workload whose ``run`` raises (a transport-style host failure)."""
+
+    plan_summary = "raise"
+
+    def run(self, spec: HostSpec, host: Host, runner_ssh: ssh.SshRunner, /) -> model.HostRun:
+        raise ssh.SshError("workload boom")
+
+
+class _ZeroProbeWorkload:
+    """A workload that returns normally with a zero-probe HostRun (prep hard-abort
+    shape: a non-raising return carrying no probe results)."""
+
+    plan_summary = "prep-abort"
+
+    def run(self, spec: HostSpec, host: Host, ssh: ssh.SshRunner, /) -> model.HostRun:
+        return model.HostRun(
+            host_spec=spec, detail="prep packages install failed (hard abort)", results=()
+        )
+
+
+class _SpyKeypair(keypair.Keypair):
+    """A Keypair that records whether ``cleanup`` was called (the survives-under-keep
+    guard for the printed ``ssh -i <path>`` pointing at a live file)."""
+
+    cleaned: list[bool]
+
+    @staticmethod
+    def make(tmp: Path) -> _SpyKeypair:
+        d = tmp / "kp"
+        d.mkdir(parents=True, exist_ok=True)
+        priv = d / "id_ed25519"
+        priv.write_text("PRIV", encoding="utf-8")
+        kp = _SpyKeypair(directory=d, private_key_path=priv, public_key="ssh-ed25519 AAAA probe")
+        object.__setattr__(kp, "cleaned", [])
+        return kp
+
+    def cleanup(self) -> None:
+        self.cleaned.append(True)
+        # do NOT actually rmtree — tests read the dir afterwards.
+
+
+class TestKeepFlag(unittest.TestCase):
+    """The ``--keep`` design: kept hosts are NOT destroyed, leave a KEPT note, and
+    the keypair survives so the printed ssh path is real."""
+
+    def _matrix(
+        self, distros: tuple[str, ...] = ("ubuntu",), wl: workload.Workload | None = None
+    ) -> runner.Matrix:
+        return runner.Matrix(wl or _demo_workload(), distros, "cpx22", "run-keep")
+
+    def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
+        return lambda _op, _kp: ssh_runner
+
+    def test_kept_host_not_destroyed_and_carries_kept_note(self) -> None:
+        # 1: keep=True → provider.destroy NEVER called; detail carries the KEPT
+        # marker, ipv4, operator, and the key path.
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        with tempfile.TemporaryDirectory() as d:
+            kp = _fake_keypair(Path(d))
+            runs = runner.execute(
+                self._matrix(), prov, self._factory(fssh), kp, "probe", keep=True
+            )
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(prov.destroyed, [])  # NEVER torn down under keep
+        detail = runs[0].detail
+        self.assertIn(runner.KEPT_HOST_PREFIX, detail)
+        self.assertIn("10.0.0.1", detail)  # the host ipv4
+        self.assertIn("probe@10.0.0.1", detail)  # operator@ip ssh target
+        self.assertIn(str(kp.private_key_path), detail)  # the real key path
+
+    def test_default_run_still_destroys(self) -> None:
+        # 2: regression — default (keep absent) STILL tears down.
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(self._matrix(), prov, self._factory(fssh), _fake_keypair(Path(d)), "probe")
+        self.assertEqual(len(prov.destroyed), 1)
+        self.assertNotIn(runner.KEPT_HOST_PREFIX, runs[0].detail)
+
+    def test_multi_host_all_kept_even_when_one_workload_raises(self) -> None:
+        # 3: two hosts, one workload raises → both kept (destroy never called for
+        # either), two HostRuns in matrix order, the failed one carries its error
+        # AND the KEPT note.
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        m = self._matrix(("ubuntu", "debian"), wl=_RaisingWorkload())
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(m, prov, self._factory(fssh), _fake_keypair(Path(d)), "probe", keep=True)
+        self.assertEqual(prov.destroyed, [])  # neither host torn down
+        self.assertEqual(len(runs), 2)
+        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])  # matrix order
+        for r in runs:
+            self.assertIn("ERROR:", r.detail)  # the workload raise mapped to error
+            self.assertIn(runner.KEPT_HOST_PREFIX, r.detail)  # AND kept
+
+    def test_keypair_survives_under_keep_but_not_otherwise(self) -> None:
+        # 4: cleanup NOT called when keep=True; IS called when keep=False.
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            kept = _SpyKeypair.make(Path(d) / "a")
+            runner.execute(self._matrix(), prov, self._factory(FakeSshRunner()), kept, "probe", keep=True)
+            self.assertEqual(kept.cleaned, [])  # survives → ssh -i <path> is real
+
+            torn = _SpyKeypair.make(Path(d) / "b")
+            runner.execute(self._matrix(), FakeProvider(), self._factory(FakeSshRunner()), torn, "probe")
+            self.assertEqual(torn.cleaned, [True])  # default → reaped
+
+    def test_prep_hard_abort_host_is_kept(self) -> None:
+        # 5: a zero-probe HostRun (prep abort returns normally) under keep → host
+        # NOT destroyed, KEPT note present.
+        prov = FakeProvider()
+        m = self._matrix(wl=_ZeroProbeWorkload())
+        with tempfile.TemporaryDirectory() as d:
+            runs = runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe", keep=True)
+        self.assertEqual(prov.destroyed, [])  # kept despite prep abort
+        self.assertEqual(runs[0].results, ())  # zero probes
+        self.assertIn(runner.KEPT_HOST_PREFIX, runs[0].detail)
+
+    def test_build_image_still_destroys_its_builder(self) -> None:
+        # 6: blast-radius guard — build_one_image has no keep; its builder is
+        # ALWAYS torn down.
+        prov = FakeProvider()
+        fssh = FakeSshRunner()
+        note_sink: list[str] = []
+        on_ready = runner.make_snapshot_on_ready(
+            "v1-ubuntu-key", {"vmlease-cache-key": "v1-ubuntu-key"}, sleep=lambda _s: None, poweroff_attempts=5
+        )
+        spec = HostSpec(
+            name="vmlease-build-ubuntu",
+            image=distro.get_profile("ubuntu").default_image,
+            server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "build-run"},
+        )
+        with tempfile.TemporaryDirectory() as d:
+            runner.build_one_image(
+                spec, distro.get_profile("ubuntu"), prov, lambda _o, _k: fssh,
+                _fake_keypair(Path(d)), "probe", None, on_ready=on_ready, note_sink=note_sink,
+            )
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-build-ubuntu"])  # ALWAYS reaped
+        self.assertEqual(note_sink, [])
+
+    def test_cli_keep_gate_aborts_before_provisioning(self) -> None:
+        # 7: --keep without --yes, reader "n" → aborts BEFORE keypair/provision.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu", "--keep",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            generated: list[str] = []
+
+            def _spy_keygen(rid: str) -> keypair.Keypair:
+                generated.append(rid)
+                return _fake_keypair(Path(d))
+
+            buf = io.StringIO()
+            # reader says "y" to the FIRST (provisioning) confirm, then "n" to the
+            # --keep confirm → must abort before any keypair is generated.
+            answers = iter(["y", "n"])
+            with mock.patch.object(cli, "generate_keypair", _spy_keygen), redirect_stdout(buf):
+                rc = cli._cmd_run(ns, reader=lambda _p: next(answers))
+            self.assertEqual(rc, 0)
+            self.assertIn("aborted", buf.getvalue())
+            self.assertEqual(generated, [])  # no keypair → no provisioning
+            self.assertFalse((Path(d) / "r").exists())
+
+    def test_cli_keep_proceeds_with_yes(self) -> None:
+        # 7 (proceed leg): --keep with --yes → both confirms skipped, run proceeds
+        # and the keypair IS generated (provisioning attempted).
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu", "--keep", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            generated: list[str] = []
+
+            def _spy_keygen(rid: str) -> keypair.Keypair:
+                generated.append(rid)
+                return _fake_keypair(Path(d))
+
+            fssh = FakeSshRunner()
+            buf = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", _spy_keygen), \
+                    mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: fssh), \
+                    redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                rc = cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(generated), 1)  # proceeded → keypair generated
+
+
 class _ScriptedTimeoutSsh:
     """An SshRunner whose ``run_probe`` returns timed-out results for named probes.
 

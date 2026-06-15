@@ -49,6 +49,21 @@ R = TypeVar("R")
 # greps for it to exit non-zero (D3). Pinned verbatim — imported elsewhere.
 TEARDOWN_WARNING_PREFIX = "WARNING: teardown of"
 
+# The marker a KEPT (not-torn-down, ``--keep``) host leaves in its detail, shared
+# between the producer (:func:`_kept_note`) and the CLI consumer that greps for it
+# to print the consolidated live-host / reap block. Distinct from
+# ``TEARDOWN_WARNING_PREFIX`` so the teardown-failure reap path never fires on a
+# deliberately kept host.
+KEPT_HOST_PREFIX = "KEPT:"
+
+
+def _kept_note(host: Host, operator: str, key_path: object) -> str:
+    """The single note a kept host leaves: how to SSH into the live machine."""
+    return (
+        f"{KEPT_HOST_PREFIX} {host.name} ({host.id}) is LIVE at {host.ipv4} "
+        f"— ssh -i {key_path} {operator}@{host.ipv4}"
+    )
+
 
 @dataclass(frozen=True)
 class Matrix:
@@ -193,6 +208,7 @@ def execute(
     on_host_complete: Callable[[HostRun], None] | None = None,
     resolve_deps: ResolveDeps | None = None,
     reap_bad_cache_image: bool = False,
+    keep: bool = False,
 ) -> list[HostRun]:
     """Per host: provision -> (rescue-write) -> run workload -> **tear down immediately**.
 
@@ -247,7 +263,7 @@ def execute(
     def _one(spec: HostSpec) -> HostRun:
         return _run_one_host(
             spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads,
-            resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image,
+            resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image, keep=keep,
         )
 
     def _notify(host_run: HostRun) -> None:
@@ -295,7 +311,11 @@ def execute(
                 raise
             return [hr for hr in ordered if hr is not None]
     finally:
-        keypair.cleanup()
+        # Under ``--keep`` the private key must SURVIVE the run so the printed
+        # ``ssh -i <path>`` points at a real file the operator can use against the
+        # still-live host(s). Otherwise the key dir is reaped as usual.
+        if not keep:
+            keypair.cleanup()
 
 
 def _run_one_host(
@@ -310,6 +330,7 @@ def _run_one_host(
     *,
     resolve_deps: ResolveDeps | None = None,
     reap_bad_cache_image: bool = False,
+    keep: bool = False,
 ) -> HostRun:
     """Create, (rescue-write,) run the workload, and ALWAYS destroy a single host.
 
@@ -409,6 +430,7 @@ def _run_one_host(
             on_ready=on_ready,
             note_sink=note_sink,
             on_chosen=chosen.append,
+            keep=keep,
         )
     except Exception as exc:  # provider / rescue / transport failure → record, don't abort
         if chosen and chosen[0] == restored_index and restore_image_id is not None:
@@ -567,6 +589,7 @@ def _with_ready_host(
     on_ready: OnReady[R],
     note_sink: list[str],
     on_chosen: Callable[[int], None] | None = None,
+    keep: bool = False,
 ) -> R:
     """Create → (rescue-write) → wait-ready → ``on_ready``, ALWAYS tearing down.
 
@@ -631,9 +654,15 @@ def _with_ready_host(
         # unwinding). The note is surfaced to the caller via ``note_sink`` — never
         # swallowed, never raised.
         if host is not None:
-            teardown_note = _best_effort_destroy(provider, host)
-            if teardown_note:
-                note_sink.append(teardown_note)
+            if keep:
+                # ``--keep``: leave the live host standing (regardless of outcome —
+                # success, probe-fail, or prep hard-abort) and surface exactly one
+                # KEPT note via note_sink so the operator can SSH in and later reap.
+                note_sink.append(_kept_note(host, operator, keypair.private_key_path))
+            else:
+                teardown_note = _best_effort_destroy(provider, host)
+                if teardown_note:
+                    note_sink.append(teardown_note)
 
 
 def _create_first_viable(
