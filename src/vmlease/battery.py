@@ -88,10 +88,12 @@ _ROOT_KEYS = frozenset({"name", "probe", "requires", "prep"})
 _PREP_KEYS = frozenset({"packages", "setup"})
 _PREP_STEP_KEYS = frozenset({"id", "run", "script", "distros", "required", "title", "timeout"})
 
-# The prep-step ``timeout`` default (seconds) — longer than the probe-runner
-# default, since prep steps include source builds (e.g. debian-13's ~1800s tlog
-# source build). Applied at resolve time when a step omits ``timeout``.
-_PREP_STEP_DEFAULT_TIMEOUT = 1800.0
+# The prep-phase ``timeout`` default (seconds) — longer than the probe-runner
+# default, since prep work includes source builds (e.g. debian-13's ~1800s tlog
+# source build). Applied at resolve time when a setup step omits ``timeout``, and
+# reused by the runtime package-install pass (workload). Public: it's the single
+# source of the prep-phase bound, shared across the loader and the runner.
+PREP_STEP_DEFAULT_TIMEOUT = 1800.0
 
 
 def _known_managers() -> frozenset[str]:
@@ -580,7 +582,7 @@ def _resolve_prep(spec: _PrepSpec, base_dir: Path) -> Prep:
     bundle-containment + symlink-safe reader probes use), the ``run`` form is the
     block verbatim; the resolved command is required **non-empty**. The packages
     mapping is frozen (immutable). A step omitting ``timeout`` takes the prep-step
-    default (:data:`_PREP_STEP_DEFAULT_TIMEOUT`).
+    default (:data:`PREP_STEP_DEFAULT_TIMEOUT`).
     """
     setup = tuple(_resolve_prep_step(s, base_dir) for s in spec.setup)
     return Prep(
@@ -600,7 +602,7 @@ def _resolve_prep_step(spec: _PrepStepSpec, base_dir: Path) -> PrepStep:
         source = "<inline>"
     if not command.strip():
         raise BatteryError(f"prep setup step {spec.id!r} has an empty command")
-    timeout = spec.timeout if spec.timeout is not None else _PREP_STEP_DEFAULT_TIMEOUT
+    timeout = spec.timeout if spec.timeout is not None else PREP_STEP_DEFAULT_TIMEOUT
     return PrepStep(
         id=spec.id,
         command=command,

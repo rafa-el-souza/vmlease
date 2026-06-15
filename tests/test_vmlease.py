@@ -3772,7 +3772,7 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
 
     def test_setup_step_timeout_default_is_1800(self) -> None:
         # an explicit step timeout overrides; an absent one takes the loader-resolved
-        # default (battery._PREP_STEP_DEFAULT_TIMEOUT, 1800s) — verified end-to-end at
+        # default (battery.PREP_STEP_DEFAULT_TIMEOUT, 1800s) — verified end-to-end at
         # the probe the workload submits.
         prep = (
             "[[prep.setup]]\nid = '''d'''\nrun = '''c'''\n"
@@ -3789,6 +3789,22 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
         wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
         self.assertEqual(seen["d"], 1800.0)
         self.assertEqual(seen["o"], 42.0)
+
+    def test_package_pass_uses_the_prep_timeout_default(self) -> None:
+        # the [prep.packages] install is prep work, so its synthetic _packages probe
+        # shares the prep-phase bound (1800s), not the shorter probe default.
+        prep = "[prep.packages]\napt = ['''jq''']\n"
+        seen: dict[str, float | None] = {}
+
+        class _TimeoutRecordingSsh(_ScriptedPrepSsh):
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                seen[probe.id] = probe.timeout
+                return super().run_probe(host, probe)
+
+        wl = workload.ProbeWorkload(self._battery(prep))
+        wl.run(self._spec(), self._host(), _TimeoutRecordingSsh())
+        self.assertEqual(seen["_packages"], battery_mod.PREP_STEP_DEFAULT_TIMEOUT)
+        self.assertEqual(seen["_packages"], 1800.0)
 
 
 # --------------------------------------------------------------------------- #

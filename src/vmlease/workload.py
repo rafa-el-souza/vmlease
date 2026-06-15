@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from vmlease import capabilities, distro
+from vmlease.battery import PREP_STEP_DEFAULT_TIMEOUT
 from vmlease.model import HostRun, PrepStepResult, Probe, ProbeTag
 
 if TYPE_CHECKING:
@@ -209,14 +210,21 @@ class ProbeWorkload:
         On apt, ``apt-get update`` runs FIRST (D13.2) so the install pass sees a
         fresh index. Returns ``True`` on success, ``False`` on a non-zero exit
         (a hard abort). The outcome is recorded in ``prep_phase`` under the
-        synthetic step id ``_packages`` (always ``required=True``).
+        synthetic step id ``_packages`` (always ``required=True``). The install is
+        bounded by the prep-phase default (:data:`PREP_STEP_DEFAULT_TIMEOUT`) — a
+        heavy package set is prep work, so it shares the setup-step bound rather
+        than the shorter probe default.
         """
         install = capabilities.install_command(manager)
         command = f"sudo {install} {' '.join(packages)}"
         if manager == "apt":
             command = f"sudo apt-get update && {command}"
         probe = Probe(
-            id="_packages", title="prep packages", command=command, tag=ProbeTag.MUTATING_HOST_ROOT
+            id="_packages",
+            title="prep packages",
+            command=command,
+            tag=ProbeTag.MUTATING_HOST_ROOT,
+            timeout=PREP_STEP_DEFAULT_TIMEOUT,
         )
         outcome = ssh.run_probe(host, probe)
         prep_phase.append(
@@ -228,7 +236,7 @@ class ProbeWorkload:
         """Run one ``[[prep.setup]]`` step and capture it as a :class:`PrepStepResult`.
 
         The step's ``timeout`` is loader-resolved — the D13.1 1800s default is
-        applied at battery load (:data:`vmlease.battery._PREP_STEP_DEFAULT_TIMEOUT`)
+        applied at battery load (:data:`vmlease.battery.PREP_STEP_DEFAULT_TIMEOUT`)
         when a step omits ``timeout``. The command runs verbatim over SSH (the
         author writes ``sudo`` inline where root is needed).
         """
