@@ -75,10 +75,14 @@ creating any host, with an opt-out flag for non-interactive use.
 The system SHALL provide a `reap` that destroys every live host carrying a run's label and returns what it
 destroyed, tolerating already-gone hosts so a re-reap is safe; a `destroy` SHALL retry transient
 provider timeouts, and reap correctness SHALL be confirmed by verifying zero residue rather than by a
-delete's reported success. The reap backstop SHALL also be triggered automatically by the run command in
-two cases so that a leaked billable host is never silent: when the run is **aborted** by a
-`KeyboardInterrupt` or `SystemExit`, the command SHALL reap the run label, report what it reaped, and
-re-raise; and when any host reports a **teardown failure**, the command SHALL attempt a reap, print a
+delete's reported success. The **automatic** backstops triggered by the run command SHALL reap only the
+hosts of the run label that are NOT marked to be kept: a deliberately kept host carries a keep marker label
+and SHALL be spared by the backstop, whereas the **explicit** `reap` command (and the `vmlease reap`
+verb) destroys every labelled host including kept ones — the operator's deliberate "destroy all". The
+backstop SHALL be triggered automatically in two cases so that a leaked billable host is never silent:
+when the run is **aborted** by a `KeyboardInterrupt` or `SystemExit`, the command SHALL reap the non-kept
+hosts of the run label, report what it reaped (and note any kept hosts left live), and re-raise; and when
+any host reports a **teardown failure**, the command SHALL attempt a reap of the non-kept hosts, print a
 prominent summary, and exit non-zero. A run whose hosts all tore down cleanly SHALL still exit zero.
 
 #### Scenario: Reap destroys all of a run's hosts
@@ -97,17 +101,25 @@ prominent summary, and exit non-zero. A run whose hosts all tore down cleanly SH
 - **THEN** the system retries and treats post-delete zero-residue as the proof of teardown, not the
   command's reported success
 
-#### Scenario: An aborted run reaps before propagating
+#### Scenario: An aborted run reaps non-kept hosts before propagating
 
 - **WHEN** the run command is interrupted by a `KeyboardInterrupt` or `SystemExit` during execution
-- **THEN** it reaps the run label as a backstop, reports what it reaped, re-raises the interruption, and
-  leaves the incrementally-written results file holding every host that had finished before the abort
+- **THEN** it reaps the run's hosts that are not marked to be kept as a backstop, leaves every kept host
+  live, reports what it reaped, re-raises the interruption, and leaves the incrementally-written results
+  file holding every host that had finished before the abort
+
+#### Scenario: A kept host survives the automatic backstop
+
+- **WHEN** a run with a kept host (a bare keep or a kept distro subset) is aborted or has a teardown
+  failure on a different host
+- **THEN** the automatic backstop spares every host carrying the keep marker and destroys only the
+  non-kept hosts, so the operator can still SSH into the kept host afterward
 
 #### Scenario: A teardown failure surfaces as a non-zero exit
 
 - **WHEN** any host's result carries a teardown-failure warning after the run
-- **THEN** the command attempts a reap of the run label, prints a prominent summary, and exits non-zero —
-  while a run with all hosts torn down cleanly exits zero
+- **THEN** the command attempts a reap of the non-kept hosts of the run label, prints a prominent summary,
+  and exits non-zero — while a run with all hosts torn down cleanly exits zero
 
 ### Requirement: The harness is provider-token-blind
 
