@@ -32,6 +32,18 @@ def serialize_run(run_id: str, timestamp: str, host_runs: list[HostRun]) -> str:
                 "distro": hr.host_spec.distro_key,
                 "image": hr.host_spec.image,
                 "restored_image": hr.restored_image,
+                "kept_host": (
+                    {
+                        "name": hr.kept_host.name,
+                        "id": hr.kept_host.id,
+                        "ipv4": hr.kept_host.ipv4,
+                        "distro": hr.kept_host.distro,
+                        "operator": hr.kept_host.operator,
+                        "key_path": hr.kept_host.key_path,
+                    }
+                    if hr.kept_host is not None
+                    else None
+                ),
                 "detail": hr.detail,
                 "prep_phase": [
                     {

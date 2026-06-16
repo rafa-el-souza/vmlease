@@ -1,7 +1,7 @@
 # vm-provisioning Specification
 
 ## Purpose
-The provision → (transform) → run-workload → always-teardown spine: build a matrix into labelled host specs, render a `plan` dry-run that makes zero provider calls, and execute each host in isolation (one host's failure never discards another's results) with optional parallelism, over a `Provider` abstraction.
+The provision → (transform) → run-workload → teardown spine (each host torn down by default, or left live when `--keep` selects it): build a matrix into labelled host specs, render a `plan` dry-run that makes zero provider calls, and execute each host in isolation (one host's failure never discards another's results) with optional parallelism, over a `Provider` abstraction.
 ## Requirements
 ### Requirement: Matrix builds into labelled host specs deterministically
 
@@ -65,8 +65,10 @@ try/finally before the next host starts, so that a failure to provision, transfo
 recorded as an error result for that host (not a propagating exception) and every other host still
 produces a result. Teardown SHALL run in a `finally` that fires even when a `BaseException` (for example
 a `KeyboardInterrupt` from operator Ctrl-C, or a `SystemExit`) propagates through the host's workload — a
-caught `Exception` is not the only path that must still tear the host down. Each host's result SHALL be
-surfaced to the caller **as that host completes** (not only in the aggregate returned at the end), so a
+caught `Exception` is not the only path that must still tear the host down — UNLESS the host is marked to
+be kept (see "Keeping selected hosts live for debugging"), in which case the `finally` deliberately leaves
+the host standing and records its reattach coordinates instead of destroying it. Each host's result SHALL
+be surfaced to the caller **as that host completes** (not only in the aggregate returned at the end), so a
 caller can persist results incrementally; the aggregate return is preserved in matrix order.
 
 #### Scenario: One host's provisioning failure does not abort the run
@@ -77,20 +79,27 @@ caller can persist results incrementally; the aggregate return is preserved in m
 
 #### Scenario: Teardown always runs and never loses results
 
-- **WHEN** a host's workload has completed (or errored)
+- **WHEN** a host's workload has completed (or errored) and the host is not marked to be kept
 - **THEN** the host is destroyed in a finally block; if the destroy itself fails, the failure is appended
   to the result as a reap-it warning rather than discarding the collected results
 
 #### Scenario: Teardown runs even when the workload raises a BaseException
 
 - **WHEN** a host's workload raises a `BaseException` (such as `KeyboardInterrupt` or `SystemExit`) after
-  the host has been created
+  the host has been created and the host is not marked to be kept
 - **THEN** the host is still destroyed by the `finally` before the exception propagates, so an aborted run
   leaves no billable host behind that path
 
+#### Scenario: A kept host is left live even when the workload raises a BaseException
+
+- **WHEN** a host marked to be kept has its workload raise a `BaseException` (for example operator Ctrl-C)
+  after the host has been created
+- **THEN** the `finally` leaves the host live rather than destroying it, and records the kept host's
+  reattach coordinates, so the operator can SSH into it after the abort
+
 #### Scenario: Each host's result is surfaced as it completes
 
-- **WHEN** a host finishes (its workload completed or errored and it has been torn down)
+- **WHEN** a host finishes (its workload completed or errored and it has been torn down or kept)
 - **THEN** its result is handed to the caller's completion sink at that point, before later hosts finish,
   while the final aggregate is still returned in matrix order
 
@@ -167,4 +176,33 @@ SHALL be performed at provision time, never during `plan`. A run SHALL **consume
 #### Scenario: A run never builds a cache image
 - **WHEN** a run encounters a cache miss
 - **THEN** it provisions via the cold path and does not create a cache image
+
+### Requirement: Keeping selected hosts live for debugging
+
+The run command SHALL accept a keep selection that leaves provisioned hosts RUNNING (billable) instead of
+tearing them down, so an operator can SSH in and iterate against a live host. The selection SHALL be
+per-host: a bare/empty selection keeps every host; a named-distro selection keeps only hosts of those
+distros and tears down the rest. A named distro that is not part of the run's distro set SHALL be rejected
+before any host is provisioned, so a typo costs nothing. Each kept host SHALL carry a keep marker label
+that distinguishes it from torn-down hosts, and SHALL record a structured reattach record — host name, id,
+IPv4, distro, operator, and the private-key path — so the live host is discoverable from the results
+without parsing prose. When any host is kept, the run's throwaway keypair SHALL survive the run so the
+recorded SSH key path points at a real file.
+
+#### Scenario: Bare keep leaves all hosts live
+
+- **WHEN** a run requests keep with no distro selection
+- **THEN** no host is torn down, each carries the keep marker label, and each records its structured
+  reattach coordinates
+
+#### Scenario: Per-distro keep leaves only the named hosts live
+
+- **WHEN** a run over multiple distros requests keep of a distro subset
+- **THEN** only the named distros' hosts are left live (each with the keep marker label and a reattach
+  record) and every other host is torn down normally
+
+#### Scenario: An unknown keep distro is rejected before spend
+
+- **WHEN** the keep selection names a distro not in the run's distro set
+- **THEN** the command reports the error and provisions nothing
 

@@ -347,6 +347,19 @@ class ProbeResult:
 
 
 @dataclass(frozen=True)
+class KeptHost:
+    """Reattach coordinates for a host left live by ``--keep`` — the structured
+    record a future ``vmlease attach`` reads (and the durable form of the KEPT note)."""
+
+    name: str
+    id: str
+    ipv4: str
+    distro: str
+    operator: str
+    key_path: str
+
+
+@dataclass(frozen=True)
 class HostRun:
     """All results for one host plus its self-describing detail snapshot.
 
@@ -368,6 +381,7 @@ class HostRun:
     results: tuple[ProbeResult, ...]
     prep_phase: tuple[PrepStepResult, ...] = ()
     restored_image: str | None = None
+    kept_host: KeptHost | None = None
 
 
 @dataclass(frozen=True)
