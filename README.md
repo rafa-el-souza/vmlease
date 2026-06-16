@@ -1,17 +1,18 @@
 # vmlease
 
-Provision throwaway cloud VMs, run a workload over SSH, and **always** tear them down — a small,
+Provision throwaway cloud VMs, run a workload over SSH, and tear them down by default (or keep one live to debug) — a small,
 project-agnostic VM-provisioning + probe harness. Built for empirical checks that need a fresh, real host
 (the "ratified ≠ validated" gate): spin a disposable VM per distro, run a declarative battery of probes,
-capture structured results, and guarantee teardown.
+capture structured results, and guarantee teardown by default.
 
 > Graduated from `probehost` (developed inside the `internal-tooling` skill tree, HEAD `efb8f38`) into this
 > standalone repo. The behavior is a faithful port; the package/label were renamed `probehost` → `vmlease`.
 
 ## What it does
 
-- **Provision → run → guaranteed teardown.** Each host is created, probed, and destroyed in its own
-  `try/finally`, so one host's failure never discards another's results, and nothing is left billing.
+- **Provision → run → guaranteed teardown (by default).** Each host is created, probed, and destroyed in its own
+  `try/finally`, so one host's failure never discards another's results, and nothing is left billing — unless you
+  deliberately opt a host out with `--keep`, which stays billable and reap-tracked.
 - **Safety first.** A cost guard (host cap + cheap-server-type allowlist), `vmlease=<run-id>` labels,
   confirm-before-create, and a `reap` orphan-backstop. The harness is **provider-token-blind** — it relies
   on your already-active `hcloud` context and never reads or logs the token.
@@ -50,9 +51,9 @@ the same run-id and the same results filename. Gate CI on **`summarize`'s** exit
 
 ```
 vmlease plan   --battery <battery.toml> --run-token <slug>      # dry-run: what WOULD provision (zero provider calls)
-vmlease run    --battery <battery.toml> --run-token <slug> --results-dir <dir> --timestamp <ts> \  # provision -> probe -> ALWAYS tear down (billable)
+vmlease run    --battery <battery.toml> --run-token <slug> --results-dir <dir> --timestamp <ts> \  # provision -> probe -> tear down (or --keep to leave live)
                [--operator probe] [--distros ubuntu,debian,fedora,arch] [--parallel N] \
-               [--upload LOCAL[:REMOTE]] [--ssh-key <name> --ssh-key-path <path>] [--max-hosts 8] [--firewall <name>] [--yes]
+               [--upload LOCAL[:REMOTE]] [--ssh-key <name> --ssh-key-path <path>] [--max-hosts 8] [--firewall <name>] [--keep [DISTRO ...]] [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
 vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
@@ -70,6 +71,29 @@ The Hetzner provider relies on the operator's active `hcloud` context (configure
 > order. `--parallel` and the cost guard's `--max-hosts` cap are independent: `--max-hosts` bounds how many
 > hosts the matrix may request at all; `--parallel` only bounds how many of them run at once (it is clamped
 > to the host count).
+
+### Debugging a live host (`--keep`)
+
+Every host is torn down by default. Pass `--keep` to leave hosts **running** so you can SSH in and iterate
+against a real, prepped box instead of paying a full provision → prep → teardown cycle per change:
+
+```
+vmlease run --battery b.toml --run-token dbg --results-dir ./out --timestamp T \
+            --distros ubuntu,debian --keep ubuntu        # keep ubuntu live, tear debian down
+# ... the run prints, per kept host:
+#   - vmlease-dbg-ubuntu (id) is LIVE at <ip> — ssh -i <keydir>/id_ed25519 probe@<ip>
+vmlease reap --run-token dbg                              # destroy ALL of the run's hosts when done
+```
+
+- Bare `--keep` keeps **every** host; `--keep arch debian` keeps only those distros (each must be in
+  `--distros`) and tears the rest down. A typo'd distro is rejected before anything provisions.
+- A kept host stays **billable with no TTL**. Its reattach coordinates (IP, operator, key path) are printed
+  and recorded in the results file; the throwaway SSH key survives on disk so the printed `ssh` line works.
+
+> **The safety backstops still apply.** `--keep` only relaxes the *default* teardown — it is not a leak: a
+> kept host carries the `vmlease=<run-id>` label so `reap`/`status` always find it, and an aborted (Ctrl-C)
+> or teardown-failing run still reaps the **non-kept** hosts. The explicit `vmlease reap` destroys
+> everything, kept hosts included.
 
 ## Authoring a battery
 
