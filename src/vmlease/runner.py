@@ -20,8 +20,9 @@ from vmlease.imagecache import (
     LABEL_CACHE_KEY,
     content_key,
 )
-from vmlease.model import HostRun, HostSpec, PlanItem, Probe, ProbeTag
+from vmlease.model import HostRun, HostSpec, KeptHost, PlanItem, Probe, ProbeTag
 from vmlease.safety import (
+    LABEL_KEEP,
     CostGuard,
     label_selector_purpose,
     make_run_id,
@@ -68,6 +69,22 @@ def _kept_note(host: Host, operator: str, key_path: Path) -> str:
 
 
 @dataclass(frozen=True)
+class KeepPolicy:
+    """Which hosts to leave live after a run. ``keep_all`` keeps every host; else
+    only hosts whose ``distro_key`` is in ``distros``. The empty default keeps none."""
+
+    keep_all: bool = False
+    distros: frozenset[str] = frozenset()
+
+    def keeps(self, distro_key: str) -> bool:
+        return self.keep_all or distro_key in self.distros
+
+    @property
+    def any_kept(self) -> bool:
+        return self.keep_all or bool(self.distros)
+
+
+@dataclass(frozen=True)
 class Matrix:
     """A run request: one workload across N distros on one server type.
 
@@ -96,6 +113,7 @@ class Matrix:
     firewall: str = ""
     uploads: tuple[UploadSpec, ...] = ()
     requires: tuple[str, ...] = ()
+    keep_policy: KeepPolicy = KeepPolicy()
 
 
 def build_host_specs(matrix: Matrix) -> list[HostSpec]:
@@ -112,13 +130,19 @@ def build_host_specs(matrix: Matrix) -> list[HostSpec]:
     specs: list[HostSpec] = []
     for key in matrix.distro_keys:
         profile = get_profile(key)
+        # The keep marker is PER-DISTRO (a --keep subset leaves only some hosts
+        # live), so each spec's labels are built from the run label + the keep
+        # marker when this distro is kept.
+        host_labels = dict(labels)
+        if matrix.keep_policy.keeps(key):
+            host_labels[LABEL_KEEP] = "1"
         specs.append(
             HostSpec(
                 name=f"vmlease-{run_id}-{key}",
                 image=profile.default_image,
                 server_type=matrix.server_type,
                 distro_key=key,
-                labels=dict(labels),
+                labels=host_labels,
                 firewall=matrix.firewall,
                 requires=requires,
             )
@@ -210,9 +234,8 @@ def execute(
     on_host_complete: Callable[[HostRun], None] | None = None,
     resolve_deps: ResolveDeps | None = None,
     reap_bad_cache_image: bool = False,
-    keep: bool = False,
 ) -> list[HostRun]:
-    """Per host: provision -> (rescue-write) -> run workload -> tear down (unless ``keep``).
+    """Per host: provision -> (rescue-write) -> run workload -> tear down (unless kept).
 
     Each host is **isolated**: it is created, transformed, run, and destroyed in
     its own ``try/finally`` BEFORE the next host starts — so a host dies seconds
@@ -222,8 +245,8 @@ def execute(
     detail and zero results (NOT a raise), so :func:`execute` always returns
     one ``HostRun`` per requested host and the caller always writes a results file.
     The injected ``matrix.workload`` owns what runs on each ready host. The keypair
-    is cleaned once at the end — UNLESS ``keep`` is set, which leaves the host(s)
-    standing and skips that cleanup (see ``keep`` below).
+    is cleaned once at the end — UNLESS the matrix's ``keep_policy`` keeps any host,
+    which leaves the host(s) standing and skips that cleanup (see ``keep_policy``).
 
     ``ssh_factory`` builds an :class:`~vmlease.ssh.SshRunner` for the operator
     + keypair (injected so tests pass a fake). ``rescue_writer`` (injected) is
@@ -257,9 +280,12 @@ def execute(
     ``reap_bad_cache_image`` (opt-in, default off) reaps the source image when a
     *restored* host fails readiness (G4); default is a hint only (the image is
     named in the failure detail but kept, so a real fault is not masked).
-    ``keep`` (opt-in, default off) leaves every host RUNNING (billable) instead of
-    tearing it down — each kept host carries a KEPT note (how to SSH in) and the
-    keypair is NOT cleaned, so the printed ``ssh -i <path>`` points at a live file.
+    ``matrix.keep_policy`` decides which hosts are left RUNNING (billable) instead
+    of being torn down: a kept host carries the ``LABEL_KEEP`` marker (stamped on its
+    spec in :func:`build_host_specs`), leaves a KEPT note + a structured
+    :class:`~vmlease.model.KeptHost` record (how to SSH in), and — when ANY host is
+    kept — the keypair is NOT cleaned, so the printed ``ssh -i <path>`` points at a
+    live file.
     """
     validate_uploads(matrix)
     specs = build_host_specs(matrix)
@@ -269,7 +295,7 @@ def execute(
     def _one(spec: HostSpec) -> HostRun:
         return _run_one_host(
             spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads,
-            resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image, keep=keep,
+            resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image,
         )
 
     def _notify(host_run: HostRun) -> None:
@@ -317,10 +343,10 @@ def execute(
                 raise
             return [hr for hr in ordered if hr is not None]
     finally:
-        # Under ``--keep`` the private key must SURVIVE the run so the printed
-        # ``ssh -i <path>`` points at a real file the operator can use against the
-        # still-live host(s). Otherwise the key dir is reaped as usual.
-        if not keep:
+        # When the keep policy keeps ANY host the private key must SURVIVE the run
+        # so the printed ``ssh -i <path>`` points at a real file the operator can use
+        # against the still-live host(s). Otherwise the key dir is reaped as usual.
+        if not matrix.keep_policy.any_kept:
             keypair.cleanup()
 
 
@@ -336,7 +362,6 @@ def _run_one_host(
     *,
     resolve_deps: ResolveDeps | None = None,
     reap_bad_cache_image: bool = False,
-    keep: bool = False,
 ) -> HostRun:
     """Create, (rescue-write,) run the workload, and ALWAYS destroy a single host.
 
@@ -423,6 +448,7 @@ def _run_one_host(
     # below has a fallback shape.
     run = HostRun(host_spec=spec, detail="ERROR: run interrupted before completion", results=())
     note_sink: list[str] = []
+    kept_sink: list[KeptHost] = []
     try:
         run = _with_ready_host(
             spec,
@@ -435,8 +461,8 @@ def _run_one_host(
             plan_creates=plan_creates,
             on_ready=on_ready,
             note_sink=note_sink,
+            kept_sink=kept_sink,
             on_chosen=chosen.append,
-            keep=keep,
         )
     except Exception as exc:  # provider / rescue / transport failure → record, don't abort
         if chosen and chosen[0] == restored_index and restore_image_id is not None:
@@ -468,6 +494,10 @@ def _run_one_host(
     run = replace(run, restored_image=restore_image_id if was_restored else None)
     if note_sink:
         run = replace(run, detail=f"{run.detail}\n{note_sink[0]}")
+    # The structured kept-host record (the durable form of the KEPT note) so the CLI
+    # renders the live-host block from data, not by grepping ``detail``.
+    if kept_sink:
+        run = replace(run, kept_host=kept_sink[0])
     return run
 
 
@@ -594,8 +624,8 @@ def _with_ready_host(
     plan_creates: list[PlanCreate],
     on_ready: OnReady[R],
     note_sink: list[str],
+    kept_sink: list[KeptHost] | None = None,
     on_chosen: Callable[[int], None] | None = None,
-    keep: bool = False,
 ) -> R:
     """Create → (rescue-write) → wait-ready → ``on_ready``, ALWAYS tearing down.
 
@@ -660,11 +690,23 @@ def _with_ready_host(
         # unwinding). The note is surfaced to the caller via ``note_sink`` — never
         # swallowed, never raised.
         if host is not None:
-            if keep:
-                # ``--keep``: leave the live host standing (regardless of outcome —
+            if LABEL_KEEP in spec.labels:
+                # Kept host: leave the live host standing (regardless of outcome —
                 # success, probe-fail, or prep hard-abort) and surface exactly one
-                # KEPT note via note_sink so the operator can SSH in and later reap.
+                # KEPT note via note_sink + a structured KeptHost record via
+                # kept_sink, so the operator can SSH in and later reap.
                 note_sink.append(_kept_note(host, operator, keypair.private_key_path))
+                if kept_sink is not None:
+                    kept_sink.append(
+                        KeptHost(
+                            name=host.name,
+                            id=host.id,
+                            ipv4=host.ipv4,
+                            distro=spec.distro_key,
+                            operator=operator,
+                            key_path=str(keypair.private_key_path),
+                        )
+                    )
             else:
                 teardown_note = _best_effort_destroy(provider, host)
                 if teardown_note:

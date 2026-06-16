@@ -1719,6 +1719,17 @@ class TestRunner(unittest.TestCase):
         for s in runner.build_host_specs(self._matrix()):
             self.assertEqual(s.requires, ())
 
+    def test_build_host_specs_stamps_keep_label_per_distro(self) -> None:
+        # A per-distro KeepPolicy stamps LABEL_KEEP on ONLY the kept distro's spec;
+        # the non-kept distro's labels carry the run label but no keep marker.
+        m = runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
+            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+        )
+        by_distro = {s.distro_key: s for s in runner.build_host_specs(m)}
+        self.assertIn(safety.LABEL_KEEP, by_distro["ubuntu"].labels)  # kept → stamped
+        self.assertNotIn(safety.LABEL_KEEP, by_distro["debian"].labels)  # not kept → unstamped
+
     def test_build_host_specs_deterministic_with_requires(self) -> None:
         m = runner.Matrix(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
@@ -2846,6 +2857,22 @@ class TestReap(unittest.TestCase):
         self.assertEqual(len(reaped), 1)
         self.assertEqual(len(prov.destroyed), 1)
 
+    def test_reap_except_kept_spares_only_the_kept_host(self) -> None:
+        # Two hosts under one run label; only one carries LABEL_KEEP. The backstop
+        # reap_except_kept destroys ONLY the non-kept host (and returns it); the
+        # kept host stays live (still found by list_labeled).
+        prov = FakeProvider()
+        prov.create_with_cloudinit(
+            HostSpec(name="keep-me", image="i", server_type="cpx22", distro_key="ubuntu",
+                     labels={"vmlease": "r1", safety.LABEL_KEEP: "1"}), "ci")
+        prov.create_with_cloudinit(
+            HostSpec(name="reap-me", image="i", server_type="cpx22", distro_key="debian",
+                     labels={"vmlease": "r1"}), "ci")
+        reaped = safety.reap_except_kept(prov, "r1")
+        self.assertEqual([h.name for h in reaped], ["reap-me"])  # only the non-kept returned
+        self.assertEqual([h.name for h in prov.destroyed], ["reap-me"])  # only the non-kept destroyed
+        self.assertEqual([h.name for h in prov.list_labeled("r1")], ["keep-me"])  # kept remains live
+
 
 # --------------------------------------------------------------------------- #
 # safety — upload source / remote-dest validators (fail-closed before spend)
@@ -3543,9 +3570,19 @@ class TestKeepFlag(unittest.TestCase):
     the keypair survives so the printed ssh path is real."""
 
     def _matrix(
-        self, distros: tuple[str, ...] = ("ubuntu",), wl: workload.Workload | None = None
+        self,
+        distros: tuple[str, ...] = ("ubuntu",),
+        wl: workload.Workload | None = None,
+        *,
+        keep_all: bool = False,
     ) -> runner.Matrix:
-        return runner.Matrix(wl or _demo_workload(), distros, "cpx22", "run-keep")
+        return runner.Matrix(
+            wl or _demo_workload(),
+            distros,
+            "cpx22",
+            "run-keep",
+            keep_policy=runner.KeepPolicy(keep_all=keep_all),
+        )
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -3558,7 +3595,7 @@ class TestKeepFlag(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             kp = _fake_keypair(Path(d))
             runs = runner.execute(
-                self._matrix(), prov, self._factory(fssh), kp, "probe", keep=True
+                self._matrix(keep_all=True), prov, self._factory(fssh), kp, "probe"
             )
         self.assertEqual(len(runs), 1)
         self.assertEqual(prov.destroyed, [])  # NEVER torn down under keep
@@ -3583,9 +3620,9 @@ class TestKeepFlag(unittest.TestCase):
         # AND the KEPT note.
         prov = FakeProvider()
         fssh = FakeSshRunner()
-        m = self._matrix(("ubuntu", "debian"), wl=_RaisingWorkload())
+        m = self._matrix(("ubuntu", "debian"), wl=_RaisingWorkload(), keep_all=True)
         with tempfile.TemporaryDirectory() as d:
-            runs = runner.execute(m, prov, self._factory(fssh), _fake_keypair(Path(d)), "probe", keep=True)
+            runs = runner.execute(m, prov, self._factory(fssh), _fake_keypair(Path(d)), "probe")
         self.assertEqual(prov.destroyed, [])  # neither host torn down
         self.assertEqual(len(runs), 2)
         self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])  # matrix order
@@ -3598,7 +3635,7 @@ class TestKeepFlag(unittest.TestCase):
         prov = FakeProvider()
         with tempfile.TemporaryDirectory() as d:
             kept = _SpyKeypair.make(Path(d) / "a")
-            runner.execute(self._matrix(), prov, self._factory(FakeSshRunner()), kept, "probe", keep=True)
+            runner.execute(self._matrix(keep_all=True), prov, self._factory(FakeSshRunner()), kept, "probe")
             self.assertEqual(kept.cleaned, [])  # survives → ssh -i <path> is real
 
             torn = _SpyKeypair.make(Path(d) / "b")
@@ -3609,9 +3646,9 @@ class TestKeepFlag(unittest.TestCase):
         # 5: a zero-probe HostRun (prep abort returns normally) under keep → host
         # NOT destroyed, KEPT note present.
         prov = FakeProvider()
-        m = self._matrix(wl=_ZeroProbeWorkload())
+        m = self._matrix(wl=_ZeroProbeWorkload(), keep_all=True)
         with tempfile.TemporaryDirectory() as d:
-            runs = runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe", keep=True)
+            runs = runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertEqual(prov.destroyed, [])  # kept despite prep abort
         self.assertEqual(runs[0].results, ())  # zero probes
         self.assertIn(runner.KEPT_HOST_PREFIX, runs[0].detail)
@@ -3758,6 +3795,188 @@ class TestKeepFlag(unittest.TestCase):
             msg = err.getvalue()
             self.assertIn("not reaped", msg)  # the operator is told it was left LIVE
             self.assertIn("`vmlease reap --run-token cli-keep`", msg)  # + how to reap later
+
+    def _partial_matrix(self) -> runner.Matrix:
+        # A per-distro keep policy (only ``ubuntu`` kept) over a 2-distro run — the
+        # generalization of the all-or-nothing ``_matrix(keep_all=...)`` helper.
+        return runner.Matrix(
+            _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
+            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+        )
+
+    def test_partial_keep_spares_kept_distro_and_tears_down_the_rest(self) -> None:
+        # PARTIAL keep, NORMAL teardown: a 2-distro run keeping only ubuntu →
+        # the ubuntu host is left live (NOT destroyed) with a populated KeptHost
+        # record; the debian host IS torn down and its kept_host is None.
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            kp = _fake_keypair(Path(d))
+            runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
+        by_distro = {r.host_spec.distro_key: r for r in runs}
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-run-keep-debian"])  # only debian reaped
+        kept = by_distro["ubuntu"].kept_host
+        self.assertIsNotNone(kept)
+        assert kept is not None  # narrow for the type checker
+        self.assertEqual(kept.name, "vmlease-run-keep-ubuntu")
+        self.assertEqual(kept.distro, "ubuntu")
+        self.assertEqual(kept.ipv4, "10.0.0.1")  # the ubuntu host's ip
+        self.assertEqual(kept.operator, "probe")
+        self.assertEqual(kept.key_path, str(kp.private_key_path))
+        self.assertIsNone(by_distro["debian"].kept_host)  # torn-down host → no record
+
+    def test_partial_keep_abort_spares_kept_host_and_backstop_reaps_the_rest(self) -> None:
+        # BLOCKER generalization (F-010, per-distro): a Ctrl-C during a PARTIAL
+        # --keep run must spare the kept (ubuntu) host while the abort backstop
+        # still reaps the non-kept (debian) host. Both hosts are created, ubuntu
+        # carries LABEL_KEEP. list_labeled reports every CREATED host so the
+        # backstop's reap_except_kept can see debian — proving it reaps debian and
+        # spares ubuntu. Were the backstop a plain reap(), it would destroy ubuntu.
+        from unittest import mock
+
+        class _ReportsCreatedProvider(FakeProvider):
+            # The abort backstop reaps by label: report every created host (with
+            # its labels) so reap_except_kept sees both the kept and non-kept host.
+            def list_labeled(self, run_id: str) -> list[Host]:
+                sel = f"{safety.LABEL_KEY}={run_id}"
+                return [
+                    Host(id=f"id-{s.name}", name=s.name, ipv4="10.0.0.9", labels=dict(s.labels))
+                    for s in self.created
+                    if f"{safety.LABEL_KEY}={s.labels.get(safety.LABEL_KEY)}" == sel
+                ]
+
+        class _InterruptDebianSsh(FakeSshRunner):
+            # ubuntu (kept) completes normally; debian raises mid-probe so both are
+            # created before the abort unwinds (ubuntu runs first, serially).
+            def run_probe(self, host: Host, probe: Probe) -> ProbeResult:
+                if "debian" in host.name:
+                    raise KeyboardInterrupt("operator hit Ctrl-C")
+                return super().run_probe(host, probe)
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu,debian", "--keep", "ubuntu", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            kp = _fake_keypair(Path(d))
+            prov = _ReportsCreatedProvider()
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                    mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: _InterruptDebianSsh()), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err), \
+                    self.assertRaises(KeyboardInterrupt):
+                cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(len(prov.created), 2)  # both distros provisioned
+            destroyed = {h.name for h in prov.destroyed}
+            self.assertIn("vmlease-cli-keep-debian", destroyed)  # non-kept reaped
+            self.assertNotIn("vmlease-cli-keep-ubuntu", destroyed)  # kept SPARED despite abort
+
+    def test_cli_keep_subset_validation_rejects_unknown_distro(self) -> None:
+        # --keep names a distro NOT in --distros → exit 2, error names the unknown
+        # distro, and NOTHING is provisioned (validated before keypair generation).
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu,debian", "--keep", "fedora", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            generated: list[str] = []
+
+            def _spy_keygen(rid: str) -> keypair.Keypair:
+                generated.append(rid)
+                return _fake_keypair(Path(d))
+
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", _spy_keygen), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(ns, reader=lambda _p: "n")
+            self.assertEqual(rc, 2)
+            self.assertIn("fedora", err.getvalue())  # the unknown distro is named
+            self.assertEqual(generated, [])  # no keypair → no provisioning
+            self.assertFalse((Path(d) / "r").exists())  # no results dir created
+
+    def test_cli_keep_yes_emits_noninteractive_billing_warning(self) -> None:
+        # --keep --yes skips the interactive confirm but MUST still emit the
+        # one-line non-interactive billing WARNING to stderr. Exit 0.
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu", "--keep", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            kp = _fake_keypair(Path(d))
+            prov = FakeProvider()
+            fssh = FakeSshRunner()
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                    mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: fssh), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(rc, 0)
+            self.assertIn("WARNING: --keep will leave billable host(s) LIVE", err.getvalue())
+
+    def test_cli_keep_block_renders_alongside_teardown_failure(self) -> None:
+        # ORDERING fix: a run that keeps one host (ubuntu) AND hits a teardown
+        # failure on another (debian's destroy raises) must print BOTH the kept
+        # live-host block AND the teardown-failure ERROR block, and exit 1.
+        from unittest import mock
+
+        class _DebianDestroyFails(FakeProvider):
+            def destroy(self, host: Host) -> None:
+                if "debian" in host.name:
+                    super().destroy(host)  # record locally, then fail the teardown
+                    raise providers.ProviderError("request timeout")
+                super().destroy(host)
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            ns = cli.build_parser().parse_args([
+                "run", "--battery", battery, "--distros", "ubuntu,debian", "--keep", "ubuntu", "--yes",
+                "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+            ])
+            kp = _fake_keypair(Path(d))
+            prov = _DebianDestroyFails()
+            fssh = FakeSshRunner()
+            err = io.StringIO()
+            with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                    mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                    mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: fssh), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
+            self.assertEqual(rc, 1)  # teardown failure → non-zero exit
+            block = err.getvalue()
+            self.assertIn("WARNING: --keep left 1 billable host(s) LIVE", block)  # kept block
+            self.assertIn("ERROR: teardown failed", block)  # teardown-failure block
+            self.assertIn(runner.TEARDOWN_WARNING_PREFIX, block)  # the per-host detail line
+
+    def test_partial_keep_serializes_structured_kept_host_record(self) -> None:
+        # The kept host's structured KeptHost record is serialized into the results
+        # JSON with all six fields; a non-kept host serializes kept_host as null.
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            kp = _fake_keypair(Path(d))
+            runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
+        doc = json.loads(results.serialize_run("run-keep", "TS", runs))
+        by_distro = {h["distro"]: h for h in doc["hosts"]}
+        kept = by_distro["ubuntu"]["kept_host"]
+        self.assertEqual(
+            kept,
+            {
+                "name": "vmlease-run-keep-ubuntu",
+                "id": "id-vmlease-run-keep-ubuntu",
+                "ipv4": "10.0.0.1",
+                "distro": "ubuntu",
+                "operator": "probe",
+                "key_path": str(kp.private_key_path),
+            },
+        )
+        self.assertIsNone(by_distro["debian"]["kept_host"])  # torn-down host → null
 
 
 class _ScriptedTimeoutSsh:

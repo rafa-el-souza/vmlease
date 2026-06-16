@@ -29,6 +29,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -67,8 +68,8 @@ from vmlease.model import Battery, HostRun, HostSpec, Image, UploadSpec
 from vmlease.providers import HetznerProvider, Provider, ProviderError, ProviderQuotaError
 from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import (
-    KEPT_HOST_PREFIX,
     TEARDOWN_WARNING_PREFIX,
+    KeepPolicy,
     Matrix,
     RescueWriter,
     build_one_image,
@@ -87,6 +88,7 @@ from vmlease.safety import (
     label_selector_purpose,
     make_run_id,
     reap,
+    reap_except_kept,
     run_label,
     server_type_arch,
 )
@@ -217,6 +219,25 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Resolve the keep policy from --keep (None=keep none; []=keep all; a non-empty
+    # list=keep those distros). A named subset must be a subset of the run's distros;
+    # validate BEFORE any provisioning / keypair generation so a typo costs nothing.
+    if args.keep is None:
+        keep_policy = KeepPolicy()
+    elif len(args.keep) == 0:
+        keep_policy = KeepPolicy(keep_all=True)
+    else:
+        unknown = [d for d in args.keep if d not in matrix.distro_keys]
+        if unknown:
+            print(
+                f"error: --keep distro(s) {unknown} not in the run's distros "
+                f"{list(matrix.distro_keys)}",
+                file=sys.stderr,
+            )
+            return 2
+        keep_policy = KeepPolicy(distros=frozenset(args.keep))
+    matrix = replace(matrix, keep_policy=keep_policy)
+
     _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
@@ -227,15 +248,24 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         print("aborted — nothing provisioned.")
         return 0
 
-    if args.keep and not _confirm(
-        "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
-        f"reaped manually (`vmlease reap --run-token {args.run_token}`). Continue? [y/N]: ",
-        assume_yes=args.yes,
-        reader=reader,
-    ):
-        # Abort BEFORE any provider call / generate_keypair so nothing is provisioned.
-        print("aborted — nothing provisioned.")
-        return 0
+    if keep_policy.any_kept:
+        if not _confirm(
+            "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
+            f"reaped manually (`vmlease reap --run-token {args.run_token}`). Continue? [y/N]: ",
+            assume_yes=args.yes,
+            reader=reader,
+        ):
+            # Abort BEFORE any provider call / generate_keypair so nothing is provisioned.
+            print("aborted — nothing provisioned.")
+            return 0
+        if args.yes:
+            # The confirm was skipped (--yes), so emit a one-line non-interactive
+            # warning that billable host(s) will be left live and must be reaped.
+            print(
+                "WARNING: --keep will leave billable host(s) LIVE after the run; "
+                f"reap when done: `vmlease reap --run-token {args.run_token}`",
+                file=sys.stderr,
+            )
 
     run_id = make_run_id(args.run_token)
     try:
@@ -286,36 +316,29 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
             max_parallel=args.parallel, on_host_complete=_persist,
             resolve_deps=resolve_deps, reap_bad_cache_image=args.reap_bad_cache_image,
-            keep=args.keep,
         )
     except (KeyboardInterrupt, SystemExit):
-        if args.keep:
-            # --keep deliberately leaves hosts standing — the per-host teardown
-            # ``finally`` already honoured keep and left the live host(s) up. The
-            # backstop reap MUST NOT undo that: reaping the run label here would
-            # destroy the very hosts the operator asked to keep (the whole point
-            # of aborting a --keep run is to go SSH into them). We cannot enumerate
-            # the live set here (``execute`` never returned), so point the operator
-            # at the run label + reap command instead of reaping, then RE-RAISE.
-            print(
-                f"aborted — --keep left host(s) labelled vmlease={run_id} LIVE "
-                f"(not reaped); reap when done: "
-                f"`vmlease reap --run-token {args.run_token}`",
-                file=sys.stderr,
-            )
-            print(f"partial results: {writer.path}", file=sys.stderr)
-            raise
         # Aborted mid-run: the per-host hosts that finished are already on disk
-        # (writer.add ran for each). Reap the run label so no billable host is
-        # left orphaned, note where the partial results are, then RE-RAISE so the
-        # process still exits on the interrupt. The backstop reap is itself a
-        # provider call that MAY fail; if it does, surface an actionable manual
-        # reap hint but never let the ProviderError mask the original interrupt.
+        # (writer.add ran for each). Backstop-reap the run label so no billable host
+        # is left orphaned — but ``reap_except_kept`` SPARES hosts carrying the keep
+        # marker, so a deliberately kept host is never destroyed by the abort
+        # cleanup (the whole point of aborting a --keep run is to go SSH into them).
+        # Note where the partial results are, then RE-RAISE so the process still
+        # exits on the interrupt. The backstop reap is itself a provider call that
+        # MAY fail; if it does, surface an actionable manual reap hint but never let
+        # the ProviderError mask the original interrupt.
         try:
-            reaped = reap(provider, run_id)
+            reaped = reap_except_kept(provider, run_id)
             print(f"aborted — reaped {len(reaped)} host(s) labelled vmlease={run_id}", file=sys.stderr)
             for h in reaped:
                 print(f"  - reaped {h.name} ({h.id})", file=sys.stderr)
+            if keep_policy.any_kept:
+                print(
+                    f"--keep left kept host(s) labelled vmlease={run_id} LIVE "
+                    f"(not reaped); reap when done: "
+                    f"`vmlease reap --run-token {args.run_token}`",
+                    file=sys.stderr,
+                )
         except ProviderError as exc:
             print(
                 f"aborted — backstop reap ALSO failed ({exc}); host(s) labelled "
@@ -329,15 +352,41 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    # Kept-host block: rendered from the STRUCTURED ``KeptHost`` record (not by
+    # grepping ``detail``). Rendered ABOVE the teardown-failure return so a run that
+    # both kept a host AND hit a teardown failure prints both blocks (the teardown
+    # failure still exits 1). A kept host was left standing on purpose.
+    kept = [hr.kept_host for hr in host_runs if hr.kept_host is not None]
+    if kept:
+        print(
+            f"WARNING: --keep left {len(kept)} billable host(s) LIVE",
+            file=sys.stderr,
+        )
+        for kh in kept:
+            print(
+                f"  - {kh.name} ({kh.id}) is LIVE at {kh.ipv4} "
+                f"— ssh -i {kh.key_path} {kh.operator}@{kh.ipv4}",
+                file=sys.stderr,
+            )
+        print(
+            f"DESTROY ALL when done: `vmlease reap --run-token {args.run_token}`",
+            file=sys.stderr,
+        )
+        print(
+            f"  (the temp ssh key dir survives on disk: {keypair.directory})",
+            file=sys.stderr,
+        )
+
     teardown_failures = [hr for hr in host_runs if TEARDOWN_WARNING_PREFIX in hr.detail]
     if teardown_failures:
         # A teardown failed: a billable host may still be live. Reap the run label
         # as a backstop and surface the failure prominently — non-zero exit so a
-        # caller (CI) cannot mistake a leaked host for a clean run. The backstop
+        # caller (CI) cannot mistake a leaked host for a clean run. ``reap_except_kept``
+        # SPARES any deliberately kept host (it carries the keep marker). The backstop
         # reap is itself a provider call that MAY fail; if it does, surface an
         # actionable manual reap hint — but still exit non-zero (never a traceback).
         try:
-            reaped = reap(provider, run_id)
+            reaped = reap_except_kept(provider, run_id)
             print(
                 f"ERROR: teardown failed for {len(teardown_failures)} host(s); "
                 f"reaped {len(reaped)} host(s) labelled vmlease={run_id}",
@@ -357,30 +406,6 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             print(f"  - {hr.host_spec.name}: {hr.detail}", file=sys.stderr)
         print(f"results: {writer.path}", file=sys.stderr)
         return 1
-
-    if args.keep:
-        # ``--keep`` left host(s) standing on purpose (no teardown note, so the
-        # teardown-failure block above never fired). Surface a consolidated,
-        # actionable LIVE-host block. Exit code is unchanged — a kept run with
-        # passing probes still returns 0.
-        kept = [hr for hr in host_runs if KEPT_HOST_PREFIX in hr.detail]
-        if kept:
-            print(
-                f"WARNING: --keep left {len(kept)} billable host(s) LIVE",
-                file=sys.stderr,
-            )
-            for hr in kept:
-                for line in hr.detail.splitlines():
-                    if KEPT_HOST_PREFIX in line:
-                        print(f"  - {line}", file=sys.stderr)
-            print(
-                f"DESTROY ALL when done: `vmlease reap --run-token {args.run_token}`",
-                file=sys.stderr,
-            )
-            print(
-                f"  (the temp ssh key dir survives on disk: {keypair.directory})",
-                file=sys.stderr,
-            )
 
     print(f"results: {writer.path}")
     return 0
@@ -985,9 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
     run_p.add_argument(
-        "--keep", action="store_true",
+        "--keep", nargs="*", default=None, metavar="DISTRO",
         help="leave provisioned host(s) RUNNING (billable) after the run and print how to SSH in; "
-        "reap with `vmlease reap --run-token <token>` when done",
+        "bare `--keep` keeps ALL hosts, `--keep arch debian` keeps only those distros (each must be "
+        "in --distros); reap with `vmlease reap --run-token <token>` when done",
     )
     run_p.add_argument(
         "--reap-bad-cache-image", action="store_true",

@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 
 LABEL_KEY = "vmlease"
 
+# The per-host marker a ``--keep`` run stamps at provision time on every host it
+# means to leave live. The per-host teardown reads it (to skip teardown) and the
+# run command's abort / teardown-failure backstops read it (via
+# :func:`reap_except_kept`) so a deliberately kept host is never auto-destroyed.
+LABEL_KEEP = "vmlease-keep"
+
 # Cheap, hourly-billed instances only. A matrix that asks for anything else is
 # refused by the cost guard — a guard against an accidental fleet of big boxes.
 DEFAULT_ALLOWED_SERVER_TYPES: frozenset[str] = frozenset({"cpx11", "cpx21", "cpx22", "cx23"})
@@ -264,6 +270,18 @@ def reap(provider: Provider, run_id: str) -> list[Host]:
     (``provider.destroy`` tolerates an already-gone host), so a re-reap is safe.
     """
     hosts = provider.list_labeled(run_id)
+    for host in hosts:
+        provider.destroy(host)
+    return hosts
+
+
+def reap_except_kept(provider: Provider, run_id: str) -> list[Host]:
+    """Backstop reap that SPARES hosts carrying the keep marker (``LABEL_KEEP``).
+
+    Used by the run command's abort + teardown-failure backstops so a deliberately
+    kept host is never destroyed by automatic cleanup. The explicit ``reap`` (the
+    ``vmlease reap`` command) still destroys everything, kept hosts included."""
+    hosts = [h for h in provider.list_labeled(run_id) if LABEL_KEEP not in h.labels]
     for host in hosts:
         provider.destroy(host)
     return hosts
