@@ -1,7 +1,7 @@
 # vm-provisioning Specification
 
 ## Purpose
-The provision → (transform) → run-workload → always-teardown spine: build a matrix into labelled host specs, render a `plan` dry-run that makes zero provider calls, and execute each host in isolation (one host's failure never discards another's results) with optional parallelism, over a `Provider` abstraction.
+The provision → (transform) → run-workload → teardown spine (each host torn down by default, or left live when `--keep` selects it): build a matrix into labelled host specs, render a `plan` dry-run that makes zero provider calls, and execute each host in isolation (one host's failure never discards another's results) with optional parallelism, over a `Provider` abstraction.
 ## Requirements
 ### Requirement: Matrix builds into labelled host specs deterministically
 

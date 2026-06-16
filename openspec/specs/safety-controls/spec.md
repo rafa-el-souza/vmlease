@@ -1,7 +1,7 @@
 # safety-controls Specification
 
 ## Purpose
-The guarantees that keep a throwaway-VM harness from leaking spend: the cost guard (host cap + cheap-server-type allowlist), the deterministic `vmlease=<run-id>` label scheme, confirm-before-create, guaranteed best-effort teardown, the `reap`/`status` orphan backstop, and provider-token-blindness.
+The guarantees that keep a throwaway-VM harness from leaking spend: the cost guard (host cap + cheap-server-type allowlist), the deterministic `vmlease=<run-id>` label scheme (plus the `vmlease-keep` marker on hosts `--keep` leaves live), confirm-before-create, best-effort teardown (skipped for kept hosts), the `reap`/`status` orphan backstop (whose automatic firings spare kept hosts, while the explicit `reap` destroys every labelled host), and provider-token-blindness.
 ## Requirements
 ### Requirement: The cost guard caps host count and restricts server types
 
