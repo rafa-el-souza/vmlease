@@ -24,14 +24,24 @@ SUDOERS
   # sudo on a real host — validate before trusting it).
   visudo -c -f "$sudoers_file" >/dev/null
 
-  # --- install the base package set + any required-capability recipes ------
-  @@install_block@@
-
-  # --- drop the throwaway probe public key for the operator ---------------
+  # --- authorize the throwaway probe key BEFORE the install block ----------
+  # The install block can abort under `set -e` (e.g. a package step fails on a
+  # given distro). Writing the operator's authorized_keys FIRST guarantees a
+  # failed host is still reachable over SSH for diagnosis — without it, an
+  # install failure leaves a host with no key for any account (no provider key
+  # is registered; see providers.build_create_argv), i.e. silently
+  # un-loginable. Readiness is gated by the sentinel (the finalize block,
+  # written last), NOT by key presence, so a failed host is reachable yet
+  # correctly reports NOT ready. The key is still injected only via cloud-init
+  # — nothing lingers in the provider account. (Do NOT write a double-at slot
+  # token in this comment: the renderer would substitute it.)
   install -d -m 0700 -o "$operator" -g "$operator" "/home/$operator/.ssh"
   install -m 0600 -o "$operator" -g "$operator" /dev/stdin "/home/$operator/.ssh/authorized_keys" <<'PUBKEY'
 @@operator_pubkey@@
 PUBKEY
+
+  # --- install the base package set + any required-capability recipes ------
+  @@install_block@@
 
   @@finalize@@
 }
