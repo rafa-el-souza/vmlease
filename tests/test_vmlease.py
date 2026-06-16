@@ -2217,6 +2217,22 @@ class TestCloudInit(unittest.TestCase):
         self.assertIn("apt-get upgrade", out)
         self.assertIn("visudo -c -f", out)
 
+    def test_authorized_keys_written_before_install_block(self) -> None:
+        # REGRESSION (2026-06-16): the operator's authorized_keys must be written
+        # BEFORE the install block. The install block can abort under `set -e`
+        # (a package step fails on some distro); since no provider SSH key is
+        # registered (providers.build_create_argv), authorizing the key only
+        # AFTER the install left a failed host un-loginable for ANY account —
+        # silently undebuggable. Authorizing first keeps a failed host reachable.
+        # Readiness stays gated on the sentinel (written last), not key presence,
+        # so a failed host is reachable yet correctly reports NOT ready.
+        out = cloudinit.render_cloudinit(distro.get_profile("ubuntu"), "probe", "ssh-ed25519 KEY probe", ("docker",))
+        key_pos = out.index("/home/$operator/.ssh/authorized_keys")
+        install_pos = out.index("docker-ce")  # a marker inside @@install_block@@
+        sentinel_pos = out.index("touch /var/lib/vmlease-ready")  # the finalize sentinel, must stay last
+        self.assertLess(key_pos, install_pos, "authorized_keys must precede the install block")
+        self.assertLess(install_pos, sentinel_pos, "readiness sentinel must stay after the install block (last)")
+
     def test_arch_extra_setup_nf_tables(self) -> None:
         out = cloudinit.render_cloudinit(distro.get_profile("arch"), "probe", "ssh-ed25519 AAAA", ())
         self.assertIn("nf_tables", out)
