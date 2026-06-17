@@ -10,14 +10,14 @@ makes a run gate-able (non-zero on any failing probe verdict or a `PREP_HARD_FAI
 
 The CLI SHALL provide a `summarize` subcommand that reads a raw vmlease results JSON file and writes a
 summary JSON file, without mutating the raw file. The summary SHALL carry a `schema_version` field
-identifying the contract version. Adding the `prep_phase` section (below) bumps the contract: the summary's
-top-level `schema_version` SHALL be `"3"`.
+identifying the contract version. Adding the per-host `name` / `family` / `version` attributes (below) bumps
+the contract additively: the summary's top-level `schema_version` SHALL be `"4"`.
 
 #### Scenario: Companion written beside the raw file by default
 - **WHEN** `vmlease summarize vmlease-run-ts.json` is invoked with no `--out`
 - **THEN** a `vmlease-run-ts.summary.json` file is written in the same directory
 - **AND** the original raw file is byte-for-byte unchanged
-- **AND** the summary's top-level `schema_version` is `"3"`
+- **AND** the summary's top-level `schema_version` is `"4"`
 
 #### Scenario: Explicit output path honored
 - **WHEN** `vmlease summarize <raw> --out /tmp/s.json` is invoked
@@ -95,14 +95,19 @@ format and does not special-case retired fields.
 
 ### Requirement: Summary carries per-host probe records, a matrix pivot, and totals
 
-The summary SHALL contain, for every host in the raw file, its `distro`, `image`, `detail`, and a list of
-probe records each with `id`, `command`, `tag`, `exit_code`, `ok`, `timed_out`, `verdict`, the four token
-buckets, the **failed-assertion descriptions** (`assertion_failures`, empty when the probe declared no
-assertions or all held), and bounded `stdout_tail`/`stderr_tail`. For every host that ran a prep phase the
-summary SHALL also carry its `prep_phase` records (see the prep-phase requirement). The summary SHALL
-include a `matrix` mapping each canonical command to a per-distro verdict, and a `totals` count keyed by
-verdict — the `totals` key-set SHALL include the prep-phase states (the hard-abort and soft-fail states)
-alongside the probe verdicts, so a reader sees prep outcomes in the same tally.
+The summary SHALL contain, for every host in the raw file, its host **`name`** (the per-host instance
+identity), its **`family`** and **`version`** attributes, its `image`, `detail`, and a list of probe records
+each with `id`, `command`, `tag`, `exit_code`, `ok`, `timed_out`, `verdict`, the four token buckets, the
+**failed-assertion descriptions** (`assertion_failures`, empty when the probe declared no assertions or all
+held), and bounded `stdout_tail`/`stderr_tail`. Per-host records SHALL be **keyed by the host `name`**, not by
+the distro, so N hosts of the same `(family, version)` coexist as distinct records. For every host that ran a
+prep phase the summary SHALL also carry its `prep_phase` records (see the prep-phase requirement). The summary
+SHALL include a `matrix` mapping each canonical command to a per-**host-name** verdict, and a `totals` count
+keyed by verdict — the `totals` key-set SHALL include the prep-phase states (the hard-abort and soft-fail
+states) alongside the probe verdicts, so a reader sees prep outcomes in the same tally. Reading a raw file
+that **predates this schema** (no `name`/`version` field on its hosts) SHALL still summarize — the host
+`name` SHALL fall back to the raw `distro` field and `family` SHALL likewise derive from it, with `version`
+absent — consistent with the established unversioned-tolerant raw-file pattern.
 
 #### Scenario: A failed assertion is named in the probe record
 
@@ -110,10 +115,22 @@ alongside the probe verdicts, so a reader sees prep outcomes in the same tally.
 - **THEN** that probe's summary record lists the failed assertion (e.g. `stdout_has "READY"`) in
   `assertion_failures`
 
-#### Scenario: Matrix pivots command against distro
+#### Scenario: Per-host record carries name, family, and version
 
-- **WHEN** a run covered `ubuntu` and `fedora` and the `start` probe passed on fedora but failed on ubuntu
+- **WHEN** a host of `(ubuntu, 22.04)` named `ubuntu-2204` is summarized
+- **THEN** its record carries `name = "ubuntu-2204"`, `family = "ubuntu"`, and `version = "22.04"`
+
+#### Scenario: Matrix pivots command against host name
+
+- **WHEN** a run covered hosts named `ubuntu` and `fedora` and the `start` probe passed on `fedora` but
+  failed on `ubuntu`
 - **THEN** `matrix["sandbox start"]` is `{"ubuntu": "FAIL", "fedora": "PASS"}`
+
+#### Scenario: N same-family hosts coexist as distinct records and columns
+
+- **WHEN** a run contains two ubuntu hosts named `ubuntu-2204` and `ubuntu-2404`
+- **THEN** each appears as its own per-host record and its own matrix column, keyed by name (not collapsed
+  into a single `ubuntu` entry)
 
 #### Scenario: Multiple probes for one command collapse to the worst verdict
 
@@ -124,6 +141,12 @@ alongside the probe verdicts, so a reader sees prep outcomes in the same tally.
 
 - **WHEN** a run had a soft prep failure on one host and a hard prep abort on another
 - **THEN** `totals` carries distinct counts for the soft-fail and hard-abort states alongside the probe-verdict counts
+
+#### Scenario: A pre-schema raw file summarizes with a name fallback
+
+- **WHEN** a raw results file predates this schema and carries no `name`/`version` field on its hosts
+- **THEN** each host's `name` falls back to its `distro` field (and `family` derives from it, `version`
+  absent), and the summary is produced without error
 
 ### Requirement: Exit code reflects the overall verdict
 
@@ -183,4 +206,18 @@ The `prep_phase` section SHALL **always be present** in the summary — an empty
 #### Scenario: A hard prep abort is surfaced and counted
 - **WHEN** a host aborted because a hard prep step failed
 - **THEN** the summary's `prep_phase` records the failing step and `totals` reflects the aborted host as a non-pass state
+
+### Requirement: Raw per-host results carry name, family, and version
+
+A run SHALL write, for each host in the raw results file, the host **`name`** (its instance identity) and its
+**`version`**, in addition to retaining the existing **`distro`** field as the host's **family** (so readers
+that predate this change keep working). These additions are additive and unversioned — the raw file carries no
+schema version (the established pattern); the summary contract (above) reads `name`/`version` when present and
+falls back to `distro` otherwise, so the raw shape and the summary stay consistent without a separate guess.
+
+#### Scenario: A run records name, family, and version per host
+
+- **WHEN** a run over a host of `(ubuntu, 22.04)` named `ubuntu-2204` writes its raw results
+- **THEN** that host's raw record carries `name = "ubuntu-2204"`, `distro = "ubuntu"` (the family), and
+  `version = "22.04"`
 

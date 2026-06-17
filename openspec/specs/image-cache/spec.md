@@ -9,31 +9,42 @@ key), the `build-image` builder that snapshots a prepped host under that key, th
 ## Requirements
 ### Requirement: build-image produces a content-addressed snapshot of a prepped host
 
-The `vmlease build-image <distro>` command SHALL provision a builder host, run the full OS-level prep
+The `vmlease build-image --distro <key>` command SHALL provision a builder host, run the full OS-level prep
 (rescue-write for rescue-write distros plus cloud-init package install), wait for readiness, sysprep the
-host, power it off, create a provider snapshot, and destroy the builder. The snapshot's labels SHALL be
-applied in the same provider call that creates it (atomic), so no cache image ever exists unlabelled.
-build-image SHALL carry a run token that labels its builder as a run host, so on abort or a
-builder-teardown failure the builder is reaped by that label, any already-created image is kept, and a
-teardown failure exits non-zero. Because the cache key reflects required capabilities, build-image SHALL
-accept a `--requires` option naming the capabilities to bake (default: none); the same capability set
-SHALL flow into the rendered cloud-init and the content key, and SHALL be recorded on the image's labels.
-A `build-image` with no `--requires` builds the capability-less variant; to cache a docker variant the
-builder is run with `--requires docker`. The `--requires` option SHALL be repeatable, and its values SHALL
-be canonicalized (sorted, deduplicated) by the **same helper** the run path uses to lift `requires` from the
-battery — so build-image and run cannot compute divergent keys from one parser inventing a different order.
+host, power it off, create a provider snapshot, and destroy the builder. `--distro` SHALL accept the
+`family[@version]` **subset** of the `--hosts` grammar (a **single** host — no `name=` prefix, no
+multiplicity): a bare `--distro ubuntu` mints the family's **default** version, while `--distro ubuntu@22.04`
+mints that specific version — so per-version cache images can be built. The builder name, the content key,
+and the snapshot's labels (including the `version` label) SHALL all carry the version; the builder name —
+being a provider host name — SHALL use the **digits-only** version form (`ubuntu@22.04` → `…ubuntu2204…`),
+consistent with host auto-naming, since `@` is not a valid host-name character. The snapshot's labels SHALL be applied in the same provider
+call that creates it (atomic), so no cache image ever exists unlabelled. build-image SHALL carry a run token
+that labels its builder as a run host, so on abort or a builder-teardown failure the builder is reaped by
+that label, any already-created image is kept, and a teardown failure exits non-zero. Because the cache key
+reflects required capabilities, build-image SHALL accept a `--requires` option naming the capabilities to
+bake (default: none); the same capability set SHALL flow into the rendered cloud-init and the content key,
+and SHALL be recorded on the image's labels. A `build-image` with no `--requires` builds the capability-less
+variant; to cache a docker variant the builder is run with `--requires docker`. The `--requires` option SHALL
+be repeatable, and its values SHALL be canonicalized (sorted, deduplicated) by the **same helper** the run
+path uses to lift `requires` from the battery — so build-image and run cannot compute divergent keys from one
+parser inventing a different order.
 
 #### Scenario: Building a cache image for a native distro
-- **WHEN** `build-image ubuntu` runs and no image with the current content key exists
+- **WHEN** `build-image --distro ubuntu` runs and no image with the current content key exists
 - **THEN** a builder is provisioned, prepped, sysprepped, powered off, snapshotted with its labels, and destroyed
 - **AND** the resulting image carries `vmlease-purpose=image-cache` and `vmlease-cache-key=<key>`
 
+#### Scenario: A version-qualified build mints a per-version image
+- **WHEN** `build-image --distro ubuntu@22.04` runs
+- **THEN** the builder name, content key, and labels (including the `version` label) carry `22.04`, producing
+  an image distinct from the default-version (`ubuntu`) image
+
 #### Scenario: build-image is idempotent
-- **WHEN** `build-image ubuntu` runs, an image with the current content key already exists, and `--rebuild` is not given
+- **WHEN** `build-image --distro ubuntu` runs, an image with the current content key already exists, and `--rebuild` is not given
 - **THEN** it is a no-op: no builder is provisioned and nothing is spent
 
 #### Scenario: --rebuild replaces the existing same-key image
-- **WHEN** `build-image ubuntu --rebuild` runs and an image with the current key exists
+- **WHEN** `build-image --distro ubuntu --rebuild` runs and an image with the current key exists
 - **THEN** a fresh image is built and the older-created same-key image is deleted, keeping the newest
 
 #### Scenario: An aborted build reaps the builder and keeps any created image
@@ -41,7 +52,7 @@ battery — so build-image and run cannot compute divergent keys from one parser
 - **THEN** the builder is reaped by its run label, any already-created image is kept, and a teardown failure exits non-zero
 
 #### Scenario: A capability variant is built and matches at run
-- **WHEN** `build-image ubuntu --requires docker` runs, and later a `run` provisions ubuntu from a battery requiring docker
+- **WHEN** `build-image --distro ubuntu --requires docker` runs, and later a `run` provisions ubuntu from a battery requiring docker
 - **THEN** both render the same docker cloud-init, compute the same content key, and the run restores the docker variant; a docker-less ubuntu run computes a different key and does not match this image
 
 ### Requirement: Sysprep precedes the snapshot and its failure aborts the build
@@ -64,20 +75,30 @@ off state within that bound, build-image SHALL abort and tear down the builder.
 
 ### Requirement: The content key is derived from the base-image fingerprint and the rendered cloud-init
 
-The cache content key SHALL be `v1-<distro>-<hash>`, where the hash covers the base-image fingerprint
-(rescue-write distro: the resolved image digest; native: the immutable provider image id; golden: the
-pinned digest) and the canonically-rendered cloud-init (rendered with a placeholder operator public key so
-the per-run key is excluded). Because the rendered cloud-init reflects the battery's required capabilities
-(a required capability's recipe is injected into the render, an unrequired one is absent), a change to the
-required-capability set changes the rendered cloud-init and therefore the key — there SHALL be no separate
-`requires` term in the hash. To keep the key stable, capability recipes SHALL be injected in a **canonical
-order — the sorted, deduplicated** required-capability set — so the declared order of `requires` (and any
-duplicates) cannot perturb the rendered bytes or the key. The same key SHALL be produced by both build-image
-(to label) and run (to look up) from one shared function.
+The cache content key SHALL be `v1-<family>-<hash>`, where the `family` component is the family-level slug
+(also the cloud-init `distro_key` slug) and the hash covers the base-image fingerprint (rescue-write distro:
+the resolved image digest; native: the immutable provider image id; golden: the pinned digest) and the
+canonically-rendered cloud-init (rendered with a placeholder operator public key so the per-run key is
+excluded). The base-image fingerprint is resolved per `(family, version)`, so **different versions of one
+family resolve to different base images and therefore distinct content keys** — there is no on-disk
+collision between sibling versions. The cache **group identity** (used for supersession, see "build-image
+prunes its own superseded predecessors") SHALL carry a `version` discriminant **distinct from `family`**;
+`family` remains the cloud-init slug, the `--distro` reap scope, and the content-key family component, while
+`version` separates one family's versions into their own supersession groups. Because the rendered cloud-init
+reflects the battery's required capabilities (a required capability's recipe is injected into the render, an
+unrequired one is absent), a change to the required-capability set changes the rendered cloud-init and
+therefore the key — there SHALL be no separate `requires` term in the hash. To keep the key stable,
+capability recipes SHALL be injected in a **canonical order — the sorted, deduplicated** required-capability
+set — so the declared order of `requires` (and any duplicates) cannot perturb the rendered bytes or the key.
+The same key SHALL be produced by both build-image (to label) and run (to look up) from one shared function.
 
 #### Scenario: Identical recipe yields an identical key
-- **WHEN** two build-image runs use the same distro, architecture, recipe, and resolved upstream
+- **WHEN** two build-image runs use the same family, version, architecture, recipe, and resolved upstream
 - **THEN** they compute the same content key
+
+#### Scenario: Two versions of a family compute distinct keys
+- **WHEN** `build-image --distro ubuntu@22.04` and `build-image --distro ubuntu@24.04` resolve different base-image fingerprints
+- **THEN** they compute distinct content keys and occupy distinct cache entries (no on-disk collision)
 
 #### Scenario: A recipe change yields a new key
 - **WHEN** the distro profile's package set changes
@@ -94,25 +115,31 @@ duplicates) cannot perturb the rendered bytes or the key. The same key SHALL be 
 ### Requirement: build-image prunes its own superseded predecessors
 
 build-image SHALL prune superseded predecessors after building the current image: it SHALL delete every
-cached image of the same (distro, architecture, required-capability set) group whose key differs from the
-new key, keeping at most one current image per group. The required-capability set SHALL be part of the
-group identity, carried on the image labels as a **short stable hash of the sorted, deduplicated
-required-capability set** — `sha256` of the NUL-joined sorted-deduplicated set, first 16 hex, computed by
-the single shared helper used by both build-image and run (not the raw joined list — so the group identity
-stays collision-safe and within the label length bound as the capability vocabulary grows beyond the v1
-single `docker`). A docker image and a
-docker-less image of the same distro and architecture therefore hash to distinct groups and SHALL NOT
-supersede one another. When not at the image cap it
-SHALL build first then prune; when at the cap it SHALL prune the superseded set first to free slots then
-build, refusing only if no same-group superseded image exists. build-image SHALL NOT prune images of other
-distros, other architectures, or other required-capability sets.
+cached image of the same **`(family, version, architecture, required-capability set)`** group whose key
+differs from the new key, keeping at most one current image per group. The `version` is part of the group
+identity, so a **sibling version of the same family is a different group and SHALL NOT be pruned** — building
+`ubuntu@24.04` never deletes an `ubuntu@22.04` image (the cross-version data-loss class this guard exists to
+prevent). The required-capability set SHALL also be part of the group identity, carried on the image labels
+as a **short stable hash of the sorted, deduplicated required-capability set** — `sha256` of the NUL-joined
+sorted-deduplicated set, first 16 hex, computed by the single shared helper used by both build-image and run
+(not the raw joined list — so the group identity stays collision-safe and within the label length bound as
+the capability vocabulary grows beyond the v1 single `docker`). A docker image and a docker-less image of the
+same `(family, version)` and architecture therefore hash to distinct groups and SHALL NOT supersede one
+another. When not at the image cap it SHALL build first then prune; when at the cap it SHALL prune the
+superseded set first to free slots then build, refusing only if no same-group superseded image exists.
+build-image SHALL NOT prune images of other families, other versions, other architectures, or other
+required-capability sets.
 
 #### Scenario: Rebuilding a rolling distro reclaims the old slot
-- **WHEN** `build-image arch` builds a new key and an older Arch image with a different key but the same required-capability set exists
+- **WHEN** `build-image --distro arch` builds a new key and an older Arch image with a different key but the same `(family, version)` and required-capability set exists
 - **THEN** the older Arch image is deleted and the new one is kept
 
+#### Scenario: A sibling version is not superseded
+- **WHEN** `build-image --distro ubuntu@24.04` builds and an `ubuntu@22.04` image of the same architecture and required-capability set exists
+- **THEN** the `ubuntu@22.04` image is NOT pruned (it is a different `(family, version)` group)
+
 #### Scenario: A docker variant does not supersede the docker-less variant
-- **WHEN** `build-image ubuntu --requires docker` builds and a docker-less ubuntu image of the same architecture exists
+- **WHEN** `build-image --distro ubuntu --requires docker` builds and a docker-less ubuntu image of the same `(family, version)` and architecture exists
 - **THEN** the docker-less image is NOT pruned (it is a different group)
 
 #### Scenario: At the cap with nothing to prune refuses before provisioning

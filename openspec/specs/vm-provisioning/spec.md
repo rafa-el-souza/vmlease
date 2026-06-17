@@ -5,28 +5,126 @@ The provision → (transform) → run-workload → teardown spine (each host tor
 ## Requirements
 ### Requirement: Matrix builds into labelled host specs deterministically
 
-The system SHALL turn a run request (a matrix of distro keys × one server type, plus a caller-supplied
-run token) into one labelled host spec per distro, deriving the run-id purely from the run token so the
-same token yields the same specs and labels. Each host spec SHALL also carry the run's **required
-capabilities** (the battery's `requires`, lifted onto the spec by the caller that builds the matrix), so
-that capability recipes can be rendered into the host's cloud-init at create time — before the workload
-exists. `requires` is a provisioning attribute of the host spec (alongside `distro_key`), not workload
-data; the runner reads it from the spec, never from the opaque workload.
+The system SHALL turn a run request — an explicit **list of host specs** (the "shopping list"), each carrying
+a per-host `name` (its instance identity), an `os = (family, version)` reference into the profile registry,
+and the run's **required capabilities** — plus a caller-supplied run token into one labelled host spec per
+list entry, deriving the run-id purely from the run token so the same token yields the same specs and labels.
+Host **identity is the per-host bare `name`**, NOT the distro, so a run MAY contain N hosts of the same
+`(family, version)` provided their names differ. The bare `name` is the **identity** — what `--keep` tokens,
+results per-host keys, and the matrix pivot key on; the **provider server name** SHALL be the derived
+composite `vmlease-<run-id>-<name>` (carrying the run-id so concurrent/overlapping runs do not collide on the
+provider's unique-server-name constraint), set when the labelled spec is built — NOT the bare identity.
+Provider resources SHALL be addressed by **label**, never by name. The host spec's image is resolved from `os`
+via the registry **during expansion** (so the resolved list is provider-call-free and `plan` can show
+images), while `os` is retained for the provision-time prep/rescue lookup (prep is NOT inlined per host); the
+cold create path SHALL use the spec's resolved `image`, not a re-resolved profile image, so plan and execute
+cannot diverge. `build_host_specs` SHALL **assert bare-`name` uniqueness fail-closed**, raising a clear error
+before any provider call rather than letting a duplicate surface only as a provider `create --name` failure.
 
-#### Scenario: One spec per distro, carrying the run label
+The CLI `--hosts` axis surface SHALL be a pure **expander** that produces the host list and SHALL itself make
+no provider calls. The expander SHALL be split into a **parse** step (string → unresolved entries) and a
+**resolve** step (entries → host specs), so that all version-defaulting, naming, and validation logic operates
+on the entry model rather than on raw strings (a future file-based host list is then an additive second parse
+front-end). It accepts comma-separated entries, each of the grammar `[name=]family[@version]`, fully qualified
+per entry (the comma is the entry separator, so there is **no** cross-entry grouping shorthand such as
+`ubuntu@22.04,24.04`): an optional `name=` prefix sets the host's explicit name, a bare family resolves to its
+default version, and `@version` selects a version. **Multiplicity is expressed by repetition** — repeating an
+entry (or naming each occurrence) produces N hosts; there is **no** `*count` multiplier. `--distros` SHALL
+remain a **pure alias** for `--hosts` (same destination and full grammar), soft-deprecated: invoking it SHALL
+emit a one-time deprecation notice, and when both `--hosts` and `--distros` are supplied the last one SHALL
+win.
 
-- **WHEN** a matrix of N distro keys is built with run token `T`
-- **THEN** N host specs are produced, each named for the run-id derived from `T` and its distro key, and
-  each carries the `vmlease=<run-id>` label
+A user-supplied `name` SHALL be the host's identity verbatim, validated **fail-closed** against the
+provider-agnostic host-name charset `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` (≤63 chars — the universal
+hostname-safe subset every cloud provider accepts), and SHALL contain none of the entry delimiters
+`, @ = :`. Auto-generated names SHALL be assigned in a **whole-run, two-phase** pass over the resolved
+`(family, version)` multiset: phase 1 resolves every entry to `(family, version)` (bare → default version);
+phase 2 names them so that a family appearing **once** keeps the bare family name (e.g. `--distros ubuntu` →
+host `ubuntu`, today's behavior), a family appearing with **multiple distinct versions** gets a version
+suffix per host (digits only, `22.04` → `2204`), and the **same `(family, version)` repeated** gets an index
+suffix (`-1`, `-2`, …); **rolling families take no version suffix** (`arch` → `arch`, repeated →
+`arch-1/2/3`). Because naming is over the *resolved* multiset, a bare entry beside an explicit-version sibling
+of the same family is disambiguated by version, not left bare. The expander SHALL guarantee unique names.
+Each host spec SHALL carry the run's required capabilities (the battery's `requires`, lifted onto the spec by
+the caller that builds the list) so that capability recipes can be rendered into the host's cloud-init at
+create time — before the workload exists; `requires` is a provisioning attribute of the host spec (alongside
+`os`), not workload data; the runner reads it from the spec, never from the opaque workload.
+
+#### Scenario: One spec per host-list entry, carrying the run label
+
+- **WHEN** a host list of N entries is expanded with run token `T`
+- **THEN** N host specs are produced, each keyed by its bare per-host `name`, each carrying the
+  `vmlease=<run-id>` label for the run-id derived from `T`
+
+#### Scenario: The provider server name carries the run-id while the identity stays bare
+
+- **WHEN** a host with bare identity `ubuntu-2204` is built for the run-id derived from token `T`
+- **THEN** its provider server name is `vmlease-<run-id>-ubuntu-2204` (so it cannot collide with another run),
+  while its identity `name` — used by `--keep`, the results record, and the matrix column — remains the bare
+  `ubuntu-2204`
+
+#### Scenario: A bare family preserves today's host name
+
+- **WHEN** `--distros ubuntu` is expanded
+- **THEN** one host spec is produced named `ubuntu` with `os = (ubuntu, <default version>)` — the host name
+  is unchanged from today's behavior
+
+#### Scenario: N hosts of the same (family, version) coexist with distinct names
+
+- **WHEN** `--hosts arch,arch,arch` is expanded
+- **THEN** three host specs are produced with distinct names `arch-1`, `arch-2`, `arch-3`, each with
+  `os = (arch, rolling)`
+
+#### Scenario: An explicit name is used verbatim as the host identity
+
+- **WHEN** `--hosts api=ubuntu@24.04,worker=ubuntu@24.04` is expanded
+- **THEN** two host specs are produced named `api` and `worker`, both with `os = (ubuntu, 24.04)`, with no
+  index suffix applied
+
+#### Scenario: An invalid user-supplied name fails closed
+
+- **WHEN** `--hosts My_Host=ubuntu` is expanded (the name violates the host-name charset)
+- **THEN** the expander reports a name-validation error and produces no host specs, before any provider call
+
+#### Scenario: A bare entry beside an explicit-version sibling is disambiguated by version
+
+- **WHEN** `--hosts ubuntu,ubuntu@22.04` is expanded and the ubuntu default version is `24.04`
+- **THEN** two host specs are produced named `ubuntu-2404` and `ubuntu-2204` — the bare entry resolves to the
+  default version and is suffixed, rather than keeping the bare name `ubuntu`
+
+#### Scenario: The default host list stays the bare families
+
+- **WHEN** a run is invoked with no `--hosts`/`--distros` selection
+- **THEN** the default host list is the four bare families (one host each, named for the family) and does NOT
+  expand to every version in the registry
+
+#### Scenario: The deprecated alias warns and last-wins
+
+- **WHEN** `--distros ubuntu` is supplied (alone, or together with a later `--hosts`)
+- **THEN** a one-time deprecation notice is emitted, and when both flags are present the last-supplied value
+  is the one expanded
+
+#### Scenario: plan renders the resolved os per host
+
+- **WHEN** `plan` is run over `--hosts ubuntu@22.04,arch`
+- **THEN** the dry-run output shows each host's resolved `os` — `ubuntu@22.04` rendered as `ubuntu@22.04` and
+  the rolling `arch` rendered as bare `arch` (not `arch@rolling`) — alongside its identity `name`, with no
+  provider calls made
 
 #### Scenario: Build is pure and deterministic
 
-- **WHEN** the same matrix (same token) is built twice
+- **WHEN** the same host list (same token) is built twice
 - **THEN** the resulting host specs (names, images, labels) are identical, with no provider calls made
+
+#### Scenario: A duplicate host name fails closed before spend
+
+- **WHEN** `build_host_specs` is given a host list containing two entries with the same `name`
+- **THEN** it raises a clear name-collision error before any provider call, rather than letting the collision
+  surface as a provider create failure
 
 #### Scenario: Host specs carry the run's required capabilities
 
-- **WHEN** a matrix is built from a battery declaring `requires = ["docker"]`
+- **WHEN** a host list is built from a battery declaring `requires = ["docker"]`
 - **THEN** each host spec carries that required-capability set, so the runner renders the docker recipe into cloud-init at create time
 
 ### Requirement: The plan dry-run makes zero provider calls
@@ -180,29 +278,115 @@ SHALL be performed at provision time, never during `plan`. A run SHALL **consume
 ### Requirement: Keeping selected hosts live for debugging
 
 The run command SHALL accept a keep selection that leaves provisioned hosts RUNNING (billable) instead of
-tearing them down, so an operator can SSH in and iterate against a live host. The selection SHALL be
-per-host: a bare/empty selection keeps every host; a named-distro selection keeps only hosts of those
-distros and tears down the rest. A named distro that is not part of the run's distro set SHALL be rejected
-before any host is provisioned, so a typo costs nothing. Each kept host SHALL carry a keep marker label
-that distinguishes it from torn-down hosts, and SHALL record a structured reattach record — host name, id,
-IPv4, distro, operator, and the private-key path — so the live host is discoverable from the results
-without parsing prose. When any host is kept, the run's throwaway keypair SHALL survive the run so the
-recorded SSH key path points at a real file.
+tearing them down, so an operator can SSH in and iterate against a live host. The selection SHALL key on the
+host **`name`**, with the name-vs-family ambiguity removed structurally rather than by a silent heuristic:
+
+- A bare/empty selection SHALL keep every host.
+- A bare `--keep <token>` SHALL match an exact host **`name`** only — never a fuzzy family fallback.
+- Keeping a whole family SHALL be the explicit selector `family:<family>` (parsed by splitting on the first
+  `:`; only the `family:` prefix is recognized — there is no `host:` form), which keeps every host of that
+  family in the run.
+- A selector that resolves to **zero** in-run hosts SHALL **fail closed** before any host is provisioned —
+  both a bare token matching no host name AND a `family:<family>` form matching no in-run host — with an error
+  listing the eligible host names **and** the `family:` hint, never a silent no-op or family fallback, so a
+  typo (or a family absent from this run) costs nothing.
+- The resolved keep-set (host names + count) SHALL be **echoed before provisioning even under the assume-yes
+  flag**, so the kept set is always visible before spend (it rides the existing billing confirm
+  interactively, and prints regardless under `--yes`).
+- A host `name` equal to a family name SHALL be rejected (no `name`/`family:` namespace collision or
+  shadowing).
+
+Each kept host SHALL carry a keep marker label that distinguishes it from torn-down hosts, and SHALL record a
+structured reattach record — host `name`, id, IPv4, **family**, **version**, operator, and the private-key
+path — so the live host is discoverable from the results without parsing prose. The `--keep` metavar SHALL be
+`HOST` (accepting `<name>` or `family:<family>`). When any host is kept, the run's throwaway keypair SHALL
+survive the run so the recorded SSH key path points at a real file.
 
 #### Scenario: Bare keep leaves all hosts live
 
-- **WHEN** a run requests keep with no distro selection
-- **THEN** no host is torn down, each carries the keep marker label, and each records its structured
-  reattach coordinates
+- **WHEN** a run requests keep with no selection
+- **THEN** no host is torn down, each carries the keep marker label, and each records its structured reattach
+  coordinates (including its `name`, family, and version)
 
-#### Scenario: Per-distro keep leaves only the named hosts live
+#### Scenario: A bare token keeps only the named host
 
-- **WHEN** a run over multiple distros requests keep of a distro subset
-- **THEN** only the named distros' hosts are left live (each with the keep marker label and a reattach
-  record) and every other host is torn down normally
+- **WHEN** a run over multiple hosts requests `--keep ubuntu-2204`
+- **THEN** only the host named `ubuntu-2204` is left live (with the keep marker label and a reattach record)
+  and every other host is torn down normally
 
-#### Scenario: An unknown keep distro is rejected before spend
+#### Scenario: A family selector keeps the whole family
 
-- **WHEN** the keep selection names a distro not in the run's distro set
-- **THEN** the command reports the error and provisions nothing
+- **WHEN** a run containing two ubuntu hosts (`ubuntu-2204`, `ubuntu-2404`) requests `--keep family:ubuntu`
+- **THEN** both ubuntu-family hosts are left live and every non-ubuntu host is torn down normally
+
+#### Scenario: An unresolved keep token fails closed before spend
+
+- **WHEN** the keep selection names a token that matches no host name and is not a `family:` form
+- **THEN** the command reports the error listing the eligible host names and the `family:` hint, and
+  provisions nothing
+
+#### Scenario: A family selector matching zero in-run hosts fails closed
+
+- **WHEN** a run containing no fedora hosts requests `--keep family:fedora`
+- **THEN** the command fails closed before provisioning, reporting that `family:fedora` matched no host in the
+  run, rather than silently keeping nothing
+
+#### Scenario: An empty family selector is a distinct error
+
+- **WHEN** a run requests `--keep family:` with no family name after the colon
+- **THEN** the command fails closed reporting that a `family:` selector requires a family name (distinct from a
+  zero-match message), so the user sees the typo
+
+#### Scenario: The resolved keep-set is echoed even under --yes
+
+- **WHEN** a run is invoked with `--keep` and the assume-yes flag
+- **THEN** the resolved keep-set (host names + count) is printed before provisioning, even though the billing
+  prompt is skipped
+
+#### Scenario: A host name equal to a family name is rejected
+
+- **WHEN** a host list would produce a host whose `name` equals a family name in the registry
+- **THEN** the run is rejected before provisioning, so a `name`/`family:` namespace collision cannot occur
+
+### Requirement: A run refuses to start when its run-token already has live hosts
+
+The `run` and `build-image` commands SHALL perform a **pre-flight liveness check** before any provisioning and
+SHALL **fail closed** when the run-token already has live provider hosts. The rationale: the run-id is derived
+deterministically from the run-token (the same token always yields the same run-id), so a run-token identifies
+**exactly one live run** — two live runs sharing a token would collide on their derived provider server names
+AND on the shared `vmlease=<run-id>` reap label, and since teardown reaps by that label, the second run's
+cleanup could destroy the first run's hosts. Accordingly: if any provider host already carries the run-id
+label, the command SHALL provision nothing and SHALL report the live host names plus a hint to reap them
+(`vmlease reap --run-token <token>`) or use a different run-token. The check SHALL run **after** the cheap
+local validations (the cost-guard host cap, `--keep` validation, the within-run name-uniqueness assertion) and
+**before** the billing confirmation, so a doomed run is refused before the operator is asked to spend. The
+`plan` dry-run SHALL NOT perform this check (it makes no provider calls). If the liveness check's own provider
+read fails, the command SHALL fail rather than proceed (liveness unverified), never falling open.
+
+#### Scenario: A run-token with live hosts is refused before spend
+
+- **WHEN** `run` is invoked with a run-token for which a provider host already carries the run-id label
+- **THEN** the command fails closed without provisioning, listing the live host name(s) and the reap /
+  different-token hint, before any billing confirmation
+
+#### Scenario: A clean run-token proceeds
+
+- **WHEN** `run` is invoked with a run-token that has no live hosts
+- **THEN** the pre-flight passes and the run proceeds to the billing confirmation and provisioning
+
+#### Scenario: build-image honors the same pre-flight
+
+- **WHEN** `build-image` is invoked with a run-token whose builder from a prior invocation is still live
+- **THEN** the command fails closed without provisioning a new builder, reporting the live host and the reap hint
+
+#### Scenario: The plan dry-run skips the liveness check
+
+- **WHEN** `plan` is invoked with a run-token that has live hosts
+- **THEN** the dry-run still renders the plan and makes no provider calls (the liveness pre-flight is run/build-image only)
+
+#### Scenario: A failed liveness read fails the run
+
+- **WHEN** the pre-flight liveness read itself errors (e.g. the provider is unreachable)
+- **THEN** the command fails rather than proceeding — liveness could not be verified, so it does not fall open
+  and provision anyway
 

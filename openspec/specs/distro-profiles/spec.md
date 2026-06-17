@@ -5,23 +5,50 @@ Per-distro provisioning: a read-only profile registry (image + package/repo prep
 ## Requirements
 ### Requirement: A read-only distro profile registry drives per-distro provisioning
 
-The system SHALL resolve each distro key to a profile carrying its default provider image and its
-per-distro preparation (packages / repository / extra setup), exposed through a read-only registry, and
-SHALL raise a clear error for an unknown distro key. A profile's preparation SHALL describe the **generic,
-battery-agnostic distro box** only; optional vmlease-provided capabilities (e.g. docker) SHALL NOT be part
-of profile preparation — they are layered per-distro as capability recipes selected by a battery's
-`requires` (see the `host-capabilities` capability). Substrate that every host of a distro needs regardless
-of capability (e.g. kernel-module loads) MAY remain in profile extra-setup.
+The system SHALL resolve each distro reference — an `os = (family, version)` tuple — to a profile carrying
+that version's provider image slug and its per-distro preparation (packages / repository / extra setup) and
+rescue behavior, exposed through a read-only registry **keyed by `(family, version)`**, and SHALL raise a
+clear error for an unknown reference (an unknown family, or an unknown version of a known family). A family
+SHALL have at least one version entry, and **each version entry SHALL carry its own image slug, substrate
+prep, and rescue behavior** (any version-conditional prep is declarative in that entry). The registry SHALL
+expose a per-family **default-version pointer** — an **explicit designation** that SHALL NOT be inferred from
+declaration order — so that a bare family reference (no version) resolves to that family's current default
+version, preserving the back-compat case where a caller names only the family. **Rolling families** (e.g.
+arch) SHALL use the sentinel version `rolling` and SHALL take no explicit `@version`; an `arch@<anything>`
+reference SHALL be an error. A profile's image slug SHALL be resolved per `(family, version)` entry (its own
+`image` field) and SHALL NOT weld the version into a single image slug shared across versions.
+A profile's preparation SHALL describe the **generic, battery-agnostic distro box** only; optional
+vmlease-provided capabilities (e.g. docker) SHALL NOT be part of profile preparation — they are layered
+per-distro as capability recipes selected by a battery's `requires` (see the `host-capabilities` capability).
+Substrate that every host of a `(family, version)` needs regardless of capability (e.g. kernel-module loads)
+MAY remain in profile extra-setup.
 
-#### Scenario: A known distro resolves to its profile
+#### Scenario: A known (family, version) resolves to its profile
 
-- **WHEN** a known distro key is looked up
-- **THEN** its profile (default image + prep) is returned
+- **WHEN** a known `(family, version)` reference is looked up
+- **THEN** its profile (that version's image slug + prep + rescue behavior) is returned
+
+#### Scenario: A bare family resolves via the default-version pointer
+
+- **WHEN** a known family is looked up with no version
+- **THEN** it resolves to that family's current default version's profile
+
+#### Scenario: The default version is explicit, not declaration-order dependent
+
+- **WHEN** a family's version entries are reordered in the registry without changing the explicit
+  default designation
+- **THEN** a bare family reference resolves to the same default version as before (the default is not
+  the first-declared entry)
+
+#### Scenario: A rolling family takes no version
+
+- **WHEN** a rolling family (e.g. arch) is referenced with an explicit `@version`
+- **THEN** the system raises an error; a bare reference resolves to the sentinel `rolling` version
 
 #### Scenario: An unknown distro is rejected
 
-- **WHEN** an unknown distro key is looked up
-- **THEN** the system raises an unknown-distro error
+- **WHEN** an unknown reference is looked up (an unknown family, or an unknown version of a known family)
+- **THEN** the system raises an unknown-distro error naming the family (and version when applicable)
 
 #### Scenario: Docker is not part of profile preparation
 

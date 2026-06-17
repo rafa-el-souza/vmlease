@@ -205,11 +205,23 @@ quota error). Reaching the guard with no same-group superseded image to reclaim 
 - **THEN** it raises `ImageQuotaError` before provisioning a builder
 
 ### Requirement: Cached images are reaped as a persistent class
-Cache images SHALL be reaped by a dedicated `reap-images` command — by distro, by an explicit older-than
-cutoff timestamp, or by supersession (a content key no longer current for its group) — with a `--dry-run`
-mode that reports without deleting. Reaping SHALL be idempotent and best-effort with a partial-success
-report. Supersession resolution SHALL be fail-safe: a group whose current key cannot be resolved is kept
-and warned, never deleted. Cache images are persistent and SHALL NOT be reaped at run end.
+Cache images SHALL be reaped by a dedicated `reap-images` command — by family (`--distro <family>`), by an
+explicit older-than cutoff timestamp, or by supersession (a content key no longer current for its group) —
+with a `--dry-run` mode that reports without deleting. `reap-images --superseded` SHALL group per
+**`(family, version)`** (joined with architecture and the required-capability set), so a sibling version's
+cached image is **never** deleted by another version's supersession (the cross-version data-loss class this
+grouping exists to prevent). `reap-images --distro <family>` SHALL stay **family-scoped** — it reaps every
+version of that family. Reaping SHALL be idempotent and best-effort with a partial-success report.
+Supersession resolution SHALL be fail-safe: a group whose current key cannot be resolved is kept and warned,
+never deleted. Cache images are persistent and SHALL NOT be reaped at run end.
+
+#### Scenario: Superseded reap groups per (family, version)
+- **WHEN** `reap-images --superseded` runs with cached images for `ubuntu@22.04` and `ubuntu@24.04`, each current for its own `(family, version)` group
+- **THEN** neither is deleted as superseded — supersession is resolved per `(family, version)`, so one version's image is never treated as a superseded predecessor of another's
+
+#### Scenario: A family-scoped reap removes every version of the family
+- **WHEN** `reap-images --distro ubuntu` runs
+- **THEN** every cached image of the ubuntu family is reaped regardless of version
 
 #### Scenario: Superseded reap is fail-safe on an unresolvable group
 - **WHEN** `reap-images --superseded` cannot resolve the current key for a group
@@ -220,16 +232,22 @@ and warned, never deleted. Cache images are persistent and SHALL NOT be reaped a
 - **THEN** images whose creation timestamp parses to before that cutoff are deleted, with no reliance on an internal clock
 
 #### Scenario: Supersession removes a whole group whose current image is absent
-- **WHEN** `reap-images --superseded` runs for a group whose current key resolves but no cached image matches it (upstream rolled and nothing was rebuilt)
+- **WHEN** `reap-images --superseded` runs for a `(family, version)` group whose current key resolves but no cached image matches it (upstream rolled and nothing was rebuilt)
 - **THEN** every cached image for that group is treated as superseded and deleted (use `--older-than` for age-protection instead)
 
 ### Requirement: Cached images carry a persistent content-addressed label set
-Each cache image SHALL carry a persistent label set (purpose, content key, schema version, distro,
-architecture, source fingerprint, build provenance) emitted by a single function, and SHALL NOT carry the
-ephemeral per-run reap label. Image age for reaping SHALL be read from the image's own creation timestamp,
-not from a label.
+Each cache image SHALL carry a persistent label set (purpose, content key, schema version, distro (= the
+**family**), **version**, architecture, source fingerprint, build provenance) emitted by a single function,
+and SHALL NOT carry the ephemeral per-run reap label. The `version` label SHALL accompany the existing
+`distro` (= family) label so a `(family, version)` group is identifiable from the labels alone; for a rolling
+family the `version` label SHALL be the sentinel `rolling`. Image age for reaping SHALL be read from the
+image's own creation timestamp, not from a label.
 
 #### Scenario: A cache image survives a per-run reap
 - **WHEN** a run's per-run reap executes
 - **THEN** cache images, which lack the per-run label, are not deleted
+
+#### Scenario: A cache image carries family and version labels
+- **WHEN** `build-image --distro ubuntu@22.04` creates a cache image
+- **THEN** the image carries a `distro` label of `ubuntu` (family) and a `version` label of `22.04`, distinguishing it from an `ubuntu@24.04` image of the same family
 

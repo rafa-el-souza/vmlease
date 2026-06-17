@@ -10,13 +10,17 @@ counts and exits non-zero on).
 ## Requirements
 ### Requirement: A battery may declare a prep phase of per-distro packages and setup steps
 
-The battery manifest MAY carry a root-level `[prep]` section declaring host prerequisites the battery brings (distinct from probes — prep is setup, not a test). `[prep.packages]` SHALL be a flat table whose every key is a known package-manager OR a known distro (the two name-sets are disjoint); a key that is neither SHALL be a battery-load error. A host's effective package set SHALL be the union of the list under the host's package-manager key and the list under the host's distro key, deduplicated, manager entries first. `[[prep.setup]]` SHALL be an ordered array of setup steps, each carrying a unique `id`, **exactly one of** an inline `run` block or a `script` reference, an optional `distros` allowlist (default: every distro), an optional `required` boolean (default `true`), an optional `title`, and an optional `timeout` (seconds; when omitted, a prep-specific default of **1800s** applies — longer than the probe-runner default, since prep steps include source builds). A `script` step's file SHALL be resolved relative to the manifest directory, contained to the bundle, and shellchecked exactly as a probe `script` is. The system SHALL raise a clear battery-load error for a malformed `[prep]`: an unrecognized key at `[prep]`/`[prep.packages]`/a setup step, a selector key that is neither a known manager nor a known distro, a `distros` allowlist value that is not a known distro (a typo guard), a setup step declaring neither/both of `run`/`script`, a duplicate setup `id`, or an empty resolved command.
+The battery manifest MAY carry a root-level `[prep]` section declaring host prerequisites the battery brings (distinct from probes — prep is setup, not a test). `[prep.packages]` SHALL be a flat table whose every key is a known package-manager OR a known **distro family** (the two name-sets are disjoint); a key that is neither SHALL be a battery-load error. Because the profile registry is now keyed by `(family, version)`, prep distro selectors SHALL be validated **family-level** against a **family-name set** (the set of family names in the registry), NOT against the tuple-keyed registry — external battery TOML is unchanged. A distro selector (a `[prep.packages]` family key, or a `[[prep.setup]].distros` value such as `arch`) SHALL match **every host of that family regardless of version** (`distros = ["arch"]` = all arch hosts). Version-qualified selectors are out of scope (the deferred "version-aware selectors" item). A host's effective package set SHALL be the union of the list under the host's package-manager key and the list under the host's **family** key, deduplicated, manager entries first. `[[prep.setup]]` SHALL be an ordered array of setup steps, each carrying a unique `id`, **exactly one of** an inline `run` block or a `script` reference, an optional `distros` allowlist (default: every family), an optional `required` boolean (default `true`), an optional `title`, and an optional `timeout` (seconds; when omitted, a prep-specific default of **1800s** applies — longer than the probe-runner default, since prep steps include source builds). A `script` step's file SHALL be resolved relative to the manifest directory, contained to the bundle, and shellchecked exactly as a probe `script` is. The system SHALL raise a clear battery-load error for a malformed `[prep]`: an unrecognized key at `[prep]`/`[prep.packages]`/a setup step, a selector key that is neither a known manager nor a known **family**, a `distros` allowlist value that is not a known **family** (a typo guard), a setup step declaring neither/both of `run`/`script`, a duplicate setup `id`, or an empty resolved command.
 
-#### Scenario: Packages resolve as the union of manager and distro selectors
-- **WHEN** `[prep.packages]` has `apt = ["a"]` and `debian = ["b"]` and the host is debian (an apt distro)
+#### Scenario: Packages resolve as the union of manager and family selectors
+- **WHEN** `[prep.packages]` has `apt = ["a"]` and `debian = ["b"]` and the host is a debian-family host (an apt distro)
 - **THEN** the effective package set is `["a", "b"]` (manager list first, deduplicated)
 
-#### Scenario: A selector key that is neither a manager nor a distro is rejected
+#### Scenario: A family selector matches every version of the family
+- **WHEN** a `[[prep.setup]]` step declares `distros = ["arch"]` and the host is any arch host (e.g. `arch@rolling`)
+- **THEN** the step matches that host — the selector is family-level and version-agnostic
+
+#### Scenario: A selector key that is neither a manager nor a family is rejected
 - **WHEN** `[prep.packages]` carries a key like `apt-get` or `ubntu`
 - **THEN** the system raises a battery-load error naming the unrecognized selector key
 
@@ -32,9 +36,9 @@ The battery manifest MAY carry a root-level `[prep]` section declaring host prer
 - **WHEN** two `[[prep.setup]]` steps share an `id`
 - **THEN** the system raises a battery-load error naming the duplicated `id`
 
-#### Scenario: An unknown distro in a step's allowlist is rejected
-- **WHEN** a setup step declares `distros = ["arhc"]` (a typo) — a value that is not a known distro
-- **THEN** the system raises a battery-load error naming the unknown distro, rather than silently skipping the step on every host
+#### Scenario: An unknown family in a step's allowlist is rejected
+- **WHEN** a setup step declares `distros = ["arhc"]` (a typo) — a value that is not a known family
+- **THEN** the system raises a battery-load error naming the unknown family, rather than silently skipping the step on every host
 
 ### Requirement: The prep phase runs once per host after readiness and before the probe loop
 
