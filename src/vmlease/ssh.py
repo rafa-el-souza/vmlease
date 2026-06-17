@@ -396,8 +396,17 @@ def _default_runner(argv: list[str], timeout: float) -> subprocess.CompletedProc
     :class:`subprocess.TimeoutExpired` carrying whatever partial output was read.
     The caller (:meth:`OpenSshRunner.run_probe`) turns that into a recorded
     timed-out result rather than letting it propagate.
+
+    ``errors="replace"`` decodes stdout/stderr leniently: a probe (or the
+    host-detail snapshot) can emit a non-UTF-8 byte (e.g. a Windows-1252 quote
+    in ``os-release``), and strict decoding would raise ``UnicodeDecodeError``
+    out of the whole host run — zeroing every probe. Lenient decoding matches
+    :func:`_decode_partial`'s policy on the timeout path, so the normal and
+    timeout paths agree.
     """
-    return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
+    return subprocess.run(
+        argv, capture_output=True, text=True, errors="replace", check=False, timeout=timeout
+    )
 
 
 def _timed_out_result(probe: Probe, timeout: float, exc: subprocess.TimeoutExpired) -> ProbeResult:

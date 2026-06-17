@@ -2784,6 +2784,15 @@ class TestSsh(unittest.TestCase):
         with self.assertRaises(ssh.SshError):
             ssh._default_stream_runner(["sleep", "10"], lambda _s: None, 0.2)
 
+    def test_default_runner_decodes_non_utf8_leniently(self) -> None:
+        # the REAL default impl, exercised with a LOCAL command emitting a raw
+        # non-UTF-8 byte (0x94, a Windows-1252 quote): strict UTF-8 decoding would
+        # raise UnicodeDecodeError out of the whole host run (zeroing every probe);
+        # lenient decoding replaces it with U+FFFD and the run completes.
+        proc = ssh._default_runner(["printf", "a\\x94b"], 10.0)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "a�b")
+
     # --- D9.3 recursive directory push (safe symlinks) ---
 
     def test_build_rsync_argv_safe_links_and_hardening(self) -> None:
