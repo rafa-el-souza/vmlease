@@ -272,7 +272,7 @@ class TestSummarizeResults(unittest.TestCase):
         self.assertEqual(s["hosts"][0]["probes"][0]["command"], "sandbox start")
         # Unknown id → battery fills it (prefers classifies).
         self.assertEqual(s["hosts"][0]["probes"][1]["command"], "novel classifies label")
-        # Matrix keys are the clean labels, not sentences.
+        # matrix keys are the clean labels, not sentences.
         self.assertIn("sandbox start", s["matrix"])
         self.assertNotIn(
             "a very long human sentence describing what start does in detail", s["matrix"]

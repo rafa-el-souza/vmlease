@@ -68,16 +68,16 @@ MAX_CONSECUTIVE_TIMEOUTS = 2
 
 
 def _effective_packages(
-    packages: Mapping[str, tuple[str, ...]], manager: str, distro_key: str
+    packages: Mapping[str, tuple[str, ...]], manager: str, family: str
 ) -> tuple[str, ...]:
-    """The effective per-host package set: union(manager-list, distro-list), deduped.
+    """The effective per-host package set: union(manager-list, family-list), deduped.
 
-    ``[prep.packages]`` keys are package-managers OR distros (disjoint, validated
+    ``[prep.packages]`` keys are package-managers OR families (disjoint, validated
     at load). The effective set for one host is the union of its manager's list and
-    its distro's list, deduplicated in first-seen order with the manager entries
+    its family's list, deduplicated in first-seen order with the manager entries
     first (D-E). Selectors absent from the mapping contribute nothing.
     """
-    ordered = (*packages.get(manager, ()), *packages.get(distro_key, ()))
+    ordered = (*packages.get(manager, ()), *packages.get(family, ()))
     seen: dict[str, None] = {}
     for pkg in ordered:
         seen.setdefault(pkg, None)

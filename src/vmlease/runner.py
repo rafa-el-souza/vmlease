@@ -111,15 +111,6 @@ class RunRequest:
     uploads: tuple[UploadSpec, ...] = ()
     keep_policy: KeepPolicy = KeepPolicy()
 
-    @property
-    def distro_keys(self) -> tuple[str, ...]:
-        """Deprecated alias: the per-host families (removed in the contract group)."""
-        return tuple(h.os.family for h in self.hosts)
-
-
-# Deprecated alias for un-migrated readers (removed in the contract group).
-Matrix = RunRequest
-
 
 def build_host_specs(req: RunRequest) -> list[HostSpec]:
     """Turn a :class:`RunRequest` into one labelled :class:`HostSpec` per host.
@@ -147,7 +138,7 @@ def build_host_specs(req: RunRequest) -> list[HostSpec]:
         seen.add(h.name)
         # The keep marker is PER-HOST (a --keep subset leaves only some hosts
         # live), so each spec's labels are built from the run label + the keep
-        # marker when this host's family is kept (old KeepPolicy signature).
+        # marker when this host's name/family is kept.
         host_labels = dict(labels)
         if req.keep_policy.keeps(h.name, h.os.family):
             host_labels[LABEL_KEEP] = "1"
@@ -156,7 +147,6 @@ def build_host_specs(req: RunRequest) -> list[HostSpec]:
                 name=h.name,
                 image=h.image,
                 server_type=h.server_type,
-                distro_key=h.os.family,
                 labels=host_labels,
                 firewall=h.firewall,
                 requires=canonical_requires(h.requires),
@@ -181,7 +171,7 @@ def validate_uploads(matrix: RunRequest) -> None:
         validate_remote_dest(spec.remote)
 
 
-def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
+def plan(matrix: RunRequest, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
     """Render the dry-run plan. Makes **zero** provider calls.
 
     Builds the host specs (the same ones a real run would provision), validates
@@ -206,7 +196,6 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
             host_name=s.name,
             image=s.image,
             server_type=s.server_type,
-            distro_key=s.distro_key,
             workload_summary=workload_summary,
             requires=s.requires,
             os=s.os,
@@ -240,7 +229,7 @@ OnReady = Callable[["Host", "SshRunner", "Provider"], R]
 
 
 def execute(
-    matrix: Matrix,
+    matrix: RunRequest,
     provider: Provider,
     ssh_factory: Callable[[str, Keypair], SshRunner],
     keypair: Keypair,

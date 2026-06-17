@@ -7,7 +7,7 @@ slug and (b) render the cloud-init that installs deps + creates the non-root
 operator before the battery runs.
 
 Project-agnostic: a profile describes *how to prepare a distro*, independent of
-any particular battery. A consumer selects profiles by key in its matrix.
+any particular battery. A consumer selects profiles by family in its matrix.
 """
 
 from __future__ import annotations
@@ -50,15 +50,11 @@ class DistroProfile:
     existing manager is a new profile, not a new template.
 
     Attributes:
-        key: **Deprecated alias for** :attr:`family` (read via the ``family``
-            property; removed in a later contract group). Stable selector (e.g.
-            ``"ubuntu"``, ``"debian"``, ``"fedora"``, ``"arch"``).
-        default_image: **Deprecated alias for** :attr:`image` (read via the
-            ``image`` property; removed in a later contract group). Provider image
-            slug for this distro.
+        family: Stable selector (e.g. ``"ubuntu"``, ``"debian"``, ``"fedora"``,
+            ``"arch"``).
+        image: Provider image slug for this distro.
         version: Distro version (e.g. ``"24.04"``, ``"13"``) or :data:`ROLLING`
-            for rolling-release distros. Carries a transitional empty default
-            during expand; made required in a later contract group.
+            for rolling-release distros.
         package_manager: ``"apt" | "dnf" | "pacman"`` — selects the install template.
         packages: Base packages to install (the generic, battery-agnostic distro
             box). Optional vmlease-provided capabilities (e.g. docker) are NOT
@@ -76,7 +72,7 @@ class DistroProfile:
             covers every distro under that manager).
         rescue_image: When set, this distro has no native Hetzner image and is
             built by a rescue-write transform (:mod:`vmlease.archbuild`):
-            ``default_image`` is the cheap BASE host to provision, and this is the
+            ``image`` is the cheap BASE host to provision, and this is the
             injected :class:`~vmlease.rescue_image.RescueImageSpec` that resolves +
             trust-gates the cloud image to write onto its disk (Arch:
             :class:`~vmlease.rescue_image.ArchRescueImageSpec`; a pinned golden
@@ -85,25 +81,15 @@ class DistroProfile:
         notes: Free-text provenance / per-distro gotchas (for the results report).
     """
 
-    key: str
-    default_image: str
+    family: str
+    image: str
+    version: str
     package_manager: str
     packages: tuple[str, ...]
     extra_setup: tuple[str, ...] = ()
     system_update_override: str = ""
     rescue_image: RescueImageSpec | None = None
     notes: str = ""
-    version: str = ""
-
-    @property
-    def family(self) -> str:
-        """The distro family selector. Replaces the deprecated :attr:`key`."""
-        return self.key
-
-    @property
-    def image(self) -> str:
-        """The provider image slug. Replaces the deprecated :attr:`default_image`."""
-        return self.default_image
 
     @property
     def needs_rescue_write(self) -> bool:
@@ -125,21 +111,20 @@ class DistroProfile:
           sentinel to a self-disabling oneshot on the next boot.
 
         Selection is profile data keyed on ``needs_rescue_write`` — NOT an
-        ``if key == "arch"`` in the renderer, and NOT a branch inside a template
+        ``if family == "arch"`` in the renderer, and NOT a branch inside a template
         (templating stays logic-free).
         """
         return FINALIZE_FRAGMENT_RESCUE_WRITE if self.needs_rescue_write else FINALIZE_FRAGMENT_DEFAULT
 
 
 # Package sets validated on real hosts — the rootless-docker prerequisites a probe
-# battery assumes are present before it probes what the *operator* can do. Exposed
-# as a read-only ``Mapping`` (``MappingProxyType`` below) — it is a static registry
-# populated once at import; a runtime mutation would be a bug, so the type system +
-# runtime both forbid it (immutability rule; global-state hygiene).
+# battery assumes are present before it probes what the *operator* can do. The base
+# per-family profiles (each at the family's default version); sibling versions are
+# derived into ``_REGISTRY`` below.
 _PROFILES: dict[str, DistroProfile] = {
     "ubuntu": DistroProfile(
-        key="ubuntu",
-        default_image="ubuntu-24.04",
+        family="ubuntu",
+        image="ubuntu-24.04",
         version="24.04",
         package_manager="apt",
         packages=(
@@ -151,8 +136,8 @@ _PROFILES: dict[str, DistroProfile] = {
         "path (NOT debian).",
     ),
     "debian": DistroProfile(
-        key="debian",
-        default_image="debian-13",
+        family="debian",
+        image="debian-13",
         version="13",
         package_manager="apt",
         packages=(
@@ -163,8 +148,8 @@ _PROFILES: dict[str, DistroProfile] = {
         "(when required) is a capability recipe via the debian repo path.",
     ),
     "fedora": DistroProfile(
-        key="fedora",
-        default_image="fedora-43",
+        family="fedora",
+        image="fedora-43",
         version="43",
         package_manager="dnf",
         packages=(
@@ -189,12 +174,12 @@ _PROFILES: dict[str, DistroProfile] = {
         "via shadow-utils; needs modprobe ip_tables for the rootless iptables preflight.",
     ),
     "arch": DistroProfile(
-        key="arch",
+        family="arch",
         # No native Hetzner Arch image: provision a cheap debian-13 base, then
         # rescue-write the verified Arch cloudimg onto its disk (archbuild). The
         # cloudimg ships cloud-init -> reads the hetzner datasource -> applies the
         # SAME --user-data prep as every other distro (verified on a real host 2026-06-01).
-        default_image="debian-13",
+        image="debian-13",
         version=ROLLING,
         rescue_image=ArchRescueImageSpec(fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT),
         package_manager="pacman",
@@ -224,14 +209,14 @@ _PROFILES: dict[str, DistroProfile] = {
 # The authoritative registry, keyed by ``(family, version)`` (D-4). The base
 # per-family profiles in ``_PROFILES`` are each at that family's default version;
 # sibling versions are derived DRY via :func:`dataclasses.replace`, overriding
-# ONLY ``version`` + ``default_image`` so the package sets etc. stay single-source.
+# ONLY ``version`` + ``image`` so the package sets etc. stay single-source.
 _REGISTRY: dict[tuple[str, str], DistroProfile] = {
     (profile.family, profile.version): profile for profile in _PROFILES.values()
 }
 _REGISTRY.update({
-    ("ubuntu", "22.04"): replace(_PROFILES["ubuntu"], version="22.04", default_image="ubuntu-22.04"),
-    ("debian", "12"): replace(_PROFILES["debian"], version="12", default_image="debian-12"),
-    ("fedora", "44"): replace(_PROFILES["fedora"], version="44", default_image="fedora-44"),
+    ("ubuntu", "22.04"): replace(_PROFILES["ubuntu"], version="22.04", image="ubuntu-22.04"),
+    ("debian", "12"): replace(_PROFILES["debian"], version="12", image="debian-12"),
+    ("fedora", "44"): replace(_PROFILES["fedora"], version="44", image="fedora-44"),
 })
 
 # Per-family default version — an EXPLICIT table (D-4), NOT first-entry-wins, so a
@@ -243,18 +228,9 @@ _DEFAULT_VERSION: Mapping[str, str] = MappingProxyType({
     "arch": ROLLING,
 })
 
-# The set of all known registry family names. Unlike the deprecated string-keyed
-# ``PROFILES`` view, this survives the contract group — it is the authoritative
-# family-name set for the expander's shadow-name guard + battery prep validation.
+# The authoritative family-name set — used by the expander's shadow-name guard +
+# battery prep validation.
 FAMILIES: frozenset[str] = frozenset(_DEFAULT_VERSION)
-
-# Deprecated read-only **family → default-profile** view (removed in the contract
-# group). Derived from the registry + the explicit default table so legacy
-# ``PROFILES[family]`` / ``frozenset(PROFILES)`` readers are unchanged. Any
-# `PROFILES[k] = ...` / `del` raises TypeError.
-PROFILES: Mapping[str, DistroProfile] = MappingProxyType({
-    family: _REGISTRY[(family, version)] for family, version in _DEFAULT_VERSION.items()
-})
 
 # The default distro matrix.
 DEFAULT_DISTRO_KEYS: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")

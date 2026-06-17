@@ -41,13 +41,6 @@ class Os(NamedTuple):
     version: str
 
 
-# Transitional empty-os sentinel for the additive ``os`` defaults during expand
-# (the contract group makes ``os`` required and drops the default). A shared
-# constant — not an inline ``Os("", "")`` call in the dataclass default (which the
-# linter rejects, and which an immutable NamedTuple makes pointless to recreate).
-_EMPTY_OS = Os("", "")
-
-
 @runtime_checkable
 class Assertion(Protocol):
     """A predicate over a probe's :class:`Outcome` — structural typing only.
@@ -228,14 +221,9 @@ class ResolvedHost:
     """A fully-resolved host request: bare identity + ``(family, version)`` os.
 
     The output of the expander's resolve phase (:mod:`vmlease.hosts`) and the
-    input to ``build_host_specs`` at cutover. ``name`` is the host's bare identity
-    (auto-named or explicit, NOT the provider server name — that is derived from
-    it at cutover). ``image`` is baked from the registry so no version
-    re-resolution happens downstream.
-
-    Field order is pinned so no required field follows a defaulted one (the
-    frozen-dataclass trap): the four required fields first, the two defaulted
-    fields last.
+    input to ``build_host_specs``. ``name`` is the host's bare identity (auto-named
+    or explicit, NOT the provider server name — that is derived from it). ``image``
+    is baked from the registry so no version re-resolution happens downstream.
     """
 
     name: str
@@ -251,43 +239,37 @@ class HostSpec:
     """A request for one VM: which image, which size, labelled for teardown.
 
     Attributes:
-        name: Provider-unique server name (carries the run-id for reaping).
+        name: The host's bare identity (used by ``--keep``, the results record,
+            and the matrix column).
         image: Provider image slug (e.g. ``"ubuntu-24.04"``).
         server_type: Provider size slug (e.g. ``"cpx22"``).
+        os: The host's ``(family, version)`` os.
+        server_name: The provider-unique server name (carries the run-id for
+            reaping; ``vmlease-{run_id}-{name}``).
         labels: Key/value labels applied to the resource (always includes the
             ``vmlease=<run-id>`` label the safety layer adds).
-        distro_key: **Deprecated** — superseded by :attr:`os`/:attr:`family`
-            (read via the ``family`` property; the field is removed in the
-            contract group). The :mod:`vmlease.distro` family (e.g. ``"ubuntu"``).
         firewall: Optional provider firewall name to attach at create time
             (``""`` = none). Restricting inbound to the operator's IP is good
             hygiene for a host that boots an unconfigured cloud image.
         requires: The vmlease-provided capabilities this host needs (canonical
             order, default-off — ``()`` means no capability). Propagated from the
-            run's :class:`~vmlease.runner.Matrix` onto every host so the runner
+            run's :class:`~vmlease.runner.RunRequest` onto every host so the runner
             (and the cache key) can gate capability inclusion per host without
             reading the opaque battery.
-        os: The host's ``(family, version)`` os. Transitional default
-            ``Os("", "")`` during expand; the cutover sets the real value and the
-            contract group makes it required.
-        server_name: The provider-unique server name (carries the run-id). A
-            transitional default ``""`` during expand; the cutover derives it from
-            ``name``. The contract group makes it required.
     """
 
     name: str
     image: str
     server_type: str
-    distro_key: str
+    os: Os
+    server_name: str
     labels: dict[str, str] = field(default_factory=dict)
     firewall: str = ""
     requires: tuple[str, ...] = ()
-    os: Os = _EMPTY_OS
-    server_name: str = ""
 
     @property
     def family(self) -> str:
-        """The host's distro family. Replaces the deprecated :attr:`distro_key`."""
+        """The host's distro family (from :attr:`os`)."""
         return self.os.family
 
 
@@ -456,16 +438,12 @@ class PlanItem:
     (e.g. ``probes=3`` for the probe battery) — the plan does not assume probes.
     ``requires`` surfaces the host's vmlease-provided capabilities (canonical
     order, ``()`` when none) so the operator can review them before any spend.
-
-    ``distro_key`` is **deprecated** (superseded by :attr:`os`; removed in the
-    contract group). ``os`` carries the host's ``(family, version)``; it has a
-    transitional default during expand and is made required in the contract group.
+    ``os`` carries the host's ``(family, version)``.
     """
 
     host_name: str
     image: str
     server_type: str
-    distro_key: str
     workload_summary: str
+    os: Os
     requires: tuple[str, ...] = ()
-    os: Os = _EMPTY_OS

@@ -72,7 +72,6 @@ from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import (
     TEARDOWN_WARNING_PREFIX,
     KeepPolicy,
-    Matrix,
     RescueWriter,
     RunRequest,
     build_one_image,
@@ -114,7 +113,7 @@ def _format_os(os: Os) -> str:
     return os.family if os.version == ROLLING else f"{os.family}@{os.version}"
 
 
-def _matrix_has_rescue_write(matrix: Matrix) -> bool:
+def _matrix_has_rescue_write(matrix: RunRequest) -> bool:
     """``True`` iff any host in the run needs a rescue-write transform."""
     return any(get_profile(h.os.family, h.os.version).needs_rescue_write for h in matrix.hosts)
 
@@ -138,7 +137,7 @@ def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: s
     return build_live_rescue_writer(rescue_key_path, ssh_key_name, keyring_path)
 
 
-def _build_run_resolve_deps(matrix: Matrix, keypair: Keypair) -> ResolveDeps:
+def _build_run_resolve_deps(matrix: RunRequest, keypair: Keypair) -> ResolveDeps:
     """Build the run's cache-lookup ``ResolveDeps`` (the keyring only when needed).
 
     Mirrors ``build-image``'s deps construction but keyed on the matrix: the pinned
@@ -673,15 +672,16 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
         def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
             return OpenSshRunner(operator, keypair.private_key_path)
 
+        build_name = f"vmlease-{run_id}-build-{build_comp}"
         spec = HostSpec(
-            name=f"vmlease-{run_id}-build-{build_comp}",
+            name=build_name,
             image=profile.image,
             server_type=args.server_type,
-            distro_key=profile.family,
+            os=build_os,
+            server_name=build_name,
             labels=run_label(run_id),
             firewall=args.firewall,
             requires=requires,
-            os=build_os,
         )
         on_ready = make_snapshot_on_ready(
             description=f"vmlease cache {_format_os(build_os)} {key}",
