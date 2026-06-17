@@ -6237,13 +6237,16 @@ def _rescue_profile(spec: object) -> distro.DistroProfile:
 
 def _cache_image(
     *, distro_key: str, arch: str, key: str, img_id: str = "img-1",
-    requires: tuple[str, ...] = (),
+    requires: tuple[str, ...] = (), version: str | None = None,
 ) -> Image:
-    """A cache Image carrying the supersession-relevant labels (incl. requires-hash)."""
+    """A cache Image carrying the supersession-relevant labels (incl. version + requires-hash)."""
+    if version is None:
+        version = distro.get_profile(distro_key).version
     return Image(
         id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
         labels={
             imagecache.LABEL_DISTRO: distro_key,
+            imagecache.LABEL_VERSION: version,
             imagecache.LABEL_ARCH: arch,
             imagecache.LABEL_CACHE_KEY: key,
             imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -6306,6 +6309,15 @@ class TestImageCacheContentKey(unittest.TestCase):
             imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
             imagecache.content_key(ubuntu, "arm", "probe", (), _null_deps()),
         )
+
+    def test_distinct_version_distinct_key(self) -> None:
+        # (D-9) (ubuntu, 22.04) vs (ubuntu, 24.04): different base image slug → the
+        # digest differs, so the content keys differ; the family component stays family.
+        k22 = imagecache.content_key(distro.get_profile("ubuntu", "22.04"), "x86", "probe", (), _null_deps())
+        k24 = imagecache.content_key(distro.get_profile("ubuntu", "24.04"), "x86", "probe", (), _null_deps())
+        self.assertNotEqual(k22, k24)
+        self.assertTrue(k22.startswith("v1-ubuntu-"))
+        self.assertTrue(k24.startswith("v1-ubuntu-"))
 
     def test_operator_changes_key(self) -> None:
         # operator is part of the canonical render (baked user), so it is in the key.
@@ -6697,6 +6709,7 @@ class TestImageCacheLabels(unittest.TestCase):
             "vmlease-cache-key": "v1-ubuntu-abc",
             "vmlease-schema": "v1",
             "vmlease-distro": "ubuntu",
+            "vmlease-version": "24.04",
             "vmlease-arch": "x86",
             "vmlease-source-fp": "ubuntu-24.04",
             "vmlease-built": "run-xyz",
@@ -6722,6 +6735,20 @@ class TestImageCacheLabels(unittest.TestCase):
         self.assertEqual(len(labels["vmlease-source-fp"]), 63)
         self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
 
+    def test_emits_version_label_for_versioned_profile(self) -> None:
+        labels = imagecache.cache_labels(
+            distro.get_profile("ubuntu", "22.04"), "x86", key="k", source_fp="fp",
+            run_token="r", requires=(),
+        )
+        self.assertEqual(labels[imagecache.LABEL_VERSION], "22.04")
+        self.assertEqual(labels[imagecache.LABEL_DISTRO], "ubuntu")  # LABEL_DISTRO stays family
+
+    def test_emits_rolling_version_label_for_arch(self) -> None:
+        labels = imagecache.cache_labels(
+            distro.get_profile("arch"), "x86", key="k", source_fp="fp", run_token="r", requires=(),
+        )
+        self.assertEqual(labels[imagecache.LABEL_VERSION], distro.ROLLING)
+
 
 class TestImageCacheSupersession(unittest.TestCase):
     def test_superseded_subset(self) -> None:
@@ -6744,7 +6771,7 @@ class TestImageCacheSupersession(unittest.TestCase):
             [img], distro.get_profile, "probe", _null_deps(), warnings.append,
         )
         expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
-        self.assertEqual(keys, {("ubuntu", "x86", imagecache.requires_hash(())): expected})
+        self.assertEqual(keys, {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): expected})
         self.assertEqual(warnings, [])
 
     def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
@@ -6752,10 +6779,10 @@ class TestImageCacheSupersession(unittest.TestCase):
         from vmlease.archbuild import ArchBuildError
         raising_spec = _FakeResolveSpec(raises=ArchBuildError("mirror down"))
 
-        def profile_for(key: str) -> distro.DistroProfile:
-            if key == "arch":
+        def profile_for(family: str, version: str = "") -> distro.DistroProfile:
+            if family == "arch":
                 return _rescue_profile(raising_spec)
-            return distro.get_profile(key)
+            return distro.get_profile(family, version)
 
         arch_img = _cache_image(distro_key="arch", arch="x86", key="v1-arch-OLD", img_id="arch1")
         ubuntu_img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-X", img_id="ub1")
@@ -6764,8 +6791,8 @@ class TestImageCacheSupersession(unittest.TestCase):
             [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
         )
         # ubuntu resolved; arch skipped (kept) with a warning.
-        self.assertIn(("ubuntu", "x86", imagecache.requires_hash(())), keys)
-        self.assertNotIn(("arch", "x86", imagecache.requires_hash(())), keys)
+        self.assertIn(("ubuntu", "24.04", "x86", imagecache.requires_hash(())), keys)
+        self.assertNotIn(("arch", distro.ROLLING, "x86", imagecache.requires_hash(())), keys)
         self.assertEqual(len(warnings), 1)
         self.assertIn("arch", warnings[0])
 
@@ -6777,6 +6804,52 @@ class TestImageCacheSupersession(unittest.TestCase):
             [a, b], distro.get_profile, "probe", _null_deps(), lambda _m: None,
         )
         self.assertEqual(len(keys), 1)
+
+    def test_group_of_is_four_tuple_with_version(self) -> None:
+        img = _cache_image(distro_key="ubuntu", version="22.04", arch="x86", key="k")
+        group = imagecache.group_of(img)
+        self.assertEqual(len(group), 4)
+        self.assertEqual(group, ("ubuntu", "22.04", "x86", imagecache.requires_hash(())))
+
+    def test_sibling_versions_are_distinct_groups(self) -> None:
+        v22 = _cache_image(distro_key="ubuntu", version="22.04", arch="x86", key="k22", img_id="v22")
+        v24 = _cache_image(distro_key="ubuntu", version="24.04", arch="x86", key="k24", img_id="v24")
+        self.assertNotEqual(imagecache.group_of(v22), imagecache.group_of(v24))
+
+    def test_sibling_versions_resolve_independently_not_superseded(self) -> None:
+        # D-9: each (family, version) group resolves its own current key; a 24.04
+        # build never supersedes the 22.04 image (distinct groups).
+        v22 = _cache_image(distro_key="ubuntu", version="22.04", arch="x86", key="k22", img_id="v22")
+        v24 = _cache_image(distro_key="ubuntu", version="24.04", arch="x86", key="k24", img_id="v24")
+        keys = imagecache.resolve_current_keys(
+            [v22, v24], distro.get_profile, "probe", _null_deps(), lambda _m: None,
+        )
+        self.assertEqual(len(keys), 2)  # two distinct groups
+        self.assertEqual(
+            keys[imagecache.group_of(v22)],
+            imagecache.content_key(distro.get_profile("ubuntu", "22.04"), "x86", "probe", (), _null_deps()),
+        )
+        self.assertEqual(
+            keys[imagecache.group_of(v24)],
+            imagecache.content_key(distro.get_profile("ubuntu", "24.04"), "x86", "probe", (), _null_deps()),
+        )
+
+    def test_image_missing_version_label_is_kept_fail_safe(self) -> None:
+        # an OLD image with no LABEL_VERSION → version="" → profile_for(family, "")
+        # raises (unknown version) → group skipped + warned, never deleted (D-9).
+        old = Image(
+            id="old", created="2024-01-01T00:00:00+00:00", disk_size=40.0, arch="x86",
+            labels={
+                imagecache.LABEL_DISTRO: "ubuntu",
+                imagecache.LABEL_ARCH: "x86",
+                imagecache.LABEL_CACHE_KEY: "v1-ubuntu-OLD",
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(()),
+            },
+        )
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys([old], distro.get_profile, "probe", _null_deps(), warnings.append)
+        self.assertEqual(keys, {})  # unresolved → kept
+        self.assertEqual(len(warnings), 1)
 
 
 class TestWaitUntilOff(unittest.TestCase):
@@ -7333,13 +7406,16 @@ class TestCliReapImages(unittest.TestCase):
     def _img(
         self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
         key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
-        requires: tuple[str, ...] = (),
+        requires: tuple[str, ...] = (), version: str | None = None,
     ) -> Image:
+        if version is None:
+            version = distro.get_profile(distro_key).version
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
             labels={
                 imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
                 imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_VERSION: version,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
                 imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -7349,7 +7425,7 @@ class TestCliReapImages(unittest.TestCase):
 
     def _run(
         self, prov: FakeProvider, argv: list[str], *,
-        resolve_current_keys: Callable[..., dict[tuple[str, str, str], str]] | None = None,
+        resolve_current_keys: Callable[..., dict[tuple[str, str, str, str], str]] | None = None,
     ) -> tuple[int, str, str]:
         from contextlib import ExitStack
         from unittest import mock
@@ -7438,7 +7514,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -7451,8 +7527,8 @@ class TestCliReapImages(unittest.TestCase):
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
-            warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
+            warn("cannot resolve current cache key for group (family='arch', version='rolling', arch='x86'): mirror down")
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -7467,7 +7543,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -7486,8 +7562,8 @@ class TestCliReapImages(unittest.TestCase):
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             return {
-                ("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
-                ("ubuntu", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
+                ("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
+                ("ubuntu", "24.04", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
             }
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
