@@ -90,7 +90,7 @@ def _recipe_slot_values(profile: DistroProfile) -> dict[str, str]:
     equals the distro key (``"debian"`` / ``"ubuntu"``) and is derived here rather
     than stored on the profile (the profile no longer carries a docker-repo slug).
     """
-    return {"docker_repo_slug": profile.key}
+    return {"docker_repo_slug": profile.family}
 
 
 def _capability_injection(
@@ -133,14 +133,14 @@ def render_install_block(profile: DistroProfile, requires: tuple[str, ...]) -> s
     except (FileNotFoundError, ModuleNotFoundError) as exc:
         raise CloudInitError(
             f"no install template {template_name!r} for package manager "
-            f"{profile.package_manager!r} (distro {profile.key!r})"
+            f"{profile.package_manager!r} (distro {profile.family!r})"
         ) from exc
     cap_packages, cap_setup = _capability_injection(profile, requires)
     candidates = {
         "packages": " ".join((*profile.packages, *cap_packages)),
         "capability_setup": "\n  ".join(cap_setup),
         "extra_setup": "\n  ".join(profile.extra_setup),
-        "distro_key": profile.key,
+        "distro_key": profile.family,
     }
     missing = find_slots(template_text) - set(candidates)
     if missing:
@@ -168,9 +168,9 @@ def render_finalize_block(profile: DistroProfile) -> str:
     except (FileNotFoundError, ModuleNotFoundError) as exc:
         raise CloudInitError(
             f"no finalize template {template_name!r} for finalize fragment "
-            f"{profile.finalize_fragment!r} (distro {profile.key!r})"
+            f"{profile.finalize_fragment!r} (distro {profile.family!r})"
         ) from exc
-    candidates = {"distro_key": profile.key}
+    candidates = {"distro_key": profile.family}
     missing = find_slots(template_text) - set(candidates)
     if missing:
         raise CloudInitError(
@@ -204,7 +204,7 @@ def render_cloudinit(
         "install_block": install_block,
         "finalize": finalize,
         "system_update": system_update_command(profile),
-        "distro_key": profile.key,
+        "distro_key": profile.family,
         "package_manager": profile.package_manager,
     }
     return _render_subset(base, candidates)

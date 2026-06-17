@@ -1608,6 +1608,38 @@ class TestDistro(unittest.TestCase):
         self.assertIsInstance(distro._SYSTEM_UPDATE_BY_MANAGER, MappingProxyType)
 
 
+class TestVersionflatAndProfileShape(unittest.TestCase):
+    def test_versionflat_strips_to_digits(self) -> None:
+        self.assertEqual(distro.versionflat("22.04"), "2204")
+        self.assertEqual(distro.versionflat("12.1"), "121")
+        self.assertEqual(distro.versionflat("13"), "13")
+
+    def test_profile_exposes_family_image_version(self) -> None:
+        p = distro.DistroProfile(
+            key="ubuntu", default_image="ubuntu-24.04", package_manager="apt",
+            packages=("p",), version="24.04",
+        )
+        self.assertEqual(p.family, "ubuntu")
+        self.assertEqual(p.image, "ubuntu-24.04")
+        self.assertEqual(p.version, "24.04")
+
+    def test_deprecated_aliases_still_readable_and_equal(self) -> None:
+        p = distro.DistroProfile(
+            key="debian", default_image="debian-13", package_manager="apt",
+            packages=("p",), version="13",
+        )
+        self.assertEqual(p.key, "debian")
+        self.assertEqual(p.default_image, "debian-13")
+        self.assertEqual(p.key, p.family)
+        self.assertEqual(p.default_image, p.image)
+
+    def test_registry_profiles_carry_versions(self) -> None:
+        self.assertEqual(distro.get_profile("ubuntu").version, "24.04")
+        self.assertEqual(distro.get_profile("debian").version, "13")
+        self.assertEqual(distro.get_profile("fedora").version, "43")
+        self.assertEqual(distro.get_profile("arch").version, distro.ROLLING)
+
+
 # --------------------------------------------------------------------------- #
 # runner — build_host_specs + plan (zero provider calls)
 # --------------------------------------------------------------------------- #

@@ -24,6 +24,19 @@ from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
 FINALIZE_FRAGMENT_DEFAULT = "default"
 FINALIZE_FRAGMENT_RESCUE_WRITE = "reboot-resume"
 
+# Sentinel version for rolling-release distros (e.g. Arch): they have no numbered
+# version, so the registry/labels carry this marker instead of a version number.
+ROLLING = "rolling"
+
+
+def versionflat(version: str) -> str:
+    """Return the digits of ``version`` (``"22.04"`` → ``"2204"``, ``"13"`` → ``"13"``).
+
+    Used to derive a compact, separator-free version token for host auto-names and
+    builder/image names (e.g. ``ubuntu-2204``). Non-digit characters are dropped.
+    """
+    return "".join(ch for ch in version if ch.isdigit())
+
 
 @dataclass(frozen=True)
 class DistroProfile:
@@ -37,8 +50,15 @@ class DistroProfile:
     existing manager is a new profile, not a new template.
 
     Attributes:
-        key: Stable selector (e.g. ``"ubuntu"``, ``"debian"``, ``"fedora"``, ``"arch"``).
-        default_image: Provider image slug for this distro.
+        key: **Deprecated alias for** :attr:`family` (read via the ``family``
+            property; removed in a later contract group). Stable selector (e.g.
+            ``"ubuntu"``, ``"debian"``, ``"fedora"``, ``"arch"``).
+        default_image: **Deprecated alias for** :attr:`image` (read via the
+            ``image`` property; removed in a later contract group). Provider image
+            slug for this distro.
+        version: Distro version (e.g. ``"24.04"``, ``"13"``) or :data:`ROLLING`
+            for rolling-release distros. Carries a transitional empty default
+            during expand; made required in a later contract group.
         package_manager: ``"apt" | "dnf" | "pacman"`` — selects the install template.
         packages: Base packages to install (the generic, battery-agnostic distro
             box). Optional vmlease-provided capabilities (e.g. docker) are NOT
@@ -73,6 +93,17 @@ class DistroProfile:
     system_update_override: str = ""
     rescue_image: RescueImageSpec | None = None
     notes: str = ""
+    version: str = ""
+
+    @property
+    def family(self) -> str:
+        """The distro family selector. Replaces the deprecated :attr:`key`."""
+        return self.key
+
+    @property
+    def image(self) -> str:
+        """The provider image slug. Replaces the deprecated :attr:`default_image`."""
+        return self.default_image
 
     @property
     def needs_rescue_write(self) -> bool:
@@ -109,6 +140,7 @@ _PROFILES: dict[str, DistroProfile] = {
     "ubuntu": DistroProfile(
         key="ubuntu",
         default_image="ubuntu-24.04",
+        version="24.04",
         package_manager="apt",
         packages=(
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
@@ -121,6 +153,7 @@ _PROFILES: dict[str, DistroProfile] = {
     "debian": DistroProfile(
         key="debian",
         default_image="debian-13",
+        version="13",
         package_manager="apt",
         packages=(
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
@@ -132,6 +165,7 @@ _PROFILES: dict[str, DistroProfile] = {
     "fedora": DistroProfile(
         key="fedora",
         default_image="fedora-43",
+        version="43",
         package_manager="dnf",
         packages=(
             "systemd-container", "acl", "rsync", "slirp4netns",
@@ -161,6 +195,7 @@ _PROFILES: dict[str, DistroProfile] = {
         # cloudimg ships cloud-init -> reads the hetzner datasource -> applies the
         # SAME --user-data prep as every other distro (verified on a real host 2026-06-01).
         default_image="debian-13",
+        version=ROLLING,
         rescue_image=ArchRescueImageSpec(fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT),
         package_manager="pacman",
         packages=(
@@ -217,7 +252,7 @@ def system_update_command(profile: DistroProfile) -> str:
     except KeyError as exc:
         raise UnknownPackageManagerError(
             f"no system-update command for package manager "
-            f"{profile.package_manager!r} (distro {profile.key!r}); set "
+            f"{profile.package_manager!r} (distro {profile.family!r}); set "
             f"system_update_override on the profile"
         ) from exc
 

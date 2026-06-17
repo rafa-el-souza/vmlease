@@ -582,7 +582,7 @@ def _lookup_cache_image(
         key = content_key(profile, arch, operator, requires, deps)
         images = provider.list_images(label_selector_purpose())
     except Exception as exc:  # lookup failure → advisory miss, never a host failure
-        warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
+        warn(f"cache lookup failed for {profile.family!r} (arch={arch!r}); using cold path: {exc}")
         return None
     return _first_matching_image(images, key=key, arch=arch, target_disk=target_disk)
 
@@ -675,7 +675,7 @@ def _with_ready_host(
         if needs_rescue:
             if rescue_writer is None:
                 raise RuntimeError(
-                    f"distro {profile.key!r} needs a rescue-write transform but no "
+                    f"distro {profile.family!r} needs a rescue-write transform but no "
                     f"rescue_writer was provided to execute()"
                 )
             rescue_writer(host, profile)
