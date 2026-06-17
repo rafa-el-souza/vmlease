@@ -209,6 +209,7 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
             distro_key=s.distro_key,
             workload_summary=workload_summary,
             requires=s.requires,
+            os=s.os,
         )
         for s in specs
     ]

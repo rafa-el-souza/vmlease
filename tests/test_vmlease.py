@@ -2168,6 +2168,41 @@ class TestCutover(unittest.TestCase):
         self.assertIs(runner.Matrix, runner.RunRequest)
 
 
+class TestPlanRendering(unittest.TestCase):
+    def test_plan_items_carry_os(self) -> None:
+        req = _run_request(_demo_workload(), ("ubuntu@22.04", "arch"), run_token="run-os")
+        items = runner.plan(req)
+        self.assertEqual(items[0].os, model.Os("ubuntu", "22.04"))
+        self.assertEqual(items[1].os, model.Os("arch", distro.ROLLING))
+
+    def test_format_os_versioned_and_rolling(self) -> None:
+        self.assertEqual(cli._format_os(model.Os("ubuntu", "22.04")), "ubuntu@22.04")
+        self.assertEqual(cli._format_os(model.Os("arch", distro.ROLLING)), "arch")
+
+    def test_plan_render_shows_family_at_version_and_bare_rolling(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main([
+                    "plan", "--battery", battery, "--hosts", "ubuntu@22.04,ubuntu@24.04,arch",
+                    "--run-token", "cli-plan",
+                ])
+            out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        # versioned hosts (two ubuntu versions → suffixed names) → family@version
+        self.assertIn("- ubuntu-2204  [ubuntu@22.04]", out)
+        self.assertIn("- ubuntu-2404  [ubuntu@24.04]", out)
+        # rolling → bare [arch], never [arch@rolling]
+        self.assertIn("- arch  [arch]", out)
+        self.assertNotIn("@rolling", out)
+
+    def test_plan_makes_zero_provider_calls(self) -> None:
+        # plan() takes no provider parameter — structurally call-free.
+        import inspect
+        self.assertNotIn("provider", inspect.signature(runner.plan).parameters)
+
+
 class TestKeepPolicy(unittest.TestCase):
     def test_keeps_name_hit(self) -> None:
         p = runner.KeepPolicy(names=frozenset({"api"}))
@@ -2379,7 +2414,7 @@ class TestCli(unittest.TestCase):
             self.assertIn("NOTHING PROVISIONED", out)
             # the plan shows the bare host identity (post-cutover), not the
             # provider server name (which carries the run-id).
-            self.assertIn("- ubuntu  [ubuntu]", out)
+            self.assertIn("- ubuntu  [ubuntu@24.04]", out)
 
     def test_plan_bad_battery_returns_2(self) -> None:
         with tempfile.TemporaryDirectory() as d:

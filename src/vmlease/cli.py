@@ -50,7 +50,7 @@ from vmlease.battery import (
     structural_violations,
 )
 from vmlease.capabilities import canonical_requires
-from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
+from vmlease.distro import DEFAULT_DISTRO_KEYS, ROLLING, UnknownDistroError, get_profile
 from vmlease.hosts import HostListError, parse, resolve
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
@@ -65,7 +65,7 @@ from vmlease.imagecache import (
     superseded,
 )
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
-from vmlease.model import Battery, HostRun, HostSpec, Image, UploadSpec
+from vmlease.model import Battery, HostRun, HostSpec, Image, Os, UploadSpec
 from vmlease.providers import HetznerProvider, Provider, ProviderError, ProviderQuotaError
 from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import (
@@ -105,6 +105,12 @@ from vmlease.shellcheck import (
 from vmlease.ssh import OpenSshRunner
 from vmlease.summary import overall_exit_code, summarize_results, summary_filename, write_summary
 from vmlease.workload import ProbeWorkload, Workload
+
+
+def _format_os(os: Os) -> str:
+    """Render a host's ``os`` for the plan/provision display: ``family@version``,
+    or bare ``family`` for a rolling-release family (D-16)."""
+    return os.family if os.version == ROLLING else f"{os.family}@{os.version}"
 
 
 def _matrix_has_rescue_write(matrix: Matrix) -> bool:
@@ -203,7 +209,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
         requires_note = f"  requires={list(it.requires)}" if it.requires else ""
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
+        print(f"  - {it.host_name}  [{_format_os(it.os)}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
     return 0
 
 
@@ -303,7 +309,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
         requires_note = f"  requires={list(it.requires)}" if it.requires else ""
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}{requires_note}")
+        print(f"  - {it.host_name}  [{_format_os(it.os)}]  {it.image}  {it.server_type}{requires_note}")
     if not _confirm("Proceed with provisioning? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0
