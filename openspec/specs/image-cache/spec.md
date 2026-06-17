@@ -5,7 +5,7 @@ Define the content-addressed snapshot cache of prepped hosts: a deterministic co
 the base-image fingerprint and the rendered cloud-init (so the required-capability set is part of the
 key), the `build-image` builder that snapshots a prepped host under that key, the restore-on-hit at run
 (recorded as `restored_image` so hit/miss is observable), and reap/supersession scoped to the
-`(distro, arch, requires-hash)` group so variants never delete one another.
+`(family, version, arch, requires-hash)` group so variants (incl. sibling versions) never delete one another.
 ## Requirements
 ### Requirement: build-image produces a content-addressed snapshot of a prepped host
 

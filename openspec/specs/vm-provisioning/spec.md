@@ -130,7 +130,7 @@ create time — before the workload exists; `requires` is a provisioning attribu
 ### Requirement: The plan dry-run makes zero provider calls
 
 The system SHALL render a `plan` that shows exactly what a real run would provision — one plan item per
-host, including image, server type, distro key, the host's **required capabilities**, and a summary of the
+host, including image, server type, the resolved `os` (`family@version`, rolling bare), the host's **required capabilities**, and a summary of the
 **injected workload** — while making **no** provider calls and running the cost guard so a guard refusal
 surfaces before any spend. Because required capabilities change the provisioned image (and therefore the
 cache key), the plan SHALL surface them so the dry-run reflects what the run will actually build.
