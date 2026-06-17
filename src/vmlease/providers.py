@@ -134,12 +134,16 @@ def build_create_argv(spec: HostSpec, user_data_path: str) -> list[str]:
     # it errors `unknown flag: --output`). It prints plain text carrying the id +
     # IPv4, parsed by ``parse_create_text``.
     firewall_args = ["--firewall", spec.firewall] if spec.firewall else []
+    # The provider server name carries the run-id (``server_name``). The ``or
+    # spec.name`` is transitional: pre-cutover specs leave ``server_name`` at its
+    # ``""`` default, so the run-id-bearing ``spec.name`` still flows through; the
+    # cutover sets ``server_name`` and the contract group drops the ``or``.
     return [
         "hcloud",
         "server",
         "create",
         "--name",
-        spec.name,
+        spec.server_name or spec.name,
         "--image",
         spec.image,
         "--type",

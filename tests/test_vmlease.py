@@ -655,6 +655,22 @@ class TestProviderArgv(unittest.TestCase):
         self.assertIn("--user-data-from-file", argv)
         self.assertEqual(argv[argv.index("--user-data-from-file") + 1], "/tmp/cloud.init")
 
+    def test_create_argv_uses_server_name_when_set(self) -> None:
+        spec = model.HostSpec(
+            name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", labels={"vmlease": "r1"},
+            server_name="vmlease-x-ubuntu",
+        )
+        argv = providers.build_create_argv(spec, "/tmp/c")
+        self.assertEqual(argv[argv.index("--name") + 1], "vmlease-x-ubuntu")
+
+    def test_create_argv_falls_back_to_name_when_server_name_empty(self) -> None:
+        # default server_name="" → today's behaviour: --name is spec.name
+        spec = self._spec()
+        self.assertEqual(spec.server_name, "")
+        argv = providers.build_create_argv(spec, "/tmp/c")
+        self.assertEqual(argv[argv.index("--name") + 1], "vmlease-r1-ubuntu")
+
     def test_delete_and_list_argv(self) -> None:
         host = model.Host(id="42", name="n", ipv4="1.2.3.4")
         self.assertEqual(providers.build_delete_argv(host), ["hcloud", "server", "delete", "42"])
@@ -666,6 +682,19 @@ class TestProviderArgv(unittest.TestCase):
         host = providers.parse_create_text(out, "vmlease-r1-arch", {"vmlease": "r1"})
         self.assertEqual((host.id, host.ipv4, host.name), ("12345678", "123.0.0.1", "vmlease-r1-arch"))
         self.assertEqual(host.labels, {"vmlease": "r1"})
+
+    def test_host_name_is_spec_name_after_parse(self) -> None:
+        # the caller passes spec.name to parse_create_text, so Host.name is the
+        # bare identity (unchanged by the server_name plumbing).
+        spec = model.HostSpec(
+            name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", labels={"vmlease": "r1"},
+            server_name="vmlease-x-ubuntu",
+        )
+        out = "Server 12345678 created\nIPv4: 123.0.0.1\n"
+        host = providers.parse_create_text(out, spec.name, spec.labels)
+        self.assertEqual(host.name, spec.name)
+        self.assertEqual(host.name, "ubuntu")
 
     def test_parse_create_text_missing_id(self) -> None:
         with self.assertRaises(providers.ProviderError):
