@@ -1542,6 +1542,13 @@ class TestBatteryRequiresAndPrep(unittest.TestCase):
             ))
         self.assertIn("arhc", str(ctx.exception))
 
+    def test_prep_accepts_every_known_family_key(self) -> None:
+        # the validation set is the registry FAMILIES (D-11): all four families load.
+        for family in ("ubuntu", "debian", "fedora", "arch"):
+            b = _resolve_toml(self._manifest(f"[prep.packages]\n{family} = ['''pkg''']\n"))
+            assert b.prep is not None
+            self.assertEqual(b.prep.packages[family], ("pkg",))
+
     def test_prep_setup_duplicate_id_rejected(self) -> None:
         with self.assertRaises(battery_mod.BatteryError) as ctx:
             battery_mod.parse_battery(self._manifest(
@@ -4884,7 +4891,10 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
         return _resolve_toml(f"name = '''b'''\n{prep_body}{self._PROBE}")
 
     def _spec(self, distro_key: str = "ubuntu") -> model.HostSpec:
-        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key=distro_key)
+        return model.HostSpec(
+            name="n", image="i", server_type="cpx22", distro_key=distro_key,
+            os=model.Os(distro_key, ""),
+        )
 
     def _host(self) -> Host:
         return Host(id="1", name="n", ipv4="9.9.9.9")
@@ -4936,6 +4946,31 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
         run = wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
         self.assertNotIn("arch-only", ssh_fake.ran)
         self.assertEqual([p.id for p in run.prep_phase], ["everywhere"])
+
+    def _versioned_spec(self, family: str, version: str) -> model.HostSpec:
+        return model.HostSpec(
+            name="n", image="i", server_type="cpx22", distro_key=family,
+            os=model.Os(family, version),
+        )
+
+    def test_family_selector_matches_every_version(self) -> None:
+        # D-11: a `distros = ["ubuntu"]` step runs on BOTH ubuntu@22.04 and @24.04.
+        prep = "[[prep.setup]]\nid = '''ubuntu-only'''\nrun = '''c'''\ndistros = ['''ubuntu''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        for version in ("22.04", "24.04"):
+            ssh_fake = _ScriptedPrepSsh()
+            run = wl.run(self._versioned_spec("ubuntu", version), self._host(), ssh_fake)
+            self.assertIn("ubuntu-only", ssh_fake.ran)
+            self.assertEqual([p.id for p in run.prep_phase], ["ubuntu-only"])
+
+    def test_package_family_key_matches_every_version(self) -> None:
+        # an [prep.packages] family key contributes to any version of that family.
+        prep = "[prep.packages]\napt = ['''a''']\nubuntu = ['''u''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        wl.run(self._versioned_spec("ubuntu", "22.04"), self._host(), ssh_fake)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertIn("apt-get install -y a u", pkg_cmd)  # manager-first union by family key
 
     def test_hard_package_fail_returns_zero_probe_hostrun_with_prep_phase(self) -> None:
         # the package pass is always hard: a non-zero exit aborts before any setup

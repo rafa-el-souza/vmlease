@@ -177,18 +177,19 @@ class ProbeWorkload:
         prep = self._battery.prep
         if prep is None:
             return False
-        profile = distro.get_profile(spec.distro_key)
+        profile = distro.get_profile(spec.family)
         manager = profile.package_manager
 
         # 1) The package install pass — apt-get update first on apt (D13.2), then
         # one ``<install> <pkgs>`` pass. Always hard: any non-zero exit aborts.
-        packages = _effective_packages(prep.packages, manager, spec.distro_key)
+        # The prep selector keys on the host FAMILY (D-11), version-agnostic.
+        packages = _effective_packages(prep.packages, manager, spec.family)
         if packages and not self._run_package_pass(host, ssh, manager, packages, prep_phase):
             return True
 
-        # 2) The ordered setup steps (authoring order); skip distros-excluded ones.
+        # 2) The ordered setup steps (authoring order); skip family-excluded ones.
         for step in prep.setup:
-            if step.distros and spec.distro_key not in step.distros:
+            if step.distros and spec.family not in step.distros:
                 continue
             result = self._run_setup_step(host, ssh, step)
             prep_phase.append(result)
