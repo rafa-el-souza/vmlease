@@ -1160,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_p = sub.add_parser(
         "build-image", help="build a content-addressed snapshot cache image (billable; confirm-gated)"
     )
-    build_p.add_argument("--distro", required=True, help="distro key to build a cache image for (e.g. ubuntu, arch)")
+    build_p.add_argument("--distro", required=True, help="family[@version] to build a cache image for (bare family -> its default version; e.g. ubuntu, ubuntu@22.04, arch)")
     build_p.add_argument(
         "--requires", action="append", metavar="CAPABILITY",
         help="vmlease-provided capability to bake into this variant (e.g. docker); "
@@ -1226,7 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "reap-images", help="reap cached snapshot images by --distro / --older-than / --superseded (best-effort)"
     )
     reap_images_p.add_argument(
-        "--distro", default="", help="scope to cached images of this distro key (an explicit per-distro cache clear)"
+        "--distro", default="", help="scope to all cached images of this family, every version (an explicit per-family cache clear)"
     )
     reap_images_p.add_argument(
         "--older-than", default="",
