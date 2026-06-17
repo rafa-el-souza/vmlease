@@ -28,6 +28,26 @@ class Outcome(NamedTuple):
     stderr: str
 
 
+class Os(NamedTuple):
+    """A host's operating system as a ``(family, version)`` pair.
+
+    Immutable + hashable (a ``NamedTuple``) so it can key dicts and feed label
+    derivation. ``family`` is the :mod:`vmlease.distro` family selector (e.g.
+    ``"ubuntu"``); ``version`` is the distro version (e.g. ``"24.04"``) or
+    :data:`vmlease.distro.ROLLING` for rolling-release families.
+    """
+
+    family: str
+    version: str
+
+
+# Transitional empty-os sentinel for the additive ``os`` defaults during expand
+# (the contract group makes ``os`` required and drops the default). A shared
+# constant — not an inline ``Os("", "")`` call in the dataclass default (which the
+# linter rejects, and which an immutable NamedTuple makes pointless to recreate).
+_EMPTY_OS = Os("", "")
+
+
 @runtime_checkable
 class Assertion(Protocol):
     """A predicate over a probe's :class:`Outcome` — structural typing only.
@@ -129,8 +149,8 @@ class PrepStep:
         command: The **resolved** shell run over SSH as the operator (``sudo``
             inline where root is needed) — the verbatim inline ``run`` block, or
             the contents of the step's ``script`` file. Runs verbatim.
-        distros: The distro-key allowlist this step runs on (``()`` — the default
-            — means every distro). A host whose distro is excluded skips the step.
+        distros: The family allowlist this step runs on (``()`` — the default
+            — means every family). A host whose family is excluded skips the step.
         required: When ``True`` (the default), a non-zero exit aborts the host
             (a hard prep failure); when ``False``, the failure is recorded and the
             phase continues (a soft prep failure).
@@ -168,12 +188,12 @@ class PrepStepResult:
 
 @dataclass(frozen=True)
 class Prep:
-    """A battery's declared prep phase: per-distro packages + ordered setup steps.
+    """A battery's declared prep phase: per-family packages + ordered setup steps.
 
     ``packages`` is a frozen mapping ``{selector: tuple[str, ...]}`` whose every
-    key is a known package-manager OR a known distro (the two name-sets are
+    key is a known package-manager OR a known family (the two name-sets are
     disjoint); the effective per-host set is the union of the host's manager list
-    and its distro list, deduplicated, manager entries first. ``setup`` is the
+    and its family list, deduplicated, manager entries first. ``setup`` is the
     ordered :class:`PrepStep` list, run in authoring order after the package pass.
     """
 
@@ -204,6 +224,29 @@ class Battery:
 
 
 @dataclass(frozen=True)
+class ResolvedHost:
+    """A fully-resolved host request: bare identity + ``(family, version)`` os.
+
+    The output of the expander's resolve phase (:mod:`vmlease.hosts`) and the
+    input to ``build_host_specs`` at cutover. ``name`` is the host's bare identity
+    (auto-named or explicit, NOT the provider server name — that is derived from
+    it at cutover). ``image`` is baked from the registry so no version
+    re-resolution happens downstream.
+
+    Field order is pinned so no required field follows a defaulted one (the
+    frozen-dataclass trap): the four required fields first, the two defaulted
+    fields last.
+    """
+
+    name: str
+    os: Os
+    image: str
+    server_type: str
+    firewall: str = ""
+    requires: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class HostSpec:
     """A request for one VM: which image, which size, labelled for teardown.
 
@@ -213,7 +256,9 @@ class HostSpec:
         server_type: Provider size slug (e.g. ``"cpx22"``).
         labels: Key/value labels applied to the resource (always includes the
             ``vmlease=<run-id>`` label the safety layer adds).
-        distro_key: The :mod:`vmlease.distro` profile key (e.g. ``"ubuntu"``).
+        distro_key: **Deprecated** — superseded by :attr:`os`/:attr:`family`
+            (read via the ``family`` property; the field is removed in the
+            contract group). The :mod:`vmlease.distro` family (e.g. ``"ubuntu"``).
         firewall: Optional provider firewall name to attach at create time
             (``""`` = none). Restricting inbound to the operator's IP is good
             hygiene for a host that boots an unconfigured cloud image.
@@ -222,6 +267,12 @@ class HostSpec:
             run's :class:`~vmlease.runner.Matrix` onto every host so the runner
             (and the cache key) can gate capability inclusion per host without
             reading the opaque battery.
+        os: The host's ``(family, version)`` os. Transitional default
+            ``Os("", "")`` during expand; the cutover sets the real value and the
+            contract group makes it required.
+        server_name: The provider-unique server name (carries the run-id). A
+            transitional default ``""`` during expand; the cutover derives it from
+            ``name``. The contract group makes it required.
     """
 
     name: str
@@ -231,6 +282,13 @@ class HostSpec:
     labels: dict[str, str] = field(default_factory=dict)
     firewall: str = ""
     requires: tuple[str, ...] = ()
+    os: Os = _EMPTY_OS
+    server_name: str = ""
+
+    @property
+    def family(self) -> str:
+        """The host's distro family. Replaces the deprecated :attr:`distro_key`."""
+        return self.os.family
 
 
 @dataclass(frozen=True)
@@ -394,6 +452,10 @@ class PlanItem:
     (e.g. ``probes=3`` for the probe battery) — the plan does not assume probes.
     ``requires`` surfaces the host's vmlease-provided capabilities (canonical
     order, ``()`` when none) so the operator can review them before any spend.
+
+    ``distro_key`` is **deprecated** (superseded by :attr:`os`; removed in the
+    contract group). ``os`` carries the host's ``(family, version)``; it has a
+    transitional default during expand and is made required in the contract group.
     """
 
     host_name: str
@@ -402,3 +464,4 @@ class PlanItem:
     distro_key: str
     workload_summary: str
     requires: tuple[str, ...] = ()
+    os: Os = _EMPTY_OS

@@ -6,6 +6,7 @@ stdlib unittest only. Run with:
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -347,6 +348,56 @@ class TestModel(unittest.TestCase):
         ))
         b = _resolve_toml(manifest)
         self.assertEqual([p.id for p in b.probes], ["SETUP", "VERIFY"])
+
+
+class TestOsAndResolvedHost(unittest.TestCase):
+    def test_os_is_hashable_and_immutable(self) -> None:
+        os1 = model.Os("ubuntu", "24.04")
+        # usable as a dict key (hashable)
+        d = {os1: "x"}
+        self.assertEqual(d[model.Os("ubuntu", "24.04")], "x")
+        # immutable (NamedTuple) — field assignment raises
+        with self.assertRaises(AttributeError):
+            os1.family = "debian"  # type: ignore[misc]
+        self.assertEqual((os1.family, os1.version), ("ubuntu", "24.04"))
+
+    def test_resolved_host_is_frozen_and_constructs(self) -> None:
+        rh = model.ResolvedHost(
+            name="api", os=model.Os("ubuntu", "24.04"),
+            image="ubuntu-24.04", server_type="cpx22",
+        )
+        self.assertEqual(rh.name, "api")
+        self.assertEqual(rh.os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(rh.firewall, "")
+        self.assertEqual(rh.requires, ())
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            rh.name = "other"  # type: ignore[misc]
+
+    def test_hostspec_constructs_with_os_and_server_name_defaults(self) -> None:
+        spec = model.HostSpec(
+            name="vmlease-r-ubuntu", image="ubuntu-24.04",
+            server_type="cpx22", distro_key="ubuntu",
+        )
+        self.assertEqual(spec.os, model.Os("", ""))
+        self.assertEqual(spec.server_name, "")
+        self.assertEqual(spec.distro_key, "ubuntu")
+
+    def test_hostspec_family_property_reads_os_family(self) -> None:
+        spec = model.HostSpec(
+            name="api", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", os=model.Os("ubuntu", "24.04"),
+            server_name="vmlease-r-api",
+        )
+        self.assertEqual(spec.family, "ubuntu")
+        self.assertEqual(spec.server_name, "vmlease-r-api")
+
+    def test_planitem_constructs_with_os_default(self) -> None:
+        item = model.PlanItem(
+            host_name="api", image="ubuntu-24.04", server_type="cpx22",
+            distro_key="ubuntu", workload_summary="probes=3",
+        )
+        self.assertEqual(item.os, model.Os("", ""))
+        self.assertEqual(item.distro_key, "ubuntu")
 
 
 # --------------------------------------------------------------------------- #
