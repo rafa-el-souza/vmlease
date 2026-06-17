@@ -587,6 +587,22 @@ class TestHostsResolve(unittest.TestCase):
         with self.assertRaises(distro.UnknownDistroError):
             self._resolve("ubuntu@99.99")
 
+    def test_shadow_name_cross_family_rejected(self) -> None:
+        # a debian host named `ubuntu` is a name/family collision → rejected
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("ubuntu=debian")
+
+    def test_default_family_host_not_shadow_rejected(self) -> None:
+        # name == its OWN family is allowed (today's default `ubuntu` host)
+        out = self._resolve("ubuntu")
+        self.assertEqual(out[0].name, "ubuntu")
+
+    def test_explicit_name_equal_own_family_allowed(self) -> None:
+        # `ubuntu=ubuntu@22.04` — name `ubuntu` == its family `ubuntu` → allowed
+        out = self._resolve("ubuntu=ubuntu@22.04")
+        self.assertEqual(out[0].name, "ubuntu")
+        self.assertEqual(out[0].os, model.Os("ubuntu", "22.04"))
+
 
 # --------------------------------------------------------------------------- #
 # safety
@@ -2079,7 +2095,7 @@ class TestRunner(unittest.TestCase):
         # the non-kept distro's labels carry the run label but no keep marker.
         m = _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
-            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+            keep_policy=runner.KeepPolicy(families=frozenset({"ubuntu"})),
         )
         by_distro = {s.distro_key: s for s in runner.build_host_specs(m)}
         self.assertIn(safety.LABEL_KEEP, by_distro["ubuntu"].labels)  # kept → stamped
@@ -2150,6 +2166,30 @@ class TestCutover(unittest.TestCase):
 
     def test_matrix_is_runrequest_alias(self) -> None:
         self.assertIs(runner.Matrix, runner.RunRequest)
+
+
+class TestKeepPolicy(unittest.TestCase):
+    def test_keeps_name_hit(self) -> None:
+        p = runner.KeepPolicy(names=frozenset({"api"}))
+        self.assertTrue(p.keeps("api", "ubuntu"))
+        self.assertFalse(p.keeps("worker", "ubuntu"))
+
+    def test_keeps_family_hit(self) -> None:
+        p = runner.KeepPolicy(families=frozenset({"ubuntu"}))
+        self.assertTrue(p.keeps("ubuntu-2204", "ubuntu"))
+        self.assertFalse(p.keeps("debian", "debian"))
+
+    def test_keeps_keep_all(self) -> None:
+        p = runner.KeepPolicy(keep_all=True)
+        self.assertTrue(p.keeps("anything", "whatever"))
+        self.assertTrue(p.any_kept)
+
+    def test_keeps_miss_and_any_kept(self) -> None:
+        p = runner.KeepPolicy()
+        self.assertFalse(p.keeps("api", "ubuntu"))
+        self.assertFalse(p.any_kept)
+        self.assertTrue(runner.KeepPolicy(names=frozenset({"x"})).any_kept)
+        self.assertTrue(runner.KeepPolicy(families=frozenset({"x"})).any_kept)
 
 
 # --------------------------------------------------------------------------- #
@@ -4269,7 +4309,7 @@ class TestKeepFlag(unittest.TestCase):
         # generalization of the all-or-nothing ``_matrix(keep_all=...)`` helper.
         return _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
-            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+            keep_policy=runner.KeepPolicy(families=frozenset({"ubuntu"})),
         )
 
     def test_partial_keep_spares_kept_distro_and_tears_down_the_rest(self) -> None:
@@ -4365,6 +4405,70 @@ class TestKeepFlag(unittest.TestCase):
             self.assertIn("fedora", err.getvalue())  # the unknown distro is named
             self.assertEqual(generated, [])  # no keypair → no provisioning
             self.assertFalse((Path(d) / "r").exists())  # no results dir created
+
+    def _keep_run(self, d: str, distros: str, keep: list[str], *, prov: FakeProvider | None = None,
+                  reader: Callable[[str], str] = lambda _p: "y") -> tuple[int, str, str, FakeProvider]:
+        """Drive `_cmd_run` with a fake provider; return (rc, stdout, stderr, prov)."""
+        from unittest import mock
+        battery = _write_battery_bundle(d, _DEMO_BATTERY)
+        ns = cli.build_parser().parse_args([
+            "run", "--battery", battery, "--hosts", distros, "--keep", *keep, "--yes",
+            "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+        ])
+        kp = _fake_keypair(Path(d))
+        prov = prov or FakeProvider()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                redirect_stdout(out), redirect_stderr(err):
+            rc = cli._cmd_run(ns, reader=reader)
+        return rc, out.getvalue(), err.getvalue(), prov
+
+    def test_cli_keep_bare_token_keeps_only_named_host(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, _err, prov = self._keep_run(d, "ubuntu,debian", ["ubuntu"])
+            self.assertEqual(rc, 0)
+            destroyed = {h.name for h in prov.destroyed}
+            self.assertIn("debian", destroyed)  # non-kept torn down
+            self.assertNotIn("ubuntu", destroyed)  # named host kept
+
+    def test_cli_keep_family_selector_keeps_whole_family(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, _err, prov = self._keep_run(d, "ubuntu@24.04,ubuntu@22.04,debian", ["family:ubuntu"])
+            self.assertEqual(rc, 0)
+            destroyed = {h.name for h in prov.destroyed}
+            self.assertEqual(destroyed, {"debian"})  # both ubuntu hosts kept, debian reaped
+
+    def test_cli_keep_unresolved_bare_token_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["nope"])
+            self.assertEqual(rc, 2)
+            self.assertIn("matched no host name", err)
+            self.assertIn("family:", err)  # the hint
+            self.assertEqual(prov.created, [])  # nothing provisioned
+
+    def test_cli_keep_family_zero_match_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["family:fedora"])
+            self.assertEqual(rc, 2)
+            self.assertIn("family:fedora", err)
+            self.assertIn("matched no host", err)
+            self.assertEqual(prov.created, [])
+
+    def test_cli_keep_empty_family_distinct_error(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["family:"])
+            self.assertEqual(rc, 2)
+            self.assertIn("requires a family name", err)
+            self.assertEqual(prov.created, [])
+
+    def test_cli_keep_set_echoed_under_yes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _err, _prov = self._keep_run(d, "ubuntu,debian", ["ubuntu"])
+            self.assertEqual(rc, 0)
+            self.assertIn("keep: 1 host(s) will be left LIVE", out)
+            self.assertIn("ubuntu", out)
 
     def test_cli_keep_yes_emits_noninteractive_billing_warning(self) -> None:
         # --keep --yes skips the interactive confirm but MUST still emit the

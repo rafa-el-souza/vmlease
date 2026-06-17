@@ -70,18 +70,21 @@ def _kept_note(host: Host, operator: str, key_path: Path) -> str:
 
 @dataclass(frozen=True)
 class KeepPolicy:
-    """Which hosts to leave live after a run. ``keep_all`` keeps every host; else
-    only hosts whose ``distro_key`` is in ``distros``. The empty default keeps none."""
+    """Which hosts to leave live after a run. ``keep_all`` keeps every host; else a
+    host is kept iff its bare ``name`` is in ``names`` OR its ``family`` is in
+    ``families``. The empty default keeps none. The ``family:``-prefix split is the
+    CLI's job, so ``keeps`` is a pure membership test (D-7)."""
 
     keep_all: bool = False
-    distros: frozenset[str] = frozenset()
+    names: frozenset[str] = frozenset()
+    families: frozenset[str] = frozenset()
 
-    def keeps(self, distro_key: str) -> bool:
-        return self.keep_all or distro_key in self.distros
+    def keeps(self, name: str, family: str) -> bool:
+        return self.keep_all or name in self.names or family in self.families
 
     @property
     def any_kept(self) -> bool:
-        return self.keep_all or bool(self.distros)
+        return self.keep_all or bool(self.names) or bool(self.families)
 
 
 @dataclass(frozen=True)
@@ -146,7 +149,7 @@ def build_host_specs(req: RunRequest) -> list[HostSpec]:
         # live), so each spec's labels are built from the run label + the keep
         # marker when this host's family is kept (old KeepPolicy signature).
         host_labels = dict(labels)
-        if req.keep_policy.keeps(h.os.family):
+        if req.keep_policy.keeps(h.name, h.os.family):
             host_labels[LABEL_KEEP] = "1"
         specs.append(
             HostSpec(

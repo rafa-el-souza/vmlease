@@ -225,22 +225,57 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         return 2
 
     # Resolve the keep policy from --keep (None=keep none; []=keep all; a non-empty
-    # list=keep those distros). A named subset must be a subset of the run's distros;
-    # validate BEFORE any provisioning / keypair generation so a typo costs nothing.
+    # list=bare host names and/or `family:<family>` selectors). Validate against the
+    # RESOLVED hosts (names + families) AFTER the cost guard (above), so a typo or a
+    # family absent from this run costs nothing. The `family:`-split is the CLI's
+    # job; KeepPolicy stays a pure membership test (D-7).
+    host_names = {h.name for h in matrix.hosts}
+    host_families = {h.os.family for h in matrix.hosts}
     if args.keep is None:
         keep_policy = KeepPolicy()
     elif len(args.keep) == 0:
         keep_policy = KeepPolicy(keep_all=True)
     else:
-        unknown = [d for d in args.keep if d not in matrix.distro_keys]
-        if unknown:
-            print(
-                f"error: --keep distro(s) {unknown} not in the run's distros "
-                f"{list(matrix.distro_keys)}",
-                file=sys.stderr,
-            )
-            return 2
-        keep_policy = KeepPolicy(distros=frozenset(args.keep))
+        keep_names: set[str] = set()
+        keep_families: set[str] = set()
+        for token in args.keep:
+            prefix, sep, rest = token.partition(":")
+            if sep and prefix == "family":
+                if rest == "":
+                    print(
+                        "error: a `family:` selector requires a family name "
+                        "(e.g. `family:ubuntu`)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if rest not in host_families:
+                    print(
+                        f"error: --keep `family:{rest}` matched no host in the run; "
+                        f"eligible host names: {sorted(host_names)} "
+                        f"(or keep a whole family with `family:<family>`)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                keep_families.add(rest)
+            elif sep:
+                print(
+                    f"error: --keep selector {token!r} is unrecognized; use a bare "
+                    f"host name or `family:<family>`. eligible host names: "
+                    f"{sorted(host_names)}",
+                    file=sys.stderr,
+                )
+                return 2
+            elif token not in host_names:
+                print(
+                    f"error: --keep {token!r} matched no host name in the run; "
+                    f"eligible host names: {sorted(host_names)} "
+                    f"(or keep a whole family with `family:<family>`)",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                keep_names.add(token)
+        keep_policy = KeepPolicy(names=frozenset(keep_names), families=frozenset(keep_families))
     matrix = replace(matrix, keep_policy=keep_policy)
 
     _warn_battery(battery)
@@ -254,6 +289,11 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         return 0
 
     if keep_policy.any_kept:
+        # Echo the RESOLVED kept-set (names + count) before provisioning, even under
+        # --yes (it rides the billing confirm interactively; prints regardless) so the
+        # kept set is always visible before spend (D-7).
+        kept_names = [h.name for h in matrix.hosts if keep_policy.keeps(h.name, h.os.family)]
+        print(f"keep: {len(kept_names)} host(s) will be left LIVE after the run: {kept_names}")
         if not _confirm(
             "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
             f"reaped manually (`vmlease reap --run-token {args.run_token}`). Continue? [y/N]: ",
@@ -1048,10 +1088,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
     run_p.add_argument(
-        "--keep", nargs="*", default=None, metavar="DISTRO",
+        "--keep", nargs="*", default=None, metavar="HOST",
         help="leave provisioned host(s) RUNNING (billable) after the run and print how to SSH in; "
-        "bare `--keep` keeps ALL hosts, `--keep arch debian` keeps only those distros (each must be "
-        "in --distros); reap with `vmlease reap --run-token <token>` when done",
+        "bare `--keep` keeps ALL hosts, `--keep <name>` keeps that host, `--keep family:<family>` "
+        "keeps every host of that family (each must be in the run); reap with "
+        "`vmlease reap --run-token <token>` when done",
     )
     run_p.add_argument(
         "--reap-bad-cache-image", action="store_true",

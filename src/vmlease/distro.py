@@ -243,6 +243,11 @@ _DEFAULT_VERSION: Mapping[str, str] = MappingProxyType({
     "arch": ROLLING,
 })
 
+# The set of all known registry family names. Unlike the deprecated string-keyed
+# ``PROFILES`` view, this survives the contract group — it is the authoritative
+# family-name set for the expander's shadow-name guard + battery prep validation.
+FAMILIES: frozenset[str] = frozenset(_DEFAULT_VERSION)
+
 # Deprecated read-only **family → default-profile** view (removed in the contract
 # group). Derived from the registry + the explicit default table so legacy
 # ``PROFILES[family]`` / ``frozenset(PROFILES)`` readers are unchanged. Any

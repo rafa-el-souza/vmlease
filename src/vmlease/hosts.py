@@ -20,7 +20,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-from vmlease.distro import ROLLING, get_profile, versionflat
+from vmlease.distro import FAMILIES, ROLLING, get_profile, versionflat
 from vmlease.model import Os, ResolvedHost
 
 # The entry delimiters of the ``--hosts`` / ``--keep`` grammars. A host name must
@@ -152,6 +152,17 @@ def resolve(
     profiles = [get_profile(e.family, e.version) for e in entries]
     oses = [Os(p.family, p.version) for p in profiles]
     names = _assign_names(entries, oses)
+    # Shadow guard (D-7): a host whose name equals a registry family name but is
+    # NOT that family is a name/family namespace collision (e.g. ``ubuntu=debian``).
+    # The default ``ubuntu`` host (name == its own family) and ``ubuntu=ubuntu@22.04``
+    # are allowed — only the cross-family shadow is rejected.
+    for name, os in zip(names, oses, strict=True):
+        if name in FAMILIES and name != os.family:
+            raise HostListError(
+                f"host name {name!r} collides with the distro family {name!r} "
+                f"(this host is {os.family!r}); rename it to avoid a name/family "
+                f"namespace collision"
+            )
     return [
         ResolvedHost(
             name=names[i], os=oses[i], image=profiles[i].image,
