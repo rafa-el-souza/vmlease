@@ -50,12 +50,13 @@ from vmlease.battery import (
     structural_violations,
 )
 from vmlease.capabilities import canonical_requires
-from vmlease.distro import DEFAULT_DISTRO_KEYS, ROLLING, UnknownDistroError, get_profile
+from vmlease.distro import DEFAULT_DISTRO_KEYS, ROLLING, UnknownDistroError, get_profile, versionflat
 from vmlease.hosts import HostListError, parse, resolve
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
     LABEL_DISTRO,
     LABEL_REQUIRES_HASH,
+    LABEL_VERSION,
     base_fingerprint,
     cache_labels,
     content_key_from_base_fp,
@@ -534,9 +535,18 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     # type, and validate the rescue key BEFORE any keypair/provisioning (do NOT copy
     # run's post-confirm ordering — a rescue-write build with no key creates nothing).
     try:
-        profile = get_profile(args.distro)
+        entries = parse(args.distro)
+        if len(entries) != 1 or entries[0].name is not None:
+            print(
+                "error: build-image --distro takes a single `family[@version]` "
+                "(no name=, no comma)",
+                file=sys.stderr,
+            )
+            return 2
+        entry = entries[0]
+        profile = get_profile(entry.family, entry.version)
         CostGuard().check([args.server_type])
-    except (UnknownDistroError, CostGuardError) as exc:
+    except (UnknownDistroError, HostListError, CostGuardError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if profile.needs_rescue_write and not (args.ssh_key and args.ssh_key_path):
@@ -609,7 +619,8 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     same_group = [
         img
         for img in images
-        if img.labels.get(LABEL_DISTRO) == profile.key
+        if img.labels.get(LABEL_DISTRO) == profile.family
+        and img.labels.get(LABEL_VERSION, "") == profile.version
         and img.arch == arch
         and img.labels.get(LABEL_REQUIRES_HASH, "") == group_requires_hash
     ]
@@ -634,9 +645,16 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
             print(f"error: pre-build prune failed, aborting before provisioning: {exc}", file=sys.stderr)
             return 1
 
-    # Confirm-before-create (the builder is billable).
-    print(f"about to PROVISION 1 builder host (billable) for {args.distro} (key {key})")
-    print(f"  - {args.server_type}  {profile.default_image}  arch={arch}")
+    # Confirm-before-create (the builder is billable). The build identity is the
+    # resolved (family, version); the builder name uses the versionflat form so it
+    # stays a clean RFC1123 label (e.g. ``vmlease-<run>-build-ubuntu-2204``).
+    build_os = Os(profile.family, profile.version)
+    build_comp = (
+        profile.family if profile.version == ROLLING
+        else f"{profile.family}-{versionflat(profile.version)}"
+    )
+    print(f"about to PROVISION 1 builder host (billable) for {_format_os(build_os)} (key {key})")
+    print(f"  - {args.server_type}  {profile.image}  arch={arch}")
     if not _confirm("Proceed with the build? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0
@@ -656,16 +674,17 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
             return OpenSshRunner(operator, keypair.private_key_path)
 
         spec = HostSpec(
-            name=f"vmlease-{run_id}-build-{args.distro}",
-            image=profile.default_image,
+            name=f"vmlease-{run_id}-build-{build_comp}",
+            image=profile.image,
             server_type=args.server_type,
-            distro_key=args.distro,
+            distro_key=profile.family,
             labels=run_label(run_id),
             firewall=args.firewall,
             requires=requires,
+            os=build_os,
         )
         on_ready = make_snapshot_on_ready(
-            description=f"vmlease cache {args.distro} {key}",
+            description=f"vmlease cache {_format_os(build_os)} {key}",
             labels=cache_labels(profile, arch, key, base_fp, args.run_token, requires),
             sleep=time.sleep,
         )

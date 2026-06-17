@@ -942,7 +942,7 @@ def build_one_image(
         # the profile's own rescue flag (a rescue-write distro's builder is written
         # then prepped before the snapshot captures it).
         cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
-        return _profile.default_image, cloud_init, _profile.needs_rescue_write
+        return _profile.image, cloud_init, _profile.needs_rescue_write
 
     return _with_ready_host(
         spec,

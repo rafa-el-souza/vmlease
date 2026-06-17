@@ -7041,12 +7041,16 @@ class TestCliBuildImage(unittest.TestCase):
     def _cache_img(
         self, *, key: str, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
         created: str = "2024-01-01T00:00:00+00:00", requires: tuple[str, ...] = (),
+        version: str | None = None,
     ) -> Image:
+        if version is None:
+            version = distro.get_profile(distro_key).version
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
             labels={
                 imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
                 imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_VERSION: version,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
                 imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -7080,7 +7084,9 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(len(prov.created), 1)
         spec = prov.created[0]
         self.assertEqual(spec.labels.get("vmlease"), "bird")  # builder carries the reap label
-        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu")
+        # the builder name uses the versionflat form (bare ubuntu → default 24.04)
+        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu-2404")
+        self.assertEqual(spec.os, model.Os("ubuntu", "24.04"))
         # the image was created and carries the cache key (NOT vmlease=<run-id>).
         self.assertEqual(len(prov.created_images), 1)
         img_labels = prov.created_images[0][2]
@@ -7096,6 +7102,65 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(prov.created, [])
         self.assertIn("error:", err)
+
+    def test_versioned_distro_builds_versionflat_name_and_image(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu@22.04", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        spec = prov.created[0]
+        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu-2204")  # versionflat
+        self.assertEqual(spec.image, "ubuntu-22.04")
+        self.assertEqual(spec.os, model.Os("ubuntu", "22.04"))
+        self.assertIn("ubuntu@22.04", out)  # display shows family@version
+
+    def test_bare_distro_builds_default_version(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.created[0].image, "ubuntu-24.04")  # default version
+
+    def test_malformed_distro_with_name_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "api=ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+        self.assertIn("single", err)
+
+    def test_malformed_distro_with_comma_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu,debian", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+
+    def test_sibling_version_image_not_superseded(self) -> None:
+        # building ubuntu@22.04 with an ubuntu@24.04 cache image present → the 24.04
+        # image is NOT in same_group → never pruned (D-9/D-10). (Default quota has
+        # room, so the build proceeds and the sibling simply survives.)
+        prov = FakeProvider()
+        prov.images["v24"] = self._cache_img(
+            key="v1-ubuntu-24OLD", img_id="v24", distro_key="ubuntu", version="24.04",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu@22.04", "--run-token", "bird", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("v24", prov.deleted_images)  # sibling version survives
+        self.assertEqual(prov.created[0].image, "ubuntu-22.04")  # the 22.04 build ran
 
     def test_non_allowlisted_server_type_exits_2(self) -> None:
         prov = FakeProvider()
@@ -7328,7 +7393,7 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("reap-images", err)
         # the builder was torn down by the scaffold's finally.
-        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu-2404"])
 
     def test_builder_teardown_failure_exits_nonzero_keeps_image(self) -> None:
         # G8: a builder-teardown failure → reap attempted, image KEPT, non-zero exit.
@@ -7368,7 +7433,7 @@ class TestCliBuildImage(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 cli._cmd_build_image(ns, reader=lambda _p: "y")
         # the builder was reaped by run-label (list_labeled then destroy).
-        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu-2404"])
 
     def test_generic_provider_error_during_build_exits_1(self) -> None:
         # a sysprep failure raises RuntimeError inside the build → exit 1, no traceback.
@@ -7457,6 +7522,16 @@ class TestCliReapImages(unittest.TestCase):
         rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
         self.assertEqual(rc, 0)
         self.assertEqual(prov.deleted_images, ["u1"])  # fedora untouched
+
+    def test_distro_scope_reaps_all_versions_of_family(self) -> None:
+        # --distro stays family-scoped (D-9): it reaps EVERY version of that family.
+        prov = FakeProvider()
+        prov.images["u22"] = self._img(img_id="u22", distro_key="ubuntu", version="22.04", key="v1-ubuntu-22")
+        prov.images["u24"] = self._img(img_id="u24", distro_key="ubuntu", version="24.04", key="v1-ubuntu-24")
+        prov.images["f1"] = self._img(img_id="f1", distro_key="fedora", key="v1-fedora-X")
+        rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(prov.deleted_images), ["u22", "u24"])  # both ubuntu versions, fedora untouched
 
     # --- --older-than -------------------------------------------------------- #
     def test_older_than_selects_only_older(self) -> None:
