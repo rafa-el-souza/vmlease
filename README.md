@@ -2,7 +2,7 @@
 
 Provision throwaway cloud VMs, run a workload over SSH, and tear them down by default (or keep one live to debug) — a small,
 project-agnostic VM-provisioning + probe harness. Built for empirical checks that need a fresh, real host
-(the "ratified ≠ validated" gate): spin a disposable VM per distro, run a declarative battery of probes,
+(the "ratified ≠ validated" gate): spin a disposable VM per host, run a declarative battery of probes,
 capture structured results, and guarantee teardown by default.
 
 > Graduated from `probehost` (developed inside the `internal-tooling` skill tree, HEAD `efb8f38`) into this
@@ -34,9 +34,9 @@ vmlease lint --battery examples/compose-plugin-check/battery.toml
 # 2. plan: dry-run the matrix — what WOULD provision. Zero provider calls, free.
 vmlease plan --battery examples/compose-plugin-check/battery.toml --run-token compose-check
 
-# 3. run: provision one host per distro, run the battery, ALWAYS tear down. Billable; confirm-gated.
+# 3. run: provision one host per entry, run the battery, ALWAYS tear down. Billable; confirm-gated.
 vmlease run  --battery examples/compose-plugin-check/battery.toml --run-token compose-check \
-        --results-dir ./results --timestamp 2026-06-15T1200 --distros ubuntu,debian --yes
+        --results-dir ./results --timestamp 2026-06-15T1200 --hosts ubuntu,debian --yes
 
 # 4. summarize: the ONE canonical reader → a .summary.json companion; its exit code is the pass/fail gate.
 vmlease summarize ./results/vmlease-compose-check-2026-06-15T1200.json \
@@ -47,18 +47,47 @@ vmlease summarize ./results/vmlease-compose-check-2026-06-15T1200.json \
 the same run-id and the same results filename. Gate CI on **`summarize`'s** exit code, never on `run`'s
 (see *CI integration & exit codes* below).
 
+### Hosts: the family/version model
+
+`--hosts` is the primary host-selection flag: a comma-separated list, each entry
+**`[name=]family[@version]`**. A bare family resolves to that family's **default version**; `@version` pins
+one. Repeat an entry to ask for two hosts of the same `(family, version)`.
+
+```bash
+--hosts ubuntu                       # one ubuntu host at the family default version
+--hosts ubuntu@22.04                 # pin a version
+--hosts api=ubuntu@24.04             # name the host `api` (the per-host identity)
+--hosts ubuntu@22.04,ubuntu@24.04    # a version matrix of the same family
+--hosts arch,arch                    # two arch hosts (repetition = multiplicity)
+```
+
+The registry is keyed by **`(family, version)`**: the validated entries are `ubuntu@22.04`, `ubuntu@24.04`,
+`debian@12`, `debian@13`, `fedora@43`, `fedora@44`, and `arch` (a rolling family — it takes **no** `@version`;
+`arch@…` errors). A bare `--hosts` (the default) is the four bare families.
+
+Each host has a **bare `name`** — its identity in results, the matrix pivot, and `--keep` — distinct from the
+provider server name (`vmlease-<run-id>-<name>`). Unnamed entries are **auto-named**:
+
+- a family that appears **once** keeps its bare name (`ubuntu`);
+- a family with **multiple versions** gets a version suffix (`ubuntu-2204`, `ubuntu-2404`);
+- the **same `(family, version)` repeated** gets an index (`arch-1`, `arch-2`);
+- **rolling** families (arch) take no version suffix.
+
+> **`--distros` is a deprecated alias** for `--hosts` (identical grammar; using it prints a one-time
+> deprecation notice). `--distros ubuntu,debian` still runs verbatim — no migration required.
+
 ## CLI
 
 ```
 vmlease plan   --battery <battery.toml> --run-token <slug>      # dry-run: what WOULD provision (zero provider calls)
 vmlease run    --battery <battery.toml> --run-token <slug> --results-dir <dir> --timestamp <ts> \  # provision -> probe -> tear down (or --keep to leave live)
-               [--operator probe] [--distros ubuntu,debian,fedora,arch] [--parallel N] \
-               [--upload LOCAL[:REMOTE]] [--ssh-key <name> --ssh-key-path <path>] [--max-hosts 8] [--firewall <name>] [--keep [DISTRO ...]] [--yes]
+               [--operator probe] [--hosts [name=]family[@version],…] [--parallel N] \
+               [--upload LOCAL[:REMOTE]] [--ssh-key <name> --ssh-key-path <path>] [--max-hosts 8] [--firewall <name>] [--keep [HOST ...]] [--yes]
 vmlease status --run-token <slug>                               # list the live hosts for a run
 vmlease lint   --battery <battery.toml> [--severity warning] [--require-shellcheck]  # shellcheck every probe (gate)
 vmlease reap   --run-token <slug>                               # destroy every host carrying a run's label
-vmlease build-image  --distro <key> --run-token <slug> [--server-type cpx22] [--rebuild]  # opt-in: cache a prepped snapshot
-vmlease reap-images  [--distro <key>] [--older-than <ISO>] [--superseded] [--dry-run]  # prune cached snapshot images
+vmlease build-image  --distro family[@version] --run-token <slug> [--server-type cpx22] [--rebuild]  # opt-in: cache a prepped snapshot
+vmlease reap-images  [--distro <family>] [--older-than <ISO>] [--superseded] [--dry-run]  # prune cached snapshot images
 vmlease summarize <raw-results.json> [--battery <battery.toml>] [--out <s.json>]  # ONE canonical reader -> .summary.json
 ```
 
@@ -79,14 +108,23 @@ against a real, prepped box instead of paying a full provision → prep → tear
 
 ```
 vmlease run --battery b.toml --run-token dbg --results-dir ./out --timestamp T \
-            --distros ubuntu,debian --keep ubuntu        # keep ubuntu live, tear debian down
+            --hosts ubuntu,debian --keep ubuntu          # keep ubuntu live, tear debian down
 # ... the run prints, per kept host:
 #   - vmlease-dbg-ubuntu (id) is LIVE at <ip> — ssh -i <keydir>/id_ed25519 probe@<ip>
 vmlease reap --run-token dbg                              # destroy ALL of the run's hosts when done
 ```
 
-- Bare `--keep` keeps **every** host; `--keep arch debian` keeps only those distros (each must be in
-  `--distros`) and tears the rest down. A typo'd distro is rejected before anything provisions.
+- **`--keep` selects by host `name` or family** (metavar `HOST`). Bare `--keep` keeps **every** host;
+  `--keep <name>` keeps the host with that exact name; `--keep family:<family>` keeps every host of that
+  family. The selector keys off the **auto-named identity** (see *Hosts: the family/version model*): with
+  `--hosts ubuntu` the host is named `ubuntu`, so `--keep ubuntu` keeps it; with
+  `--hosts ubuntu@22.04,ubuntu@24.04` the hosts are `ubuntu-2204` / `ubuntu-2404`, so you keep one with
+  `--keep ubuntu-2204` (a bare `--keep ubuntu` would match no host and error), or keep both with
+  `--keep family:ubuntu`.
+- **Fail-closed.** A token matching no host — including a `family:` selector that matches zero in-run hosts —
+  is rejected before anything provisions, listing the eligible host names. The resolved keep-set (names +
+  count) is **echoed before provisioning even under `--yes`**, so the kept hosts are always visible before
+  spend.
 - A kept host stays **billable with no TTL**. Its reattach coordinates (IP, operator, key path) are printed
   and recorded in the results file; the throwaway SSH key survives on disk so the printed `ssh` line works.
 
@@ -94,6 +132,12 @@ vmlease reap --run-token dbg                              # destroy ALL of the r
 > kept host carries the `vmlease=<run-id>` label so `reap`/`status` always find it, and an aborted (Ctrl-C)
 > or teardown-failing run still reaps the **non-kept** hosts. The explicit `vmlease reap` destroys
 > everything, kept hosts included.
+
+> **Live-run pre-flight.** A run-token deterministically identifies one live run, so `run` and `build-image`
+> **refuse to start** (fail closed, before the billing confirm) if the run-token already has live provider
+> hosts — it lists them and hints at `vmlease reap --run-token <token>` (or use a different token). This
+> prevents a second run from colliding with — and reaping — the first run's hosts. `plan` is exempt (it makes
+> no provider calls).
 
 ## Authoring a battery
 
@@ -287,7 +331,7 @@ run = '''curl -LsSf https://astral.sh/uv/install.sh | sudo sh'''  # inline; or `
   and forces a **non-zero** `summarize` exit (this also closes the old zero-probe-host → exit-0 hole — a
   hard-aborted host has zero probes but is *not* silently green). A soft prep failure counts as
   **`PREP_SOFT_FAIL`** — a distinct, visible state in `totals` that does **not** by itself force a non-zero
-  exit (a CI gate may still choose to fail on it). The summary `schema_version` is `"3"`.
+  exit (a CI gate may still choose to fail on it). The summary `schema_version` is `"4"`.
 
 ## Results & summary
 
@@ -302,7 +346,10 @@ raw file is the source of truth and is **never mutated**.
   "run_id": "...", "timestamp": "...",
   "hosts": [
     {
-      "name": "...", "distro": "ubuntu", "image": "ubuntu-24.04",
+      "name": "ubuntu-2204",           // the per-host instance identity (auto-named or `name=`)
+      "family": "ubuntu", "version": "22.04",   // the resolved (family, version)
+      "distro": "ubuntu",              // == family; retained for old readers (back-compat)
+      "image": "ubuntu-24.04",
       "restored_image": null,          // snapshot id if a cache hit restored this host, else null (cold miss)
       "detail": "...",                 // the self-describing host-detail snapshot (os-release, kernel, …)
       "prep_phase": [                  // one entry per executed prep step; [] for a no-prep host
@@ -326,17 +373,20 @@ raw file is the source of truth and is **never mutated**.
 
 ### The summary file (`summary.py`)
 
-`summarize` adds `schema_version: "3"`, a computed per-probe `verdict`, the four token buckets, bounded
-stream tails (last 2000 chars), a `matrix` pivot (command × distro, collapsed worst-of), and `totals` by
-verdict:
+`summarize` adds `schema_version: "4"`, a computed per-probe `verdict`, the four token buckets, bounded
+stream tails (last 2000 chars), a `matrix` pivot (command × host **name**, collapsed worst-of), and `totals`
+by verdict. The per-host `name`/`family`/`version` attributes ride additively (the `"4"` bump):
 
 ```jsonc
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "run_id": "...", "timestamp": "...", "battery": "vmlease-compose-plugin-check",  // battery is null without --battery
   "hosts": [
     {
-      "name": "...", "distro": "ubuntu", "image": "ubuntu-24.04", "detail": "...",
+      "name": "ubuntu-2204",           // per-host identity; the matrix pivots on this
+      "family": "ubuntu", "version": "22.04",
+      "distro": "ubuntu",              // == family (back-compat)
+      "image": "ubuntu-24.04", "detail": "...",
       "prep_phase": {                  // step-id-keyed (raw is a list); {} for a no-prep host
         "INSTALL_UV": { "exit": 0, "required": true, "verdict": "", "stderr_tail": "..." }
       },
@@ -353,7 +403,7 @@ verdict:
       "not_run": []                    // declared-but-not-run probe ids — only when --battery is supplied
     }
   ],
-  "matrix": { "<command>": { "ubuntu": "PASS", "debian": "FAIL" } },
+  "matrix": { "<command>": { "ubuntu-2204": "PASS", "ubuntu-2404": "FAIL" } },  // keyed by host NAME
   "totals": { "PASS": 3, "FAIL": 1, "TIMEOUT": 0, "PASS_NO_ASSERTIONS": 2,
               "PREP_SOFT_FAIL": 0, "PREP_HARD_FAIL": 0 }
 }
@@ -365,6 +415,10 @@ probe declared `[probe.assert]`, the runner-stored `ok` (the AND of those assert
 or non-zero exit → **`FAIL`**; else a zero exit with an `*_OK` token → **`PASS`**; else (zero exit, no
 assertion tokens) → **`PASS_NO_ASSERTIONS`**. A hard prep abort is **`PREP_HARD_FAIL`** (forces a non-zero
 exit); a soft prep fail is **`PREP_SOFT_FAIL`** (surfaced, but does not by itself force non-zero).
+
+The `matrix` pivots each command against the host **`name`**, not the distro — so N hosts of the same family
+no longer collapse into one column: a run over `ubuntu-2204` and `ubuntu-2404` yields two distinct columns. A
+pre-schema raw file (no `name`/`version`) still summarizes — `name` falls back to the raw `distro` field.
 
 Pass `--battery <battery.toml>` to use authoritative command labels and surface declared-but-not-run probes
 per host (the `not_run` list); without it a built-in probe-id→command map is the fallback. See
@@ -414,12 +468,14 @@ content-addressed labelled snapshot, and deletes the builder. Building is **alwa
 `run` consumes the cache but never builds it.
 
 ```
-vmlease build-image --distro <key> --run-token <slug> \
+vmlease build-image --distro family[@version] --run-token <slug> \
         [--server-type cpx22] [--operator probe] [--requires docker] [--rebuild] [--max-images 10] \
         [--ssh-key <name> --ssh-key-path <path>] [--firewall <name>] [--yes]
 ```
 
-- `--distro` — the distro key to build (e.g. `ubuntu`, `arch`); an unknown key exits 2.
+- `--distro` — the `family[@version]` to build (same grammar as `--hosts`, but a single host: no `name=`, no
+  multiplicity). A bare family (e.g. `ubuntu`, `arch`) mints its **default version**; `ubuntu@22.04` mints
+  that version. An unknown family/version exits 2.
 - `--server-type` — builder instance size; **defaults to `cpx22`** (cost-guard allowlisted).
 - `--requires` — capability to bake into this variant (e.g. `docker`); repeatable; default builds the
   capability-less variant. A `--requires docker` image is a distinct cache key and never supersedes the
@@ -452,12 +508,14 @@ ephemeral `vmlease=<run-id>` run label. The per-run `vmlease reap` (a server-onl
 cache images. To prune the cache, use `reap-images`:
 
 ```
-vmlease reap-images [--distro <key>] [--older-than <ISO-8601>] [--superseded] [--dry-run]
+vmlease reap-images [--distro <family>] [--older-than <ISO-8601>] [--superseded] [--dry-run]
 ```
 
-- `--distro` — scope to one distro's cached images (an explicit per-distro cache clear).
+- `--distro <family>` — scope to all cached images of one **family**, **every version** (an explicit
+  per-family cache clear).
 - `--older-than <ISO-8601>` — reap images created before the cutoff (validated fail-closed; no clock read).
-- `--superseded` — reap off-current-key images; each group's current key is resolved fail-safe, and any
+- `--superseded` — reap off-current-key images; supersession groups per **`(family, version)`** (so no
+  version's image is ever pruned by another version's), each group's current key resolved fail-safe, and any
   unresolvable group is **kept and warned**, never blindly deleted.
 - `--dry-run` — report what *would* be deleted and delete nothing (the preview/safety gate).
 
@@ -465,9 +523,12 @@ A bare `reap-images` with no selector is **refused** (exit `2`) — never an imp
 
 ### The content key
 
-Cache validity is keyed on **distro + architecture + the rendered prep recipe + the resolved upstream
-image** — `v1-<distro>-<hash>`, where the hash folds the base-image fingerprint and the canonical
-cloud-init together. So a recipe change or an upstream image change yields a *new* key, and the next
+Cache validity is keyed on **family + architecture + the rendered prep recipe + the resolved upstream
+image** — `v1-<family>-<hash>`, where the hash folds the base-image fingerprint and the canonical
+cloud-init together. The base-image slug differs per version, so each `(family, version)` already gets a
+distinct content key; a `vmlease-version` label additionally carries the version so supersession groups
+per `(family, version)` (no cross-version prune). So a recipe change or an upstream image change yields a
+*new* key, and the next
 `build-image` produces a fresh image while a `run` simply misses the stale one and falls back to cold —
 freshness is automatic, with no stale-cache footgun.
 
