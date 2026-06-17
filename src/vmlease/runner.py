@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     from vmlease.distro import DistroProfile
     from vmlease.keypair import Keypair
-    from vmlease.model import Host, Image, UploadSpec
+    from vmlease.model import Host, Image, ResolvedHost, UploadSpec
     from vmlease.providers import Provider
     from vmlease.rescue_image import ResolveDeps
     from vmlease.ssh import SshRunner
@@ -85,72 +85,86 @@ class KeepPolicy:
 
 
 @dataclass(frozen=True)
-class Matrix:
-    """A run request: one workload across N distros on one server type.
+class RunRequest:
+    """A run request: one workload across N resolved hosts.
 
     Attributes:
         workload: The injected :class:`~vmlease.workload.Workload` to run on every
             host (e.g. ``ProbeWorkload`` for the probe battery). The runner never
             names a concrete impl — the caller constructs and injects it.
-        distro_keys: Which :mod:`vmlease.distro` profiles to provision.
-        server_type: The (cheap, allowlisted) instance size for every host.
+        hosts: The resolved hosts to provision (each carries its own ``os``,
+            ``image``, ``server_type``, ``firewall``, ``requires`` — D-3). The
+            expander (:mod:`vmlease.hosts`) produces these with unique names.
         run_token: The determinism seam for the run-id (a slug/timestamp the
             caller supplies — NOT read from the clock here).
-        firewall: Optional provider firewall name attached to every host
-            (``""`` = none).
         uploads: Files scp'd onto every host after readiness, before the workload
             (``()`` = none). Validated host-independently before any spend.
-        requires: The vmlease-provided capabilities every host in the run needs
-            (a provisioning attribute, default-off — ``()`` means no capability).
-            The CLI lifts this from the battery and canonicalizes it; the runner
-            propagates it onto every :class:`~vmlease.model.HostSpec`.
+        keep_policy: Which hosts to leave live after the run (default keeps none).
     """
 
     workload: Workload
-    distro_keys: tuple[str, ...]
-    server_type: str
+    hosts: tuple[ResolvedHost, ...]
     run_token: str
-    firewall: str = ""
     uploads: tuple[UploadSpec, ...] = ()
-    requires: tuple[str, ...] = ()
     keep_policy: KeepPolicy = KeepPolicy()
 
+    @property
+    def distro_keys(self) -> tuple[str, ...]:
+        """Deprecated alias: the per-host families (removed in the contract group)."""
+        return tuple(h.os.family for h in self.hosts)
 
-def build_host_specs(matrix: Matrix) -> list[HostSpec]:
-    """Turn a :class:`Matrix` into one labelled :class:`HostSpec` per distro.
 
-    Pure + deterministic (the run-id derives from ``matrix.run_token``). Every
-    spec carries the ``vmlease=<run-id>`` label so the safety layer can reap
-    the whole run. Raises :class:`~vmlease.distro.UnknownDistroError` for an
-    unknown distro key.
+# Deprecated alias for un-migrated readers (removed in the contract group).
+Matrix = RunRequest
+
+
+def build_host_specs(req: RunRequest) -> list[HostSpec]:
+    """Turn a :class:`RunRequest` into one labelled :class:`HostSpec` per host.
+
+    Pure + deterministic (the run-id derives from ``req.run_token``). Each host's
+    bare identity (``name``) becomes the spec's identity and is woven into the
+    provider ``server_name`` (``vmlease-{run_id}-{name}``) so it cannot collide
+    across runs. The image is **baked** from the resolved host (no re-resolution).
+    Every spec carries the ``vmlease=<run-id>`` label so the safety layer can reap
+    the whole run. Asserts bare-``name`` uniqueness fail-closed (the D-6 backstop)
+    before returning — a duplicate raises rather than surfacing as a provider
+    ``create --name`` failure. Makes **no** provider calls.
     """
-    run_id = make_run_id(matrix.run_token)
+    run_id = make_run_id(req.run_token)
     labels = run_label(run_id)
-    requires = canonical_requires(matrix.requires)
+    seen: set[str] = set()
     specs: list[HostSpec] = []
-    for key in matrix.distro_keys:
-        profile = get_profile(key)
-        # The keep marker is PER-DISTRO (a --keep subset leaves only some hosts
+    for h in req.hosts:
+        if h.name in seen:
+            raise ValueError(
+                f"duplicate host name {h.name!r} in the run request; host names "
+                f"must be unique (the expander guarantees this — a collision here "
+                f"is a bug)"
+            )
+        seen.add(h.name)
+        # The keep marker is PER-HOST (a --keep subset leaves only some hosts
         # live), so each spec's labels are built from the run label + the keep
-        # marker when this distro is kept.
+        # marker when this host's family is kept (old KeepPolicy signature).
         host_labels = dict(labels)
-        if matrix.keep_policy.keeps(key):
+        if req.keep_policy.keeps(h.os.family):
             host_labels[LABEL_KEEP] = "1"
         specs.append(
             HostSpec(
-                name=f"vmlease-{run_id}-{key}",
-                image=profile.default_image,
-                server_type=matrix.server_type,
-                distro_key=key,
+                name=h.name,
+                image=h.image,
+                server_type=h.server_type,
+                distro_key=h.os.family,
                 labels=host_labels,
-                firewall=matrix.firewall,
-                requires=requires,
+                firewall=h.firewall,
+                requires=canonical_requires(h.requires),
+                os=h.os,
+                server_name=f"vmlease-{run_id}-{h.name}",
             )
         )
     return specs
 
 
-def validate_uploads(matrix: Matrix) -> None:
+def validate_uploads(matrix: RunRequest) -> None:
     """Validate every upload's source + remote dest, fail-closed, before spend.
 
     Host-independent (the local file and remote path are the same for every
@@ -394,16 +408,17 @@ def _run_one_host(
     """
     from vmlease.model import HostRun
 
-    profile = get_profile(spec.distro_key)
+    profile = get_profile(spec.os.family, spec.os.version)
 
     def cold_plan_create(_profile: DistroProfile) -> tuple[str, str, bool]:
-        # ``run``'s COLD path: the profile's default image + the full cloud-init +
+        # ``run``'s COLD path: the spec's baked image + the full cloud-init +
         # the profile's own rescue flag. A rescue-write distro's base host gets the
         # SAME cloud-init; the written cloudimg re-applies it from the hetzner
         # datasource. cloud-init is rendered (+ validated) before create, so a
-        # template defect fails before spend.
+        # template defect fails before spend. The image is the spec's baked
+        # ``image`` (so plan/execute can't drift from the resolved version).
         cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
-        return _profile.default_image, cloud_init, _profile.needs_rescue_write
+        return spec.image, cloud_init, _profile.needs_rescue_write
 
     # Build the candidate list. The cold candidate is ALWAYS the fallback; a cache
     # hit prepends a restore candidate (and records the source image for the G4

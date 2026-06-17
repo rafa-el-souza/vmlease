@@ -28,10 +28,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vmlease.rescue_image import ResolveDeps
@@ -51,6 +51,7 @@ from vmlease.battery import (
 )
 from vmlease.capabilities import canonical_requires
 from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
+from vmlease.hosts import HostListError, parse, resolve
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
     LABEL_DISTRO,
@@ -72,6 +73,7 @@ from vmlease.runner import (
     KeepPolicy,
     Matrix,
     RescueWriter,
+    RunRequest,
     build_one_image,
     execute,
     make_snapshot_on_ready,
@@ -104,8 +106,8 @@ from vmlease.workload import ProbeWorkload, Workload
 
 
 def _matrix_has_rescue_write(matrix: Matrix) -> bool:
-    """``True`` iff any distro in the matrix needs a rescue-write transform."""
-    return any(get_profile(k).needs_rescue_write for k in matrix.distro_keys)
+    """``True`` iff any host in the run needs a rescue-write transform."""
+    return any(get_profile(h.os.family, h.os.version).needs_rescue_write for h in matrix.hosts)
 
 
 def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: str) -> RescueWriter:
@@ -161,17 +163,20 @@ def _matrix_from_args(
     args: argparse.Namespace,
     workload: Workload,
     requires: tuple[str, ...] = (),
-) -> Matrix:
-    distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
-    uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
-    return Matrix(
-        workload=workload,
-        distro_keys=distro_keys,
+) -> RunRequest:
+    entries = parse(args.hosts)
+    resolved = resolve(
+        entries,
         server_type=args.server_type,
-        run_token=args.run_token,
         firewall=args.firewall,
-        uploads=uploads,
         requires=requires,
+    )
+    uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
+    return RunRequest(
+        workload=workload,
+        hosts=tuple(resolved),
+        run_token=args.run_token,
+        uploads=uploads,
     )
 
 
@@ -188,7 +193,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
+    except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     _warn_battery(battery)
@@ -215,7 +220,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
         items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
+    except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -964,9 +969,42 @@ def _print_lint_summary(findings: tuple[ShellcheckFinding, ...], severity: str) 
     print(f"summary: {parts} (threshold: {severity})")
 
 
+class _DeprecatedDistrosAction(argparse.Action):
+    """``--distros`` alias for ``--hosts`` (shared ``dest``): stores the value and
+    emits a **one-time** stderr deprecation notice. Because the dest is shared,
+    supplying both ``--hosts`` and ``--distros`` is last-wins automatically.
+    """
+
+    _warned: bool
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        if not getattr(self, "_warned", False):
+            print(
+                "warning: --distros is deprecated; use --hosts "
+                "(same grammar: [name=]family[@version], comma-separated)",
+                file=sys.stderr,
+            )
+            self._warned = True
+        setattr(namespace, self.dest, values)
+
+
 def _add_matrix_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--battery", required=True, help="path to the battery.toml manifest (the TOML bundle)")
-    sp.add_argument("--distros", default=",".join(DEFAULT_DISTRO_KEYS), help="comma-separated distro keys")
+    sp.add_argument(
+        "--hosts", dest="hosts", default=",".join(DEFAULT_DISTRO_KEYS),
+        help="comma-separated host list, each '[name=]family[@version]' "
+        "(default: the four bare families)",
+    )
+    sp.add_argument(
+        "--distros", dest="hosts", action=_DeprecatedDistrosAction,
+        help="deprecated alias for --hosts (same grammar)",
+    )
     sp.add_argument("--server-type", default="cpx22", help="instance size (default: cpx22)")
     sp.add_argument("--max-hosts", type=int, default=DEFAULT_MAX_HOSTS, help="cost-guard host cap")
     sp.add_argument("--run-token", required=True, help="determinism seam for the run-id")
