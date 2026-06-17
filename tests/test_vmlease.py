@@ -3711,6 +3711,19 @@ class TestResults(unittest.TestCase):
         self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
         self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
 
+    def test_serialize_emits_name_family_version(self) -> None:
+        # D-8 raw shape: bare `name`, raw `distro` = family, plus new `version`.
+        spec = HostSpec(
+            name="ubuntu-2204", image="ubuntu-22.04", server_type="cpx22",
+            distro_key="ubuntu", os=model.Os("ubuntu", "22.04"),
+            server_name="vmlease-r1-ubuntu-2204",
+        )
+        hr = model.HostRun(host_spec=spec, detail="ok", results=())
+        host = json.loads(results.serialize_run("r1", "TS", [hr]))["hosts"][0]
+        self.assertEqual(host["name"], "ubuntu-2204")  # bare identity
+        self.assertEqual(host["distro"], "ubuntu")      # raw distro = family (back-compat)
+        self.assertEqual(host["version"], "22.04")
+
     def test_serialize_passing_assertion_probe_carries_declared_count_true(self) -> None:
         # (7.5) DECLARED-count: a PASSING assertion probe (assertion_failures=())
         # serializes has_assertions=True and assertion_failures=[] — has_assertions

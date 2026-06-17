@@ -140,7 +140,7 @@ class TestVerdict(unittest.TestCase):
 class TestSummarizeResults(unittest.TestCase):
     def test_schema_and_top_level_fields(self) -> None:
         s = summary.summarize_results(_raw_doc([]), source_raw="r.json")
-        self.assertEqual(s["schema_version"], "3")
+        self.assertEqual(s["schema_version"], "4")
         self.assertEqual(s["run_id"], "r1")
         self.assertEqual(s["timestamp"], "20260601T000000Z")
         self.assertEqual(s["source_raw"], "r.json")
@@ -169,6 +169,44 @@ class TestSummarizeResults(unittest.TestCase):
         ])
         s = summary.summarize_results(doc)
         self.assertEqual(s["matrix"]["sandbox start"], {"ubuntu": "FAIL", "fedora": "PASS"})
+
+    def test_matrix_pivots_on_name_distinct_columns_same_family(self) -> None:
+        # D-8: pivot keyed by bare NAME → two same-family hosts get distinct columns.
+        doc = _raw_doc([
+            {"name": "ubuntu-2204", "distro": "ubuntu", "version": "22.04", "image": "u",
+             "detail": "", "probes": [_probe("start", exit_code=1)]},
+            {"name": "ubuntu-2404", "distro": "ubuntu", "version": "24.04", "image": "u",
+             "detail": "", "probes": [_probe("start", stdout="X_OK")]},
+        ])
+        s = summary.summarize_results(doc)
+        self.assertEqual(s["matrix"]["sandbox start"], {"ubuntu-2204": "FAIL", "ubuntu-2404": "PASS"})
+
+    def test_host_record_carries_family_and_version(self) -> None:
+        doc = _raw_doc([{"name": "ubuntu-2204", "distro": "ubuntu", "version": "22.04",
+                         "image": "u", "detail": "", "probes": [_probe("start")]}])
+        h = summary.summarize_results(doc)["hosts"][0]
+        self.assertEqual((h["name"], h["family"], h["version"]), ("ubuntu-2204", "ubuntu", "22.04"))
+        self.assertNotIn("distro", h)  # host_record now uses family/version
+
+    def test_pre_schema_fallback_name_used_as_is(self) -> None:
+        # OLD raw: provider-style name, distro=family, NO version. The name is used
+        # AS-IS (no stripping heuristic); family from distro; version "".
+        doc = _raw_doc([{"name": "vmlease-x-ubuntu", "distro": "ubuntu", "image": "u",
+                         "detail": "", "probes": [_probe("start")]}])
+        s = summary.summarize_results(doc)
+        h = s["hosts"][0]
+        self.assertEqual(h["name"], "vmlease-x-ubuntu")  # NOT stripped
+        self.assertEqual(h["family"], "ubuntu")
+        self.assertEqual(h["version"], "")
+        self.assertIn("vmlease-x-ubuntu", s["matrix"]["sandbox start"])  # pivot on the raw name
+
+    def test_no_name_key_falls_back_to_distro(self) -> None:
+        # a pre-schema file with NO "name" key → name falls back to the family.
+        doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [_probe("start")]}])
+        h = summary.summarize_results(doc)["hosts"][0]
+        self.assertEqual(h["name"], "ubuntu")
+        self.assertEqual(h["family"], "ubuntu")
+        self.assertEqual(h["version"], "")
 
     def test_worst_of_collapse_for_one_command_two_probes(self) -> None:
         doc = _raw_doc([{"distro": "ubuntu", "image": "u", "detail": "", "probes": [
@@ -395,9 +433,9 @@ def _prep_step(pid: str, exit_code: int = 0, required: bool = True, stderr: str 
 class TestPrepPhaseSummary(unittest.TestCase):
     """The prep_phase pivot (D-F/D13.4): hard -> non-zero exit; soft -> surfaced."""
 
-    def test_schema_version_is_three(self) -> None:
+    def test_schema_version_is_four(self) -> None:
         s = summary.summarize_results(_raw_doc([]))
-        self.assertEqual(s["schema_version"], "3")
+        self.assertEqual(s["schema_version"], "4")
 
     def test_totals_always_carry_prep_keys(self) -> None:
         s = summary.summarize_results(_raw_doc([]))
@@ -479,7 +517,7 @@ class TestCliSummarize(unittest.TestCase):
             self.assertIn(str(companion), buf.getvalue())
             self.assertEqual(raw.read_bytes(), before)  # raw byte-for-byte unchanged
             doc = json.loads(companion.read_text(encoding="utf-8"))
-            self.assertEqual(doc["schema_version"], "3")
+            self.assertEqual(doc["schema_version"], "4")
 
     def test_explicit_out_path(self) -> None:
         with tempfile.TemporaryDirectory() as d:
