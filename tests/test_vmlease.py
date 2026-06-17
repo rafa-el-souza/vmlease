@@ -440,29 +440,29 @@ class TestHostsParse(unittest.TestCase):
         )
 
     def test_empty_string_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("")
 
     def test_double_comma_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("ubuntu,,debian")
 
     def test_trailing_comma_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("ubuntu,")
 
     def test_empty_family_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("@22.04")
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("name=@22.04")
 
     def test_empty_version_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("ubuntu@")
 
     def test_empty_name_errors(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.parse("=ubuntu")
 
 
@@ -472,27 +472,95 @@ class TestHostsValidateName(unittest.TestCase):
             hosts.validate_name(name)  # must not raise
 
     def test_rejects_uppercase_and_underscore(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.validate_name("My_Host")
 
     def test_rejects_empty(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.validate_name("")
 
     def test_rejects_too_long(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.validate_name("x" * 64)
 
     def test_rejects_leading_and_trailing_hyphen(self) -> None:
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.validate_name("-ubuntu")
-        with self.assertRaises(hosts.HostSpecError):
+        with self.assertRaises(hosts.HostListError):
             hosts.validate_name("ubuntu-")
 
     def test_rejects_delimiter_chars(self) -> None:
         for name in ("a@b", "a=b", "a:b", "a,b"):
-            with self.assertRaises(hosts.HostSpecError):
+            with self.assertRaises(hosts.HostListError):
                 hosts.validate_name(name)
+
+
+class TestHostsResolve(unittest.TestCase):
+    def _resolve(
+        self,
+        spec: str,
+        *,
+        server_type: str = "cpx22",
+        firewall: str = "",
+        requires: tuple[str, ...] = (),
+    ) -> list[model.ResolvedHost]:
+        return hosts.resolve(
+            hosts.parse(spec), server_type=server_type, firewall=firewall, requires=requires
+        )
+
+    def test_same_family_version_repeated_gets_index(self) -> None:
+        out = self._resolve("arch,arch,arch")
+        self.assertEqual([h.name for h in out], ["arch-1", "arch-2", "arch-3"])
+        for h in out:
+            self.assertEqual(h.os, model.Os("arch", distro.ROLLING))
+
+    def test_bare_family_keeps_bare_name(self) -> None:
+        out = self._resolve("ubuntu")
+        self.assertEqual([h.name for h in out], ["ubuntu"])
+        self.assertEqual(out[0].os, model.Os("ubuntu", "24.04"))
+
+    def test_bare_beside_versioned_sibling_disambiguates_by_version(self) -> None:
+        # Fork-B case A: default 24.04 → ubuntu-2404, ubuntu-2204.
+        out = self._resolve("ubuntu,ubuntu@22.04")
+        self.assertEqual([h.name for h in out], ["ubuntu-2404", "ubuntu-2204"])
+        self.assertEqual(out[0].os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(out[1].os, model.Os("ubuntu", "22.04"))
+
+    def test_same_version_repeated_gets_index(self) -> None:
+        # Fork-B case B: both resolve to (ubuntu,22.04) → ubuntu-2204-1/-2.
+        out = self._resolve("ubuntu@22.04,ubuntu@22.04")
+        self.assertEqual([h.name for h in out], ["ubuntu-2204-1", "ubuntu-2204-2"])
+
+    def test_explicit_names_verbatim_no_index(self) -> None:
+        out = self._resolve("api=ubuntu@24.04,worker=ubuntu@24.04")
+        self.assertEqual([h.name for h in out], ["api", "worker"])
+        for h in out:
+            self.assertEqual(h.os, model.Os("ubuntu", "24.04"))
+
+    def test_bad_family_from_grouping_shorthand_raises(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("ubuntu@22.04,24.04")
+
+    def test_explicit_invalid_name_raises_no_specs(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("My_Host=ubuntu")
+
+    def test_explicit_name_collision_raises(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("api=ubuntu,api=debian")
+
+    def test_image_baked_and_run_wide_attrs_stamped(self) -> None:
+        out = self._resolve(
+            "ubuntu@22.04", server_type="cpx31", firewall="fw1", requires=("docker",)
+        )
+        self.assertEqual(out[0].image, "ubuntu-22.04")
+        self.assertEqual(out[0].server_type, "cpx31")
+        self.assertEqual(out[0].firewall, "fw1")
+        self.assertEqual(out[0].requires, ("docker",))
+
+    def test_unknown_version_raises(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("ubuntu@99.99")
 
 
 # --------------------------------------------------------------------------- #
