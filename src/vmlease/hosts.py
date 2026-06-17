@@ -20,7 +20,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-from vmlease.distro import FAMILIES, ROLLING, get_profile, versionflat
+from vmlease.distro import FAMILIES, ROLLING, get_profile, host_base_name
 from vmlease.model import Os, ResolvedHost
 
 # The entry delimiters of the ``--hosts`` / ``--keep`` grammars. A host name must
@@ -150,6 +150,16 @@ def resolve(
     :class:`HostListError` on a duplicate name (an explicit-name collision).
     """
     profiles = [get_profile(e.family, e.version) for e in entries]
+    # A rolling-release family takes no @version: if the user gave one explicitly
+    # AND it resolved to the rolling profile, reject it (D-4 / distro-profiles spec:
+    # ``arch@<anything>`` SHALL be an error). Programmatic ``get_profile(family,
+    # ROLLING)`` callers are unaffected — the guard keys on ``entry.version``.
+    for entry, profile in zip(entries, profiles, strict=True):
+        if entry.version is not None and profile.version == ROLLING:
+            raise HostListError(
+                f"rolling-release family {entry.family!r} does not take an "
+                f"@version; use bare {entry.family!r}"
+            )
     oses = [Os(p.family, p.version) for p in profiles]
     names = _assign_names(entries, oses)
     # Shadow guard (D-7): a host whose name equals a registry family name but is
@@ -193,7 +203,7 @@ def _assign_names(entries: list[HostEntry], oses: list[Os]) -> list[str]:
         if family_count[os.family] == 1:
             names[i] = os.family
             continue
-        base = os.family if os.version == ROLLING else f"{os.family}-{versionflat(os.version)}"
+        base = host_base_name(os.family, os.version)
         if version_count[os] == 1:
             names[i] = base
         else:

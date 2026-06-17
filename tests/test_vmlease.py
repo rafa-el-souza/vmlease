@@ -604,6 +604,21 @@ class TestHostsResolve(unittest.TestCase):
         self.assertEqual(out[0].name, "ubuntu")
         self.assertEqual(out[0].os, model.Os("ubuntu", "22.04"))
 
+    def test_rolling_family_explicit_rolling_version_rejected(self) -> None:
+        # D-4 / distro-profiles spec: `arch@<anything>` SHALL be an error — even the
+        # rolling sentinel, which is in the registry but must not be given explicitly.
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("arch@rolling")
+
+    def test_bare_rolling_family_resolves(self) -> None:
+        out = self._resolve("arch")
+        self.assertEqual(out[0].os, model.Os("arch", distro.ROLLING))
+
+    def test_rolling_family_versioned_rejected(self) -> None:
+        # an explicit numbered version on a rolling family is a registry miss
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("arch@24.04")
+
 
 # --------------------------------------------------------------------------- #
 # safety
@@ -1866,7 +1881,7 @@ class TestShellcheckDriver(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestDistro(unittest.TestCase):
     def test_known_profiles(self) -> None:
-        for key in distro.DEFAULT_DISTRO_KEYS:
+        for key in distro.DEFAULT_FAMILIES:
             self.assertEqual(distro.get_profile(key).family, key)
 
     def test_unknown_profile_raises(self) -> None:
@@ -1906,6 +1921,10 @@ class TestVersionflatAndProfileShape(unittest.TestCase):
         self.assertEqual(distro.versionflat("22.04"), "2204")
         self.assertEqual(distro.versionflat("12.1"), "121")
         self.assertEqual(distro.versionflat("13"), "13")
+
+    def test_host_base_name_versioned_and_rolling(self) -> None:
+        self.assertEqual(distro.host_base_name("ubuntu", "22.04"), "ubuntu-2204")
+        self.assertEqual(distro.host_base_name("arch", distro.ROLLING), "arch")
 
     def test_profile_exposes_family_image_version(self) -> None:
         p = distro.DistroProfile(
@@ -1973,8 +1992,8 @@ class TestRegistryAndGetProfile(unittest.TestCase):
         self.assertIn("ubuntu", str(ctx.exception))
 
     def test_profiles_string_view_resolves_all_families(self) -> None:
-        self.assertEqual(distro.FAMILIES, frozenset(distro.DEFAULT_DISTRO_KEYS))
-        for family in distro.DEFAULT_DISTRO_KEYS:
+        self.assertEqual(distro.FAMILIES, frozenset(distro.DEFAULT_FAMILIES))
+        for family in distro.DEFAULT_FAMILIES:
             self.assertEqual(distro.get_profile(family).family, family)
 
 
@@ -2095,9 +2114,9 @@ class TestRunner(unittest.TestCase):
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
             keep_policy=runner.KeepPolicy(families=frozenset({"ubuntu"})),
         )
-        by_distro = {s.family: s for s in runner.build_host_specs(m)}
-        self.assertIn(safety.LABEL_KEEP, by_distro["ubuntu"].labels)  # kept → stamped
-        self.assertNotIn(safety.LABEL_KEEP, by_distro["debian"].labels)  # not kept → unstamped
+        by_family = {s.family: s for s in runner.build_host_specs(m)}
+        self.assertIn(safety.LABEL_KEEP, by_family["ubuntu"].labels)  # kept → stamped
+        self.assertNotIn(safety.LABEL_KEEP, by_family["debian"].labels)  # not kept → unstamped
 
     def test_build_host_specs_deterministic_with_requires(self) -> None:
         m = _run_request(
@@ -2338,9 +2357,9 @@ class TestCli(unittest.TestCase):
             ns = cli.build_parser().parse_args([
                 "plan", "--battery", self._write_battery(d), "--run-token", "cli-run",
             ])
-            req = cli._matrix_from_args(ns, _demo_workload())
-            self.assertEqual([h.name for h in req.hosts], list(distro.DEFAULT_DISTRO_KEYS))
-            self.assertEqual(tuple(h.os.family for h in req.hosts), distro.DEFAULT_DISTRO_KEYS)
+            req = cli._run_request_from_args(ns, _demo_workload())
+            self.assertEqual([h.name for h in req.hosts], list(distro.DEFAULT_FAMILIES))
+            self.assertEqual(tuple(h.os.family for h in req.hosts), distro.DEFAULT_FAMILIES)
 
     def test_hosts_flag_end_to_end_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -2348,7 +2367,7 @@ class TestCli(unittest.TestCase):
                 "plan", "--battery", self._write_battery(d), "--run-token", "cli-run",
                 "--hosts", "api=ubuntu@24.04,debian",
             ])
-            req = cli._matrix_from_args(ns, _demo_workload())
+            req = cli._run_request_from_args(ns, _demo_workload())
             self.assertEqual([h.name for h in req.hosts], ["api", "debian"])
             self.assertEqual(req.hosts[0].os, model.Os("ubuntu", "24.04"))
             self.assertEqual(req.hosts[1].os, model.Os("debian", "13"))
@@ -2443,26 +2462,26 @@ class TestCli(unittest.TestCase):
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
                 "--upload", "/a/x.whl", "--upload", "/b/y.bin:~/dest/y.bin",
             ])
-            m = cli._matrix_from_args(ns, _demo_workload())
+            m = cli._run_request_from_args(ns, _demo_workload())
             self.assertEqual(len(m.uploads), 2)
             self.assertEqual(m.uploads[0].remote, "~/x.whl")
             self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
 
-    def test_matrix_from_args_default_requires_empty(self) -> None:
+    def test_run_request_from_args_default_requires_empty(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             ns = cli.build_parser().parse_args([
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
             ])
-            req = cli._matrix_from_args(ns, _demo_workload())
+            req = cli._run_request_from_args(ns, _demo_workload())
             self.assertEqual(req.hosts[0].requires, ())
 
-    def test_matrix_from_args_carries_requires(self) -> None:
+    def test_run_request_from_args_carries_requires(self) -> None:
         # the requires arg is already canonicalized (D-I.4) and lands on each host.
         with tempfile.TemporaryDirectory() as d:
             ns = cli.build_parser().parse_args([
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
             ])
-            m = cli._matrix_from_args(ns, _demo_workload(), ("docker",))
+            m = cli._run_request_from_args(ns, _demo_workload(), ("docker",))
             self.assertEqual(m.hosts[0].requires, ("docker",))
 
     def test_plan_rejects_bad_upload_no_provider_call(self) -> None:
@@ -4098,9 +4117,9 @@ class TestExecute(unittest.TestCase):
             runs = runner.execute(m, prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe", max_parallel=2)
         self.assertEqual(len(runs), 2)
         self.assertEqual(len(prov.destroyed), 2)
-        by_distro = {r.host_spec.family: r for r in runs}
-        self.assertTrue(by_distro["ubuntu"].results)  # preserved
-        self.assertTrue(by_distro["debian"].detail.startswith("ERROR:"))
+        by_family = {r.host_spec.family: r for r in runs}
+        self.assertTrue(by_family["ubuntu"].results)  # preserved
+        self.assertTrue(by_family["debian"].detail.startswith("ERROR:"))
 
 
 # --------------------------------------------------------------------------- #
@@ -4468,9 +4487,9 @@ class TestKeepFlag(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             kp = _fake_keypair(Path(d))
             runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
-        by_distro = {r.host_spec.family: r for r in runs}
+        by_family = {r.host_spec.family: r for r in runs}
         self.assertEqual([h.name for h in prov.destroyed], ["debian"])  # only debian reaped (bare identity)
-        kept = by_distro["ubuntu"].kept_host
+        kept = by_family["ubuntu"].kept_host
         self.assertIsNotNone(kept)
         assert kept is not None  # narrow for the type checker
         self.assertEqual(kept.name, "ubuntu")  # bare identity post-cutover
@@ -4479,7 +4498,7 @@ class TestKeepFlag(unittest.TestCase):
         self.assertEqual(kept.ipv4, "10.0.0.1")  # the ubuntu host's ip
         self.assertEqual(kept.operator, "probe")
         self.assertEqual(kept.key_path, str(kp.private_key_path))
-        self.assertIsNone(by_distro["debian"].kept_host)  # torn-down host → no record
+        self.assertIsNone(by_family["debian"].kept_host)  # torn-down host → no record
 
     def test_partial_keep_abort_spares_kept_host_and_backstop_reaps_the_rest(self) -> None:
         # BLOCKER generalization (F-010, per-distro): a Ctrl-C during a PARTIAL
@@ -4684,8 +4703,8 @@ class TestKeepFlag(unittest.TestCase):
             kp = _fake_keypair(Path(d))
             runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
         doc = json.loads(results.serialize_run("run-keep", "TS", runs))
-        by_distro = {h["distro"]: h for h in doc["hosts"]}
-        kept = by_distro["ubuntu"]["kept_host"]
+        by_family = {h["distro"]: h for h in doc["hosts"]}
+        kept = by_family["ubuntu"]["kept_host"]
         self.assertEqual(
             kept,
             {
@@ -4698,7 +4717,7 @@ class TestKeepFlag(unittest.TestCase):
                 "key_path": str(kp.private_key_path),
             },
         )
-        self.assertIsNone(by_distro["debian"]["kept_host"])  # torn-down host → null
+        self.assertIsNone(by_family["debian"]["kept_host"])  # torn-down host → null
 
 
 class _ScriptedTimeoutSsh:

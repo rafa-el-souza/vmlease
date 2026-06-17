@@ -1,6 +1,6 @@
-"""Runner — compose a matrix into host specs, plan it, and execute it.
+"""Runner — compose a run request into host specs, plan it, and execute it.
 
-Turns a (battery, distro-keys, server-type) matrix into labelled
+Turns a (battery, distro-keys, server-type) run request into labelled
 :class:`~vmlease.model.HostSpec` objects, gates them through the cost guard, and
 either renders a ``plan`` that makes **zero** provider calls or runs the
 provision -> probe -> teardown loop. Plan and execute build their specs from the
@@ -157,7 +157,7 @@ def build_host_specs(req: RunRequest) -> list[HostSpec]:
     return specs
 
 
-def validate_uploads(matrix: RunRequest) -> None:
+def validate_uploads(req: RunRequest) -> None:
     """Validate every upload's source + remote dest, fail-closed, before spend.
 
     Host-independent (the local file and remote path are the same for every
@@ -166,12 +166,12 @@ def validate_uploads(matrix: RunRequest) -> None:
     at the top of both ``plan`` (zero provider calls) and ``execute`` (before the
     provision loop), so a bad ``--upload`` aborts before any host is created.
     """
-    for spec in matrix.uploads:
+    for spec in req.uploads:
         validate_upload_source(spec.local)
         validate_remote_dest(spec.remote)
 
 
-def plan(matrix: RunRequest, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
+def plan(req: RunRequest, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
     """Render the dry-run plan. Makes **zero** provider calls.
 
     Builds the host specs (the same ones a real run would provision), validates
@@ -186,11 +186,11 @@ def plan(matrix: RunRequest, *, cost_guard: CostGuard | None = None) -> list[Pla
     always shows the cold image (a hit only changes which image is *created*, not
     the host set), keeping the dry-run faithful and call-free.
     """
-    validate_uploads(matrix)
-    specs = build_host_specs(matrix)
+    validate_uploads(req)
+    specs = build_host_specs(req)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
-    workload_summary = matrix.workload.plan_summary
+    workload_summary = req.workload.plan_summary
     return [
         PlanItem(
             host_name=s.name,
@@ -229,7 +229,7 @@ OnReady = Callable[["Host", "SshRunner", "Provider"], R]
 
 
 def execute(
-    matrix: RunRequest,
+    req: RunRequest,
     provider: Provider,
     ssh_factory: Callable[[str, Keypair], SshRunner],
     keypair: Keypair,
@@ -251,14 +251,14 @@ def execute(
     rescue-write / become reachable is recorded as a ``HostRun`` with an error
     detail and zero results (NOT a raise), so :func:`execute` always returns
     one ``HostRun`` per requested host and the caller always writes a results file.
-    The injected ``matrix.workload`` owns what runs on each ready host. The keypair
-    is cleaned once at the end — UNLESS the matrix's ``keep_policy`` keeps any host,
+    The injected ``req.workload`` owns what runs on each ready host. The keypair
+    is cleaned once at the end — UNLESS the request's ``keep_policy`` keeps any host,
     which leaves the host(s) standing and skips that cleanup (see ``keep_policy``).
 
     ``ssh_factory`` builds an :class:`~vmlease.ssh.SshRunner` for the operator
     + keypair (injected so tests pass a fake). ``rescue_writer`` (injected) is
-    REQUIRED when the matrix contains a ``needs_rescue_write`` distro (e.g. arch).
-    ``cost_guard`` re-checks the matrix before any provider call.
+    REQUIRED when the request contains a ``needs_rescue_write`` distro (e.g. arch).
+    ``cost_guard`` re-checks the request before any provider call.
 
     ``max_parallel`` runs up to N hosts concurrently (default 1 = serial). Each
     host is an independent, self-contained :func:`_run_one_host` (own create /
@@ -266,7 +266,7 @@ def execute(
     the gpg keyring — is read-only after setup, so concurrency is safe and the
     teardown-always guarantee holds per thread. The work is I/O-bound (subprocess
     / ssh waits release the GIL), so a thread pool is the right tool. Results are
-    returned in **matrix order** regardless of completion order. Running hosts
+    returned in **request order** regardless of completion order. Running hosts
     concurrently also sidesteps Hetzner's recycled-IP-into-the-next-host behavior
     (hosts overlap, so an IP is not freed mid-run).
 
@@ -275,7 +275,7 @@ def execute(
     or via ``as_completed`` in parallel mode (NOT from a worker thread, so a sink
     that does I/O sees no concurrent calls). It lets the caller persist results
     incrementally (so an abort still leaves the finished hosts on disk) without
-    changing the matrix-ordered aggregate return.
+    changing the request-ordered aggregate return.
 
     ``resolve_deps`` (injected, optional) activates the **cache-aware** restore
     path: when present, each host first tries the content-addressed cached image
@@ -287,21 +287,21 @@ def execute(
     ``reap_bad_cache_image`` (opt-in, default off) reaps the source image when a
     *restored* host fails readiness (G4); default is a hint only (the image is
     named in the failure detail but kept, so a real fault is not masked).
-    ``matrix.keep_policy`` decides which hosts are left RUNNING (billable) instead
+    ``req.keep_policy`` decides which hosts are left RUNNING (billable) instead
     of being torn down: a kept host carries the ``LABEL_KEEP`` marker (stamped on its
     spec in :func:`build_host_specs`), leaves a KEPT note + a structured
     :class:`~vmlease.model.KeptHost` record (how to SSH in), and — when ANY host is
     kept — the keypair is NOT cleaned, so the printed ``ssh -i <path>`` points at a
     live file.
     """
-    validate_uploads(matrix)
-    specs = build_host_specs(matrix)
+    validate_uploads(req)
+    specs = build_host_specs(req)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
 
     def _one(spec: HostSpec) -> HostRun:
         return _run_one_host(
-            spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads,
+            spec, req.workload, provider, ssh_factory, keypair, operator, rescue_writer, req.uploads,
             resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image,
         )
 
@@ -320,7 +320,7 @@ def execute(
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(max_workers=min(max_parallel, len(specs))) as pool:
-            # Submit keeps a future->index map so the aggregate stays in matrix
+            # Submit keeps a future->index map so the aggregate stays in request
             # order; as_completed lets the main thread call the sink as each host
             # finishes (the workers never touch on_host_complete).
             futures = {pool.submit(_one, spec): idx for idx, spec in enumerate(specs)}
@@ -336,7 +336,7 @@ def execute(
                 # propagating BaseException (e.g. a worker's KeyboardInterrupt) would
                 # otherwise drop hosts that already finished cleanly but whose
                 # as_completed turn hadn't arrived. Fire on_host_complete for each
-                # done, non-cancelled, not-yet-recorded future (in matrix order) so
+                # done, non-cancelled, not-yet-recorded future (in request order) so
                 # their results persist like the serial path, then re-raise.
                 for future, idx in sorted(futures.items(), key=lambda kv: kv[1]):
                     if ordered[idx] is not None or future.cancelled() or not future.done():
@@ -353,7 +353,7 @@ def execute(
         # When the keep policy keeps ANY host the private key must SURVIVE the run
         # so the printed ``ssh -i <path>`` points at a real file the operator can use
         # against the still-live host(s). Otherwise the key dir is reaped as usual.
-        if not matrix.keep_policy.any_kept:
+        if not req.keep_policy.any_kept:
             keypair.cleanup()
 
 

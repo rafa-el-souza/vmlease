@@ -50,7 +50,13 @@ from vmlease.battery import (
     structural_violations,
 )
 from vmlease.capabilities import canonical_requires
-from vmlease.distro import DEFAULT_DISTRO_KEYS, ROLLING, UnknownDistroError, get_profile, versionflat
+from vmlease.distro import (
+    DEFAULT_FAMILIES,
+    ROLLING,
+    UnknownDistroError,
+    get_profile,
+    host_base_name,
+)
 from vmlease.hosts import HostListError, parse, resolve
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
@@ -113,9 +119,9 @@ def _format_os(os: Os) -> str:
     return os.family if os.version == ROLLING else f"{os.family}@{os.version}"
 
 
-def _matrix_has_rescue_write(matrix: RunRequest) -> bool:
+def _run_has_rescue_write(req: RunRequest) -> bool:
     """``True`` iff any host in the run needs a rescue-write transform."""
-    return any(get_profile(h.os.family, h.os.version).needs_rescue_write for h in matrix.hosts)
+    return any(get_profile(h.os.family, h.os.version).needs_rescue_write for h in req.hosts)
 
 
 def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: str) -> RescueWriter:
@@ -137,18 +143,18 @@ def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: s
     return build_live_rescue_writer(rescue_key_path, ssh_key_name, keyring_path)
 
 
-def _build_run_resolve_deps(matrix: RunRequest, keypair: Keypair) -> ResolveDeps:
+def _build_run_resolve_deps(req: RunRequest, keypair: Keypair) -> ResolveDeps:
     """Build the run's cache-lookup ``ResolveDeps`` (the keyring only when needed).
 
-    Mirrors ``build-image``'s deps construction but keyed on the matrix: the pinned
-    ``arch-boxes`` keyring is set up ONLY when the matrix contains a rescue-write
-    distro (a native-only matrix never touches gpg). The keyring lives under the
+    Mirrors ``build-image``'s deps construction but keyed on the run: the pinned
+    ``arch-boxes`` keyring is set up ONLY when the run contains a rescue-write
+    distro (a native-only run never touches gpg). The keyring lives under the
     per-run keypair's directory (it exists by now — the cache lookup is
     provision-time, after the keypair is generated). The deps feed the advisory
     cache lookup; a resolve failure inside it degrades to the cold path (G9).
     """
     keyring_path = str(keypair.directory / "arch-boxes.gpg")
-    if _matrix_has_rescue_write(matrix):
+    if _run_has_rescue_write(req):
         ensure_arch_keyring(keyring_path, live_subprocess_run)
     return build_live_resolve_deps(keyring_path)
 
@@ -167,7 +173,7 @@ def _parse_upload(value: str) -> UploadSpec:
     return UploadSpec(local=local, remote=remote)
 
 
-def _matrix_from_args(
+def _run_request_from_args(
     args: argparse.Namespace,
     workload: Workload,
     requires: tuple[str, ...] = (),
@@ -197,10 +203,10 @@ def _warn_battery(battery: Battery) -> None:
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(
+        req = _run_request_from_args(
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
-        items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
+        items = plan(req, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -224,10 +230,10 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
 def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(
+        req = _run_request_from_args(
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
-        items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
+        items = plan(req, cost_guard=CostGuard(max_hosts=args.max_hosts))
     except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -237,8 +243,8 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     # RESOLVED hosts (names + families) AFTER the cost guard (above), so a typo or a
     # family absent from this run costs nothing. The `family:`-split is the CLI's
     # job; KeepPolicy stays a pure membership test (D-7).
-    host_names = {h.name for h in matrix.hosts}
-    host_families = {h.os.family for h in matrix.hosts}
+    host_names = {h.name for h in req.hosts}
+    host_families = {h.os.family for h in req.hosts}
     if args.keep is None:
         keep_policy = KeepPolicy()
     elif len(args.keep) == 0:
@@ -284,7 +290,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
             else:
                 keep_names.add(token)
         keep_policy = KeepPolicy(names=frozenset(keep_names), families=frozenset(keep_families))
-    matrix = replace(matrix, keep_policy=keep_policy)
+    req = replace(req, keep_policy=keep_policy)
 
     _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
@@ -318,7 +324,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         # Echo the RESOLVED kept-set (names + count) before provisioning, even under
         # --yes (it rides the billing confirm interactively; prints regardless) so the
         # kept set is always visible before spend (D-7).
-        kept_names = [h.name for h in matrix.hosts if keep_policy.keeps(h.name, h.os.family)]
+        kept_names = [h.name for h in req.hosts if keep_policy.keeps(h.name, h.os.family)]
         print(f"keep: {len(kept_names)} host(s) will be left LIVE after the run: {kept_names}")
         if not _confirm(
             "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
@@ -347,13 +353,13 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
         return OpenSshRunner(operator, keypair.private_key_path, probe_timeout_default=args.probe_timeout)
 
-    # A rescue-writer is only built when the matrix contains a needs_rescue_write
+    # A rescue-writer is only built when the run contains a needs_rescue_write
     # distro (e.g. arch); it transforms the base host into the target distro
     # before probing. It needs the REGISTERED ssh key (name + local private half)
     # for root access into the rescue system — distinct from the throwaway probe
     # key. Both must be present, or the rescue SSH cannot authenticate.
     rescue_writer = None
-    if _matrix_has_rescue_write(matrix):
+    if _run_has_rescue_write(req):
         if not args.ssh_key or not args.ssh_key_path:
             print(
                 "error: a rescue-write distro (e.g. arch) requires --ssh-key "
@@ -367,10 +373,10 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         rescue_writer = _build_rescue_writer(keypair, args.ssh_key, args.ssh_key_path)
 
     # The cache is ADVISORY: build the run's resolve deps (sets up the pinned arch
-    # keyring only when the matrix has a rescue-write distro — a native-only matrix
+    # keyring only when the run has a rescue-write distro — a native-only run
     # never touches gpg) and let execute() try a cached snapshot per host, falling
     # back to the cold path on any miss/failure. run NEVER builds (D3).
-    resolve_deps = _build_run_resolve_deps(matrix, keypair)
+    resolve_deps = _build_run_resolve_deps(req, keypair)
 
     writer = IncrementalResultsWriter(Path(args.results_dir), run_id, args.timestamp)
 
@@ -380,7 +386,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
 
     try:
         host_runs = execute(
-            matrix, provider, _ssh_factory, keypair, args.operator,
+            req, provider, _ssh_factory, keypair, args.operator,
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
             max_parallel=args.parallel, on_host_complete=_persist,
             resolve_deps=resolve_deps, reap_bad_cache_image=args.reap_bad_cache_image,
@@ -648,10 +654,7 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     # resolved (family, version); the builder name uses the versionflat form so it
     # stays a clean RFC1123 label (e.g. ``vmlease-<run>-build-ubuntu-2204``).
     build_os = Os(profile.family, profile.version)
-    build_comp = (
-        profile.family if profile.version == ROLLING
-        else f"{profile.family}-{versionflat(profile.version)}"
-    )
+    build_comp = host_base_name(profile.family, profile.version)
     print(f"about to PROVISION 1 builder host (billable) for {_format_os(build_os)} (key {key})")
     print(f"  - {args.server_type}  {profile.image}  arch={arch}")
     if not _confirm("Proceed with the build? [y/N]: ", assume_yes=args.yes, reader=reader):
@@ -855,7 +858,7 @@ def _reap_images_superseded_set(
     needs_keyring = any(
         get_profile(img.labels.get(LABEL_DISTRO, "")).needs_rescue_write
         for img in images
-        if img.labels.get(LABEL_DISTRO, "") in DEFAULT_DISTRO_KEYS
+        if img.labels.get(LABEL_DISTRO, "") in DEFAULT_FAMILIES
     )
     keyring_dir = _NoKeypairDir()
     try:
@@ -1090,10 +1093,10 @@ class _DeprecatedDistrosAction(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
-def _add_matrix_args(sp: argparse.ArgumentParser) -> None:
+def _add_run_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--battery", required=True, help="path to the battery.toml manifest (the TOML bundle)")
     sp.add_argument(
-        "--hosts", dest="hosts", default=",".join(DEFAULT_DISTRO_KEYS),
+        "--hosts", dest="hosts", default=",".join(DEFAULT_FAMILIES),
         help="comma-separated host list, each '[name=]family[@version]' "
         "(default: the four bare families)",
     )
@@ -1118,11 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     plan_p = sub.add_parser("plan", help="dry-run: show what would be provisioned (zero provider calls)")
-    _add_matrix_args(plan_p)
+    _add_run_args(plan_p)
     plan_p.set_defaults(func=_cmd_plan)
 
     run_p = sub.add_parser("run", help="provision -> probe -> tear down (billable; confirm-gated)")
-    _add_matrix_args(run_p)
+    _add_run_args(run_p)
     run_p.add_argument("--operator", default="probe", help="non-root operator account on each host")
     run_p.add_argument("--results-dir", required=True, help="dir to write the timestamped results JSON")
     run_p.add_argument("--timestamp", required=True, help="results timestamp (caller-supplied; determinism seam)")

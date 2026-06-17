@@ -38,6 +38,11 @@ def versionflat(version: str) -> str:
     return "".join(ch for ch in version if ch.isdigit())
 
 
+def host_base_name(family: str, version: str) -> str:
+    """The host/builder base name for ``(family, version)`` (bare family if rolling)."""
+    return family if version == ROLLING else f"{family}-{versionflat(version)}"
+
+
 @dataclass(frozen=True)
 class DistroProfile:
     """How to provision + prepare one distro family.
@@ -233,7 +238,7 @@ _DEFAULT_VERSION: Mapping[str, str] = MappingProxyType({
 FAMILIES: frozenset[str] = frozenset(_DEFAULT_VERSION)
 
 # The default distro matrix.
-DEFAULT_DISTRO_KEYS: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")
+DEFAULT_FAMILIES: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")
 
 # System-refresh command per package manager (single source — derived from the
 # manager, so a fresh-baseline upgrade covers every distro under that manager,
