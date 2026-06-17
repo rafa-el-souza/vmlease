@@ -7,13 +7,13 @@ slug and (b) render the cloud-init that installs deps + creates the non-root
 operator before the battery runs.
 
 Project-agnostic: a profile describes *how to prepare a distro*, independent of
-any particular battery. A consumer selects profiles by key in its matrix.
+any particular battery. A consumer selects profiles by family in its matrix.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
@@ -23,6 +23,24 @@ from vmlease.rescue_image import ArchRescueImageSpec, RescueImageSpec
 # sentinel step, selected per profile by :attr:`DistroProfile.finalize_fragment`).
 FINALIZE_FRAGMENT_DEFAULT = "default"
 FINALIZE_FRAGMENT_RESCUE_WRITE = "reboot-resume"
+
+# Sentinel version for rolling-release distros (e.g. Arch): they have no numbered
+# version, so the registry/labels carry this marker instead of a version number.
+ROLLING = "rolling"
+
+
+def versionflat(version: str) -> str:
+    """Return the digits of ``version`` (``"22.04"`` → ``"2204"``, ``"13"`` → ``"13"``).
+
+    Used to derive a compact, separator-free version token for host auto-names and
+    builder/image names (e.g. ``ubuntu-2204``). Non-digit characters are dropped.
+    """
+    return "".join(ch for ch in version if ch.isdigit())
+
+
+def host_base_name(family: str, version: str) -> str:
+    """The host/builder base name for ``(family, version)`` (bare family if rolling)."""
+    return family if version == ROLLING else f"{family}-{versionflat(version)}"
 
 
 @dataclass(frozen=True)
@@ -37,8 +55,11 @@ class DistroProfile:
     existing manager is a new profile, not a new template.
 
     Attributes:
-        key: Stable selector (e.g. ``"ubuntu"``, ``"debian"``, ``"fedora"``, ``"arch"``).
-        default_image: Provider image slug for this distro.
+        family: Stable selector (e.g. ``"ubuntu"``, ``"debian"``, ``"fedora"``,
+            ``"arch"``).
+        image: Provider image slug for this distro.
+        version: Distro version (e.g. ``"24.04"``, ``"13"``) or :data:`ROLLING`
+            for rolling-release distros.
         package_manager: ``"apt" | "dnf" | "pacman"`` — selects the install template.
         packages: Base packages to install (the generic, battery-agnostic distro
             box). Optional vmlease-provided capabilities (e.g. docker) are NOT
@@ -56,7 +77,7 @@ class DistroProfile:
             covers every distro under that manager).
         rescue_image: When set, this distro has no native Hetzner image and is
             built by a rescue-write transform (:mod:`vmlease.archbuild`):
-            ``default_image`` is the cheap BASE host to provision, and this is the
+            ``image`` is the cheap BASE host to provision, and this is the
             injected :class:`~vmlease.rescue_image.RescueImageSpec` that resolves +
             trust-gates the cloud image to write onto its disk (Arch:
             :class:`~vmlease.rescue_image.ArchRescueImageSpec`; a pinned golden
@@ -65,8 +86,9 @@ class DistroProfile:
         notes: Free-text provenance / per-distro gotchas (for the results report).
     """
 
-    key: str
-    default_image: str
+    family: str
+    image: str
+    version: str
     package_manager: str
     packages: tuple[str, ...]
     extra_setup: tuple[str, ...] = ()
@@ -94,21 +116,21 @@ class DistroProfile:
           sentinel to a self-disabling oneshot on the next boot.
 
         Selection is profile data keyed on ``needs_rescue_write`` — NOT an
-        ``if key == "arch"`` in the renderer, and NOT a branch inside a template
+        ``if family == "arch"`` in the renderer, and NOT a branch inside a template
         (templating stays logic-free).
         """
         return FINALIZE_FRAGMENT_RESCUE_WRITE if self.needs_rescue_write else FINALIZE_FRAGMENT_DEFAULT
 
 
 # Package sets validated on real hosts — the rootless-docker prerequisites a probe
-# battery assumes are present before it probes what the *operator* can do. Exposed
-# as a read-only ``Mapping`` (``MappingProxyType`` below) — it is a static registry
-# populated once at import; a runtime mutation would be a bug, so the type system +
-# runtime both forbid it (immutability rule; global-state hygiene).
+# battery assumes are present before it probes what the *operator* can do. The base
+# per-family profiles (each at the family's default version); sibling versions are
+# derived into ``_REGISTRY`` below.
 _PROFILES: dict[str, DistroProfile] = {
     "ubuntu": DistroProfile(
-        key="ubuntu",
-        default_image="ubuntu-24.04",
+        family="ubuntu",
+        image="ubuntu-24.04",
+        version="24.04",
         package_manager="apt",
         packages=(
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
@@ -119,8 +141,9 @@ _PROFILES: dict[str, DistroProfile] = {
         "path (NOT debian).",
     ),
     "debian": DistroProfile(
-        key="debian",
-        default_image="debian-13",
+        family="debian",
+        image="debian-13",
+        version="13",
         package_manager="apt",
         packages=(
             "systemd-container", "acl", "rsync", "fuse-overlayfs", "e2fsprogs",
@@ -130,8 +153,9 @@ _PROFILES: dict[str, DistroProfile] = {
         "(when required) is a capability recipe via the debian repo path.",
     ),
     "fedora": DistroProfile(
-        key="fedora",
-        default_image="fedora-43",
+        family="fedora",
+        image="fedora-43",
+        version="43",
         package_manager="dnf",
         packages=(
             "systemd-container", "acl", "rsync", "slirp4netns",
@@ -155,12 +179,13 @@ _PROFILES: dict[str, DistroProfile] = {
         "via shadow-utils; needs modprobe ip_tables for the rootless iptables preflight.",
     ),
     "arch": DistroProfile(
-        key="arch",
+        family="arch",
         # No native Hetzner Arch image: provision a cheap debian-13 base, then
         # rescue-write the verified Arch cloudimg onto its disk (archbuild). The
         # cloudimg ships cloud-init -> reads the hetzner datasource -> applies the
         # SAME --user-data prep as every other distro (verified on a real host 2026-06-01).
-        default_image="debian-13",
+        image="debian-13",
+        version=ROLLING,
         rescue_image=ArchRescueImageSpec(fingerprint=DEFAULT_ARCH_KEY_FINGERPRINT),
         package_manager="pacman",
         packages=(
@@ -186,11 +211,34 @@ _PROFILES: dict[str, DistroProfile] = {
     ),
 }
 
-# The public, read-only view: any `PROFILES[k] = ...` / `del` raises TypeError.
-PROFILES: Mapping[str, DistroProfile] = MappingProxyType(_PROFILES)
+# The authoritative registry, keyed by ``(family, version)`` (D-4). The base
+# per-family profiles in ``_PROFILES`` are each at that family's default version;
+# sibling versions are derived DRY via :func:`dataclasses.replace`, overriding
+# ONLY ``version`` + ``image`` so the package sets etc. stay single-source.
+_REGISTRY: dict[tuple[str, str], DistroProfile] = {
+    (profile.family, profile.version): profile for profile in _PROFILES.values()
+}
+_REGISTRY.update({
+    ("ubuntu", "22.04"): replace(_PROFILES["ubuntu"], version="22.04", image="ubuntu-22.04"),
+    ("debian", "12"): replace(_PROFILES["debian"], version="12", image="debian-12"),
+    ("fedora", "44"): replace(_PROFILES["fedora"], version="44", image="fedora-44"),
+})
+
+# Per-family default version — an EXPLICIT table (D-4), NOT first-entry-wins, so a
+# bare-family lookup is order-independent. Rolling families take ``ROLLING``.
+_DEFAULT_VERSION: Mapping[str, str] = MappingProxyType({
+    "ubuntu": "24.04",
+    "debian": "13",
+    "fedora": "43",
+    "arch": ROLLING,
+})
+
+# The authoritative family-name set — used by the expander's shadow-name guard +
+# battery prep validation.
+FAMILIES: frozenset[str] = frozenset(_DEFAULT_VERSION)
 
 # The default distro matrix.
-DEFAULT_DISTRO_KEYS: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")
+DEFAULT_FAMILIES: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")
 
 # System-refresh command per package manager (single source — derived from the
 # manager, so a fresh-baseline upgrade covers every distro under that manager,
@@ -217,7 +265,7 @@ def system_update_command(profile: DistroProfile) -> str:
     except KeyError as exc:
         raise UnknownPackageManagerError(
             f"no system-update command for package manager "
-            f"{profile.package_manager!r} (distro {profile.key!r}); set "
+            f"{profile.package_manager!r} (distro {profile.family!r}); set "
             f"system_update_override on the profile"
         ) from exc
 
@@ -230,11 +278,28 @@ class UnknownPackageManagerError(KeyError):
     """A profile's package manager has no known system-update command + no override."""
 
 
-def get_profile(key: str) -> DistroProfile:
-    """Return the profile for ``key`` or raise :class:`UnknownDistroError`."""
-    try:
-        return PROFILES[key]
-    except KeyError as exc:
+def get_profile(family: str, version: str | None = None) -> DistroProfile:
+    """Return the profile for ``family`` (its default version) or ``(family, version)``.
+
+    A bare ``family`` resolves through the explicit per-family default version
+    (:data:`_DEFAULT_VERSION`), so today's single-arg callers are unchanged.
+    Raises :class:`UnknownDistroError` for an unknown family, or for a known
+    family with an unknown version (rolling families such as ``arch`` accept only
+    :data:`ROLLING` — ``get_profile("arch", "24.04")`` errors; bare ``arch`` →
+    the rolling entry).
+    """
+    known_families = sorted({fam for fam, _v in _REGISTRY})
+    if family not in known_families:
         raise UnknownDistroError(
-            f"no distro profile for {key!r}; known: {sorted(PROFILES)}"
+            f"no distro profile for {family!r}; known families: {known_families}"
+        )
+    if version is None:
+        version = _DEFAULT_VERSION[family]
+    try:
+        return _REGISTRY[(family, version)]
+    except KeyError as exc:
+        known_versions = sorted(v for fam, v in _REGISTRY if fam == family)
+        raise UnknownDistroError(
+            f"no distro profile for {family!r}@{version!r}; "
+            f"known versions for {family!r}: {known_versions}"
         ) from exc

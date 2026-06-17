@@ -232,7 +232,7 @@ def rescue_write_host(host: Host, profile: DistroProfile, deps: RescueWriteDeps,
     """
     spec = profile.rescue_image
     if spec is None:
-        raise ArchBuildError(f"distro {profile.key!r} has no rescue_image spec; cannot rescue-write")
+        raise ArchBuildError(f"distro {profile.family!r} has no rescue_image spec; cannot rescue-write")
     # TRUST GATE — must precede every mutation. A bad signature / sha raises here,
     # before enable-rescue, so nothing destructive runs against an untrusted image.
     resolved: ResolvedRescueImage = spec.resolve_and_verify(deps.resolve_deps)

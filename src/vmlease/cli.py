@@ -28,10 +28,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vmlease.rescue_image import ResolveDeps
@@ -50,11 +50,19 @@ from vmlease.battery import (
     structural_violations,
 )
 from vmlease.capabilities import canonical_requires
-from vmlease.distro import DEFAULT_DISTRO_KEYS, UnknownDistroError, get_profile
+from vmlease.distro import (
+    DEFAULT_FAMILIES,
+    ROLLING,
+    UnknownDistroError,
+    get_profile,
+    host_base_name,
+)
+from vmlease.hosts import HostListError, parse, resolve
 from vmlease.imagecache import (
     LABEL_CACHE_KEY,
     LABEL_DISTRO,
     LABEL_REQUIRES_HASH,
+    LABEL_VERSION,
     base_fingerprint,
     cache_labels,
     content_key_from_base_fp,
@@ -64,14 +72,14 @@ from vmlease.imagecache import (
     superseded,
 )
 from vmlease.keypair import Keypair, KeypairError, generate_keypair
-from vmlease.model import Battery, HostRun, HostSpec, Image, UploadSpec
+from vmlease.model import Battery, HostRun, HostSpec, Image, Os, UploadSpec
 from vmlease.providers import HetznerProvider, Provider, ProviderError, ProviderQuotaError
 from vmlease.results import IncrementalResultsWriter
 from vmlease.runner import (
     TEARDOWN_WARNING_PREFIX,
     KeepPolicy,
-    Matrix,
     RescueWriter,
+    RunRequest,
     build_one_image,
     execute,
     make_snapshot_on_ready,
@@ -84,7 +92,9 @@ from vmlease.safety import (
     CostGuardError,
     ImageQuotaError,
     ImageQuotaGuard,
+    LiveRunError,
     UploadError,
+    assert_no_live_run,
     label_selector_purpose,
     make_run_id,
     reap,
@@ -103,9 +113,15 @@ from vmlease.summary import overall_exit_code, summarize_results, summary_filena
 from vmlease.workload import ProbeWorkload, Workload
 
 
-def _matrix_has_rescue_write(matrix: Matrix) -> bool:
-    """``True`` iff any distro in the matrix needs a rescue-write transform."""
-    return any(get_profile(k).needs_rescue_write for k in matrix.distro_keys)
+def _format_os(os: Os) -> str:
+    """Render a host's ``os`` for the plan/provision display: ``family@version``,
+    or bare ``family`` for a rolling-release family (D-16)."""
+    return os.family if os.version == ROLLING else f"{os.family}@{os.version}"
+
+
+def _run_has_rescue_write(req: RunRequest) -> bool:
+    """``True`` iff any host in the run needs a rescue-write transform."""
+    return any(get_profile(h.os.family, h.os.version).needs_rescue_write for h in req.hosts)
 
 
 def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: str) -> RescueWriter:
@@ -127,18 +143,18 @@ def _build_rescue_writer(keypair: Keypair, ssh_key_name: str, rescue_key_path: s
     return build_live_rescue_writer(rescue_key_path, ssh_key_name, keyring_path)
 
 
-def _build_run_resolve_deps(matrix: Matrix, keypair: Keypair) -> ResolveDeps:
+def _build_run_resolve_deps(req: RunRequest, keypair: Keypair) -> ResolveDeps:
     """Build the run's cache-lookup ``ResolveDeps`` (the keyring only when needed).
 
-    Mirrors ``build-image``'s deps construction but keyed on the matrix: the pinned
-    ``arch-boxes`` keyring is set up ONLY when the matrix contains a rescue-write
-    distro (a native-only matrix never touches gpg). The keyring lives under the
+    Mirrors ``build-image``'s deps construction but keyed on the run: the pinned
+    ``arch-boxes`` keyring is set up ONLY when the run contains a rescue-write
+    distro (a native-only run never touches gpg). The keyring lives under the
     per-run keypair's directory (it exists by now — the cache lookup is
     provision-time, after the keypair is generated). The deps feed the advisory
     cache lookup; a resolve failure inside it degrades to the cold path (G9).
     """
     keyring_path = str(keypair.directory / "arch-boxes.gpg")
-    if _matrix_has_rescue_write(matrix):
+    if _run_has_rescue_write(req):
         ensure_arch_keyring(keyring_path, live_subprocess_run)
     return build_live_resolve_deps(keyring_path)
 
@@ -157,21 +173,24 @@ def _parse_upload(value: str) -> UploadSpec:
     return UploadSpec(local=local, remote=remote)
 
 
-def _matrix_from_args(
+def _run_request_from_args(
     args: argparse.Namespace,
     workload: Workload,
     requires: tuple[str, ...] = (),
-) -> Matrix:
-    distro_keys = tuple(k.strip() for k in args.distros.split(",") if k.strip())
-    uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
-    return Matrix(
-        workload=workload,
-        distro_keys=distro_keys,
+) -> RunRequest:
+    entries = parse(args.hosts)
+    resolved = resolve(
+        entries,
         server_type=args.server_type,
-        run_token=args.run_token,
         firewall=args.firewall,
-        uploads=uploads,
         requires=requires,
+    )
+    uploads = tuple(_parse_upload(v) for v in (args.upload or ()))
+    return RunRequest(
+        workload=workload,
+        hosts=tuple(resolved),
+        run_token=args.run_token,
+        uploads=uploads,
     )
 
 
@@ -184,11 +203,11 @@ def _warn_battery(battery: Battery) -> None:
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(
+        req = _run_request_from_args(
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
-        items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
+        items = plan(req, cost_guard=CostGuard(max_hosts=args.max_hosts))
+    except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     _warn_battery(battery)
@@ -196,7 +215,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     print(f"plan: {len(items)} host(s) — NOTHING PROVISIONED (dry-run)")
     for it in items:
         requires_note = f"  requires={list(it.requires)}" if it.requires else ""
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
+        print(f"  - {it.host_name}  [{_format_os(it.os)}]  {it.image}  {it.server_type}  {it.workload_summary}{requires_note}")
     return 0
 
 
@@ -211,44 +230,102 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
 def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
     try:
         battery = load_battery(Path(args.battery))
-        matrix = _matrix_from_args(
+        req = _run_request_from_args(
             args, ProbeWorkload(battery), canonical_requires(battery.requires)
         )
-        items = plan(matrix, cost_guard=CostGuard(max_hosts=args.max_hosts))
-    except (BatteryError, UnknownDistroError, CostGuardError, UploadError) as exc:
+        items = plan(req, cost_guard=CostGuard(max_hosts=args.max_hosts))
+    except (BatteryError, UnknownDistroError, HostListError, CostGuardError, UploadError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     # Resolve the keep policy from --keep (None=keep none; []=keep all; a non-empty
-    # list=keep those distros). A named subset must be a subset of the run's distros;
-    # validate BEFORE any provisioning / keypair generation so a typo costs nothing.
+    # list=bare host names and/or `family:<family>` selectors). Validate against the
+    # RESOLVED hosts (names + families) AFTER the cost guard (above), so a typo or a
+    # family absent from this run costs nothing. The `family:`-split is the CLI's
+    # job; KeepPolicy stays a pure membership test (D-7).
+    host_names = {h.name for h in req.hosts}
+    host_families = {h.os.family for h in req.hosts}
     if args.keep is None:
         keep_policy = KeepPolicy()
     elif len(args.keep) == 0:
         keep_policy = KeepPolicy(keep_all=True)
     else:
-        unknown = [d for d in args.keep if d not in matrix.distro_keys]
-        if unknown:
-            print(
-                f"error: --keep distro(s) {unknown} not in the run's distros "
-                f"{list(matrix.distro_keys)}",
-                file=sys.stderr,
-            )
-            return 2
-        keep_policy = KeepPolicy(distros=frozenset(args.keep))
-    matrix = replace(matrix, keep_policy=keep_policy)
+        keep_names: set[str] = set()
+        keep_families: set[str] = set()
+        for token in args.keep:
+            prefix, sep, rest = token.partition(":")
+            if sep and prefix == "family":
+                if rest == "":
+                    print(
+                        "error: a `family:` selector requires a family name "
+                        "(e.g. `family:ubuntu`)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if rest not in host_families:
+                    print(
+                        f"error: --keep `family:{rest}` matched no host in the run; "
+                        f"eligible host names: {sorted(host_names)} "
+                        f"(or keep a whole family with `family:<family>`)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                keep_families.add(rest)
+            elif sep:
+                print(
+                    f"error: --keep selector {token!r} is unrecognized; use a bare "
+                    f"host name or `family:<family>`. eligible host names: "
+                    f"{sorted(host_names)}",
+                    file=sys.stderr,
+                )
+                return 2
+            elif token not in host_names:
+                print(
+                    f"error: --keep {token!r} matched no host name in the run; "
+                    f"eligible host names: {sorted(host_names)} "
+                    f"(or keep a whole family with `family:<family>`)",
+                    file=sys.stderr,
+                )
+                return 2
+            else:
+                keep_names.add(token)
+        keep_policy = KeepPolicy(names=frozenset(keep_names), families=frozenset(keep_families))
+    req = replace(req, keep_policy=keep_policy)
 
     _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
+
+    # Cross-run safety pre-flight (D-17): refuse to start if this run-token already
+    # has live hosts (a shared token would collide on server_names and the
+    # label-keyed teardown could destroy the other run's hosts). Runs AFTER the pure
+    # local checks (battery / cost-guard / --keep / dup-name) and BEFORE the billing
+    # confirm — the first provider call (a read). A LiveRunError → exit 2 (fail
+    # closed); a ProviderError (liveness unverifiable) → exit 1 (never fail-open).
+    run_id = make_run_id(args.run_token)
+    provider = HetznerProvider()
+    try:
+        assert_no_live_run(provider, run_id, args.run_token)
+    except LiveRunError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
         requires_note = f"  requires={list(it.requires)}" if it.requires else ""
-        print(f"  - {it.host_name}  [{it.distro_key}]  {it.image}  {it.server_type}{requires_note}")
+        print(f"  - {it.host_name}  [{_format_os(it.os)}]  {it.image}  {it.server_type}{requires_note}")
     if not _confirm("Proceed with provisioning? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0
 
     if keep_policy.any_kept:
+        # Echo the RESOLVED kept-set (names + count) before provisioning, even under
+        # --yes (it rides the billing confirm interactively; prints regardless) so the
+        # kept set is always visible before spend (D-7).
+        kept_names = [h.name for h in req.hosts if keep_policy.keeps(h.name, h.os.family)]
+        print(f"keep: {len(kept_names)} host(s) will be left LIVE after the run: {kept_names}")
         if not _confirm(
             "--keep: host(s) will be left RUNNING and BILLABLE after the run and must be "
             f"reaped manually (`vmlease reap --run-token {args.run_token}`). Continue? [y/N]: ",
@@ -267,25 +344,22 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
                 file=sys.stderr,
             )
 
-    run_id = make_run_id(args.run_token)
     try:
         keypair = generate_keypair(run_id)
     except KeypairError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    provider = HetznerProvider()
-
     def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
         return OpenSshRunner(operator, keypair.private_key_path, probe_timeout_default=args.probe_timeout)
 
-    # A rescue-writer is only built when the matrix contains a needs_rescue_write
+    # A rescue-writer is only built when the run contains a needs_rescue_write
     # distro (e.g. arch); it transforms the base host into the target distro
     # before probing. It needs the REGISTERED ssh key (name + local private half)
     # for root access into the rescue system — distinct from the throwaway probe
     # key. Both must be present, or the rescue SSH cannot authenticate.
     rescue_writer = None
-    if _matrix_has_rescue_write(matrix):
+    if _run_has_rescue_write(req):
         if not args.ssh_key or not args.ssh_key_path:
             print(
                 "error: a rescue-write distro (e.g. arch) requires --ssh-key "
@@ -299,10 +373,10 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
         rescue_writer = _build_rescue_writer(keypair, args.ssh_key, args.ssh_key_path)
 
     # The cache is ADVISORY: build the run's resolve deps (sets up the pinned arch
-    # keyring only when the matrix has a rescue-write distro — a native-only matrix
+    # keyring only when the run has a rescue-write distro — a native-only run
     # never touches gpg) and let execute() try a cached snapshot per host, falling
     # back to the cold path on any miss/failure. run NEVER builds (D3).
-    resolve_deps = _build_run_resolve_deps(matrix, keypair)
+    resolve_deps = _build_run_resolve_deps(req, keypair)
 
     writer = IncrementalResultsWriter(Path(args.results_dir), run_id, args.timestamp)
 
@@ -312,7 +386,7 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
 
     try:
         host_runs = execute(
-            matrix, provider, _ssh_factory, keypair, args.operator,
+            req, provider, _ssh_factory, keypair, args.operator,
             cost_guard=CostGuard(max_hosts=args.max_hosts), rescue_writer=rescue_writer,
             max_parallel=args.parallel, on_host_complete=_persist,
             resolve_deps=resolve_deps, reap_bad_cache_image=args.reap_bad_cache_image,
@@ -466,9 +540,18 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     # type, and validate the rescue key BEFORE any keypair/provisioning (do NOT copy
     # run's post-confirm ordering — a rescue-write build with no key creates nothing).
     try:
-        profile = get_profile(args.distro)
+        entries = parse(args.distro)
+        if len(entries) != 1 or entries[0].name is not None:
+            print(
+                "error: build-image --distro takes a single `family[@version]` "
+                "(no name=, no comma)",
+                file=sys.stderr,
+            )
+            return 2
+        entry = entries[0]
+        profile = get_profile(entry.family, entry.version)
         CostGuard().check([args.server_type])
-    except (UnknownDistroError, CostGuardError) as exc:
+    except (UnknownDistroError, HostListError, CostGuardError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if profile.needs_rescue_write and not (args.ssh_key and args.ssh_key_path):
@@ -519,6 +602,20 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
         print(f"already cached (key {key}); nothing to do")
         return 0
 
+    # Cross-run safety pre-flight (D-17): refuse to start if this run-token already
+    # has live hosts. Placed AFTER the idempotent no-op (a cached build is a free
+    # no-op and must not do a needless live read) and BEFORE the quota/prune/confirm
+    # block. LiveRunError → exit 2 (fail closed); ProviderError → exit 1 (never
+    # fail-open).
+    try:
+        assert_no_live_run(provider, run_id, args.run_token)
+    except LiveRunError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     # Quota + D8(B) prune ordering. S = same-(distro, arch, requires-hash) cache
     # images whose key differs from K_new (this group's superseded predecessors).
     # The required-capability set is part of the group identity (D-D correction),
@@ -527,7 +624,8 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     same_group = [
         img
         for img in images
-        if img.labels.get(LABEL_DISTRO) == profile.key
+        if img.labels.get(LABEL_DISTRO) == profile.family
+        and img.labels.get(LABEL_VERSION, "") == profile.version
         and img.arch == arch
         and img.labels.get(LABEL_REQUIRES_HASH, "") == group_requires_hash
     ]
@@ -552,9 +650,13 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
             print(f"error: pre-build prune failed, aborting before provisioning: {exc}", file=sys.stderr)
             return 1
 
-    # Confirm-before-create (the builder is billable).
-    print(f"about to PROVISION 1 builder host (billable) for {args.distro} (key {key})")
-    print(f"  - {args.server_type}  {profile.default_image}  arch={arch}")
+    # Confirm-before-create (the builder is billable). The build identity is the
+    # resolved (family, version); the builder name uses the versionflat form so it
+    # stays a clean RFC1123 label (e.g. ``vmlease-<run>-build-ubuntu-2204``).
+    build_os = Os(profile.family, profile.version)
+    build_comp = host_base_name(profile.family, profile.version)
+    print(f"about to PROVISION 1 builder host (billable) for {_format_os(build_os)} (key {key})")
+    print(f"  - {args.server_type}  {profile.image}  arch={arch}")
     if not _confirm("Proceed with the build? [y/N]: ", assume_yes=args.yes, reader=reader):
         print("aborted — nothing provisioned.")
         return 0
@@ -573,17 +675,19 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
         def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
             return OpenSshRunner(operator, keypair.private_key_path)
 
+        build_name = f"vmlease-{run_id}-build-{build_comp}"
         spec = HostSpec(
-            name=f"vmlease-{run_id}-build-{args.distro}",
-            image=profile.default_image,
+            name=build_name,
+            image=profile.image,
             server_type=args.server_type,
-            distro_key=args.distro,
+            os=build_os,
+            server_name=build_name,
             labels=run_label(run_id),
             firewall=args.firewall,
             requires=requires,
         )
         on_ready = make_snapshot_on_ready(
-            description=f"vmlease cache {args.distro} {key}",
+            description=f"vmlease cache {_format_os(build_os)} {key}",
             labels=cache_labels(profile, arch, key, base_fp, args.run_token, requires),
             sleep=time.sleep,
         )
@@ -754,7 +858,7 @@ def _reap_images_superseded_set(
     needs_keyring = any(
         get_profile(img.labels.get(LABEL_DISTRO, "")).needs_rescue_write
         for img in images
-        if img.labels.get(LABEL_DISTRO, "") in DEFAULT_DISTRO_KEYS
+        if img.labels.get(LABEL_DISTRO, "") in DEFAULT_FAMILIES
     )
     keyring_dir = _NoKeypairDir()
     try:
@@ -964,9 +1068,42 @@ def _print_lint_summary(findings: tuple[ShellcheckFinding, ...], severity: str) 
     print(f"summary: {parts} (threshold: {severity})")
 
 
-def _add_matrix_args(sp: argparse.ArgumentParser) -> None:
+class _DeprecatedDistrosAction(argparse.Action):
+    """``--distros`` alias for ``--hosts`` (shared ``dest``): stores the value and
+    emits a **one-time** stderr deprecation notice. Because the dest is shared,
+    supplying both ``--hosts`` and ``--distros`` is last-wins automatically.
+    """
+
+    _warned: bool
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        if not getattr(self, "_warned", False):
+            print(
+                "warning: --distros is deprecated; use --hosts "
+                "(same grammar: [name=]family[@version], comma-separated)",
+                file=sys.stderr,
+            )
+            self._warned = True
+        setattr(namespace, self.dest, values)
+
+
+def _add_run_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--battery", required=True, help="path to the battery.toml manifest (the TOML bundle)")
-    sp.add_argument("--distros", default=",".join(DEFAULT_DISTRO_KEYS), help="comma-separated distro keys")
+    sp.add_argument(
+        "--hosts", dest="hosts", default=",".join(DEFAULT_FAMILIES),
+        help="comma-separated host list, each '[name=]family[@version]' "
+        "(default: the four bare families)",
+    )
+    sp.add_argument(
+        "--distros", dest="hosts", action=_DeprecatedDistrosAction,
+        help="deprecated alias for --hosts (same grammar)",
+    )
     sp.add_argument("--server-type", default="cpx22", help="instance size (default: cpx22)")
     sp.add_argument("--max-hosts", type=int, default=DEFAULT_MAX_HOSTS, help="cost-guard host cap")
     sp.add_argument("--run-token", required=True, help="determinism seam for the run-id")
@@ -984,11 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     plan_p = sub.add_parser("plan", help="dry-run: show what would be provisioned (zero provider calls)")
-    _add_matrix_args(plan_p)
+    _add_run_args(plan_p)
     plan_p.set_defaults(func=_cmd_plan)
 
     run_p = sub.add_parser("run", help="provision -> probe -> tear down (billable; confirm-gated)")
-    _add_matrix_args(run_p)
+    _add_run_args(run_p)
     run_p.add_argument("--operator", default="probe", help="non-root operator account on each host")
     run_p.add_argument("--results-dir", required=True, help="dir to write the timestamped results JSON")
     run_p.add_argument("--timestamp", required=True, help="results timestamp (caller-supplied; determinism seam)")
@@ -1010,10 +1147,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--yes", action="store_true", help="skip the confirm-before-create prompt")
     run_p.add_argument(
-        "--keep", nargs="*", default=None, metavar="DISTRO",
+        "--keep", nargs="*", default=None, metavar="HOST",
         help="leave provisioned host(s) RUNNING (billable) after the run and print how to SSH in; "
-        "bare `--keep` keeps ALL hosts, `--keep arch debian` keeps only those distros (each must be "
-        "in --distros); reap with `vmlease reap --run-token <token>` when done",
+        "bare `--keep` keeps ALL hosts, `--keep <name>` keeps that host, `--keep family:<family>` "
+        "keeps every host of that family (each must be in the run); reap with "
+        "`vmlease reap --run-token <token>` when done",
     )
     run_p.add_argument(
         "--reap-bad-cache-image", action="store_true",
@@ -1025,7 +1163,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_p = sub.add_parser(
         "build-image", help="build a content-addressed snapshot cache image (billable; confirm-gated)"
     )
-    build_p.add_argument("--distro", required=True, help="distro key to build a cache image for (e.g. ubuntu, arch)")
+    build_p.add_argument("--distro", required=True, help="family[@version] to build a cache image for (bare family -> its default version; e.g. ubuntu, ubuntu@22.04, arch)")
     build_p.add_argument(
         "--requires", action="append", metavar="CAPABILITY",
         help="vmlease-provided capability to bake into this variant (e.g. docker); "
@@ -1091,7 +1229,7 @@ def build_parser() -> argparse.ArgumentParser:
         "reap-images", help="reap cached snapshot images by --distro / --older-than / --superseded (best-effort)"
     )
     reap_images_p.add_argument(
-        "--distro", default="", help="scope to cached images of this distro key (an explicit per-distro cache clear)"
+        "--distro", default="", help="scope to all cached images of this family, every version (an explicit per-family cache clear)"
     )
     reap_images_p.add_argument(
         "--older-than", default="",

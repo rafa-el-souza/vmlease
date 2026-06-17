@@ -6,6 +6,7 @@ stdlib unittest only. Run with:
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -33,6 +34,7 @@ from vmlease import (
     cli,
     cloudinit,
     distro,
+    hosts,
     imagecache,
     keypair,
     model,
@@ -235,6 +237,31 @@ def _demo_workload() -> workload.ProbeWorkload:
     return workload.ProbeWorkload(_resolve_toml(_DEMO_BATTERY))
 
 
+def _run_request(
+    workload_: workload.Workload,
+    distros: tuple[str, ...],
+    server_type: str = "cpx22",
+    run_token: str = "t",
+    *,
+    firewall: str = "",
+    requires: tuple[str, ...] = (),
+    keep_policy: runner.KeepPolicy | None = None,
+    uploads: tuple[model.UploadSpec, ...] = (),
+) -> runner.RunRequest:
+    """Build a :class:`~vmlease.runner.RunRequest` from a list of distro families
+    via the real expander (parse → resolve), mirroring the old positional signature
+    so runner/CLI tests migrate mechanically. Each ``distros``
+    item is a ``--hosts`` entry string (``family`` or ``family@version``)."""
+    resolved = hosts.resolve(
+        hosts.parse(",".join(distros)),
+        server_type=server_type, firewall=firewall, requires=requires,
+    )
+    return runner.RunRequest(
+        workload=workload_, hosts=tuple(resolved), run_token=run_token,
+        uploads=uploads, keep_policy=keep_policy or runner.KeepPolicy(),
+    )
+
+
 def _fake_keypair(tmp: Path) -> keypair.Keypair:
     d = tmp / "kp"
     d.mkdir(parents=True, exist_ok=True)
@@ -349,6 +376,250 @@ class TestModel(unittest.TestCase):
         self.assertEqual([p.id for p in b.probes], ["SETUP", "VERIFY"])
 
 
+class TestOsAndResolvedHost(unittest.TestCase):
+    def test_os_is_hashable_and_immutable(self) -> None:
+        os1 = model.Os("ubuntu", "24.04")
+        # usable as a dict key (hashable)
+        d = {os1: "x"}
+        self.assertEqual(d[model.Os("ubuntu", "24.04")], "x")
+        # immutable (NamedTuple) — field assignment raises
+        with self.assertRaises(AttributeError):
+            os1.family = "debian"  # type: ignore[misc]
+        self.assertEqual((os1.family, os1.version), ("ubuntu", "24.04"))
+
+    def test_resolved_host_is_frozen_and_constructs(self) -> None:
+        rh = model.ResolvedHost(
+            name="api", os=model.Os("ubuntu", "24.04"),
+            image="ubuntu-24.04", server_type="cpx22",
+        )
+        self.assertEqual(rh.name, "api")
+        self.assertEqual(rh.os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(rh.firewall, "")
+        self.assertEqual(rh.requires, ())
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            rh.name = "other"  # type: ignore[misc]
+
+    def test_hostspec_constructs_with_os_and_server_name(self) -> None:
+        spec = model.HostSpec(
+            name="vmlease-r-ubuntu", image="ubuntu-24.04",
+            server_type="cpx22", os=model.Os("ubuntu", "24.04"),
+            server_name="vmlease-r-ubuntu",
+        )
+        self.assertEqual(spec.os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(spec.server_name, "vmlease-r-ubuntu")
+        self.assertEqual(spec.family, "ubuntu")
+
+    def test_hostspec_family_property_reads_os_family(self) -> None:
+        spec = model.HostSpec(
+            name="api", image="ubuntu-24.04", server_type="cpx22",
+            os=model.Os("ubuntu", "24.04"),
+            server_name="vmlease-r-api",
+        )
+        self.assertEqual(spec.family, "ubuntu")
+        self.assertEqual(spec.server_name, "vmlease-r-api")
+
+    def test_planitem_constructs_with_os(self) -> None:
+        item = model.PlanItem(
+            host_name="api", image="ubuntu-24.04", server_type="cpx22",
+            os=model.Os("ubuntu", "24.04"), workload_summary="probes=3",
+        )
+        self.assertEqual(item.os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(item.os.family, "ubuntu")
+
+
+class TestHostsParse(unittest.TestCase):
+    def test_bare_family(self) -> None:
+        self.assertEqual(hosts.parse("ubuntu"), [hosts.HostEntry(None, "ubuntu", None)])
+
+    def test_name_prefix(self) -> None:
+        self.assertEqual(hosts.parse("api=ubuntu"), [hosts.HostEntry("api", "ubuntu", None)])
+
+    def test_version_suffix(self) -> None:
+        self.assertEqual(hosts.parse("ubuntu@22.04"), [hosts.HostEntry(None, "ubuntu", "22.04")])
+
+    def test_name_and_version(self) -> None:
+        self.assertEqual(
+            hosts.parse("api=ubuntu@22.04"), [hosts.HostEntry("api", "ubuntu", "22.04")]
+        )
+
+    def test_comma_separates_two_entries(self) -> None:
+        self.assertEqual(
+            hosts.parse("ubuntu,debian"),
+            [hosts.HostEntry(None, "ubuntu", None), hosts.HostEntry(None, "debian", None)],
+        )
+
+    def test_no_grouping_shorthand_is_two_entries(self) -> None:
+        # The comma is the entry separator: "ubuntu@22.04,24.04" is TWO entries
+        # (the bogus "24.04" family is rejected later, at resolve — not here).
+        self.assertEqual(
+            hosts.parse("ubuntu@22.04,24.04"),
+            [hosts.HostEntry(None, "ubuntu", "22.04"), hosts.HostEntry(None, "24.04", None)],
+        )
+
+    def test_split_on_first_delimiters(self) -> None:
+        # split on FIRST '=' then FIRST '@'
+        self.assertEqual(
+            hosts.parse("a=b=c"), [hosts.HostEntry("a", "b=c", None)]
+        )
+        self.assertEqual(
+            hosts.parse("ubuntu@22@04"), [hosts.HostEntry(None, "ubuntu", "22@04")]
+        )
+
+    def test_empty_string_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("")
+
+    def test_double_comma_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("ubuntu,,debian")
+
+    def test_trailing_comma_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("ubuntu,")
+
+    def test_empty_family_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("@22.04")
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("name=@22.04")
+
+    def test_empty_version_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("ubuntu@")
+
+    def test_empty_name_errors(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.parse("=ubuntu")
+
+
+class TestHostsValidateName(unittest.TestCase):
+    def test_accepts_valid_names(self) -> None:
+        for name in ("ubuntu", "ubuntu-2204", "api", "a", "a1", "x" * 63):
+            hosts.validate_name(name)  # must not raise
+
+    def test_rejects_uppercase_and_underscore(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.validate_name("My_Host")
+
+    def test_rejects_empty(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.validate_name("")
+
+    def test_rejects_too_long(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.validate_name("x" * 64)
+
+    def test_rejects_leading_and_trailing_hyphen(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            hosts.validate_name("-ubuntu")
+        with self.assertRaises(hosts.HostListError):
+            hosts.validate_name("ubuntu-")
+
+    def test_rejects_delimiter_chars(self) -> None:
+        for name in ("a@b", "a=b", "a:b", "a,b"):
+            with self.assertRaises(hosts.HostListError):
+                hosts.validate_name(name)
+
+
+class TestHostsResolve(unittest.TestCase):
+    def _resolve(
+        self,
+        spec: str,
+        *,
+        server_type: str = "cpx22",
+        firewall: str = "",
+        requires: tuple[str, ...] = (),
+    ) -> list[model.ResolvedHost]:
+        return hosts.resolve(
+            hosts.parse(spec), server_type=server_type, firewall=firewall, requires=requires
+        )
+
+    def test_same_family_version_repeated_gets_index(self) -> None:
+        out = self._resolve("arch,arch,arch")
+        self.assertEqual([h.name for h in out], ["arch-1", "arch-2", "arch-3"])
+        for h in out:
+            self.assertEqual(h.os, model.Os("arch", distro.ROLLING))
+
+    def test_bare_family_keeps_bare_name(self) -> None:
+        out = self._resolve("ubuntu")
+        self.assertEqual([h.name for h in out], ["ubuntu"])
+        self.assertEqual(out[0].os, model.Os("ubuntu", "24.04"))
+
+    def test_bare_beside_versioned_sibling_disambiguates_by_version(self) -> None:
+        # Fork-B case A: default 24.04 → ubuntu-2404, ubuntu-2204.
+        out = self._resolve("ubuntu,ubuntu@22.04")
+        self.assertEqual([h.name for h in out], ["ubuntu-2404", "ubuntu-2204"])
+        self.assertEqual(out[0].os, model.Os("ubuntu", "24.04"))
+        self.assertEqual(out[1].os, model.Os("ubuntu", "22.04"))
+
+    def test_same_version_repeated_gets_index(self) -> None:
+        # Fork-B case B: both resolve to (ubuntu,22.04) → ubuntu-2204-1/-2.
+        out = self._resolve("ubuntu@22.04,ubuntu@22.04")
+        self.assertEqual([h.name for h in out], ["ubuntu-2204-1", "ubuntu-2204-2"])
+
+    def test_explicit_names_verbatim_no_index(self) -> None:
+        out = self._resolve("api=ubuntu@24.04,worker=ubuntu@24.04")
+        self.assertEqual([h.name for h in out], ["api", "worker"])
+        for h in out:
+            self.assertEqual(h.os, model.Os("ubuntu", "24.04"))
+
+    def test_bad_family_from_grouping_shorthand_raises(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("ubuntu@22.04,24.04")
+
+    def test_explicit_invalid_name_raises_no_specs(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("My_Host=ubuntu")
+
+    def test_explicit_name_collision_raises(self) -> None:
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("api=ubuntu,api=debian")
+
+    def test_image_baked_and_run_wide_attrs_stamped(self) -> None:
+        out = self._resolve(
+            "ubuntu@22.04", server_type="cpx31", firewall="fw1", requires=("docker",)
+        )
+        self.assertEqual(out[0].image, "ubuntu-22.04")
+        self.assertEqual(out[0].server_type, "cpx31")
+        self.assertEqual(out[0].firewall, "fw1")
+        self.assertEqual(out[0].requires, ("docker",))
+
+    def test_unknown_version_raises(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("ubuntu@99.99")
+
+    def test_shadow_name_cross_family_rejected(self) -> None:
+        # a debian host named `ubuntu` is a name/family collision → rejected
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("ubuntu=debian")
+
+    def test_default_family_host_not_shadow_rejected(self) -> None:
+        # name == its OWN family is allowed (today's default `ubuntu` host)
+        out = self._resolve("ubuntu")
+        self.assertEqual(out[0].name, "ubuntu")
+
+    def test_explicit_name_equal_own_family_allowed(self) -> None:
+        # `ubuntu=ubuntu@22.04` — name `ubuntu` == its family `ubuntu` → allowed
+        out = self._resolve("ubuntu=ubuntu@22.04")
+        self.assertEqual(out[0].name, "ubuntu")
+        self.assertEqual(out[0].os, model.Os("ubuntu", "22.04"))
+
+    def test_rolling_family_explicit_rolling_version_rejected(self) -> None:
+        # D-4 / distro-profiles spec: `arch@<anything>` SHALL be an error — even the
+        # rolling sentinel, which is in the registry but must not be given explicitly.
+        with self.assertRaises(hosts.HostListError):
+            self._resolve("arch@rolling")
+
+    def test_bare_rolling_family_resolves(self) -> None:
+        out = self._resolve("arch")
+        self.assertEqual(out[0].os, model.Os("arch", distro.ROLLING))
+
+    def test_rolling_family_versioned_rejected(self) -> None:
+        # an explicit numbered version on a rolling family is a registry miss
+        with self.assertRaises(distro.UnknownDistroError):
+            self._resolve("arch@24.04")
+
+
 # --------------------------------------------------------------------------- #
 # safety
 # --------------------------------------------------------------------------- #
@@ -418,7 +689,8 @@ class TestProviderArgv(unittest.TestCase):
     def _spec(self) -> model.HostSpec:
         return model.HostSpec(
             name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22",
-            distro_key="ubuntu", labels={"vmlease": "r1", "a": "b"},
+            os=model.Os("ubuntu", ""), server_name="",
+            labels={"vmlease": "r1", "a": "b"},
         )
 
     def test_create_argv_firewall_present_and_absent(self) -> None:
@@ -426,7 +698,8 @@ class TestProviderArgv(unittest.TestCase):
         self.assertNotIn("--firewall", providers.build_create_argv(self._spec(), "/tmp/c"))
         # firewall set -> --firewall <name> present
         fw_spec = model.HostSpec(
-            name="n", image="i", server_type="cpx22", distro_key="ubuntu",
+            name="n", image="i", server_type="cpx22",
+            os=model.Os("ubuntu", ""), server_name="n",
             labels={"vmlease": "r1"}, firewall="my-firewall",
         )
         argv = providers.build_create_argv(fw_spec, "/tmp/c")
@@ -441,6 +714,22 @@ class TestProviderArgv(unittest.TestCase):
         self.assertIn("--user-data-from-file", argv)
         self.assertEqual(argv[argv.index("--user-data-from-file") + 1], "/tmp/cloud.init")
 
+    def test_create_argv_uses_server_name_when_set(self) -> None:
+        spec = model.HostSpec(
+            name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+            os=model.Os("ubuntu", ""), labels={"vmlease": "r1"},
+            server_name="vmlease-x-ubuntu",
+        )
+        argv = providers.build_create_argv(spec, "/tmp/c")
+        self.assertEqual(argv[argv.index("--name") + 1], "vmlease-x-ubuntu")
+
+    def test_create_argv_uses_server_name_verbatim(self) -> None:
+        # --name is exactly spec.server_name (no fallback to spec.name).
+        spec = self._spec()
+        self.assertEqual(spec.server_name, "")
+        argv = providers.build_create_argv(spec, "/tmp/c")
+        self.assertEqual(argv[argv.index("--name") + 1], "")
+
     def test_delete_and_list_argv(self) -> None:
         host = model.Host(id="42", name="n", ipv4="1.2.3.4")
         self.assertEqual(providers.build_delete_argv(host), ["hcloud", "server", "delete", "42"])
@@ -452,6 +741,19 @@ class TestProviderArgv(unittest.TestCase):
         host = providers.parse_create_text(out, "vmlease-r1-arch", {"vmlease": "r1"})
         self.assertEqual((host.id, host.ipv4, host.name), ("12345678", "123.0.0.1", "vmlease-r1-arch"))
         self.assertEqual(host.labels, {"vmlease": "r1"})
+
+    def test_host_name_is_spec_name_after_parse(self) -> None:
+        # the caller passes spec.name to parse_create_text, so Host.name is the
+        # bare identity (unchanged by the server_name plumbing).
+        spec = model.HostSpec(
+            name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+            os=model.Os("ubuntu", ""), labels={"vmlease": "r1"},
+            server_name="vmlease-x-ubuntu",
+        )
+        out = "Server 12345678 created\nIPv4: 123.0.0.1\n"
+        host = providers.parse_create_text(out, spec.name, spec.labels)
+        self.assertEqual(host.name, spec.name)
+        self.assertEqual(host.name, "ubuntu")
 
     def test_parse_create_text_missing_id(self) -> None:
         with self.assertRaises(providers.ProviderError):
@@ -602,7 +904,7 @@ class TestProviderArgv(unittest.TestCase):
 
 class TestHetznerProviderImpl(unittest.TestCase):
     def _spec(self) -> model.HostSpec:
-        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "r1"})
+        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n", labels={"vmlease": "r1"})
 
     def test_create_success(self) -> None:
         out = "Server 5 created\nIPv4: 1.1.1.1\n"
@@ -1258,6 +1560,13 @@ class TestBatteryRequiresAndPrep(unittest.TestCase):
             ))
         self.assertIn("arhc", str(ctx.exception))
 
+    def test_prep_accepts_every_known_family_key(self) -> None:
+        # the validation set is the registry FAMILIES (D-11): all four families load.
+        for family in ("ubuntu", "debian", "fedora", "arch"):
+            b = _resolve_toml(self._manifest(f"[prep.packages]\n{family} = ['''pkg''']\n"))
+            assert b.prep is not None
+            self.assertEqual(b.prep.packages[family], ("pkg",))
+
     def test_prep_setup_duplicate_id_rejected(self) -> None:
         with self.assertRaises(battery_mod.BatteryError) as ctx:
             battery_mod.parse_battery(self._manifest(
@@ -1572,8 +1881,8 @@ class TestShellcheckDriver(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestDistro(unittest.TestCase):
     def test_known_profiles(self) -> None:
-        for key in distro.DEFAULT_DISTRO_KEYS:
-            self.assertEqual(distro.get_profile(key).key, key)
+        for key in distro.DEFAULT_FAMILIES:
+            self.assertEqual(distro.get_profile(key).family, key)
 
     def test_unknown_profile_raises(self) -> None:
         with self.assertRaises(distro.UnknownDistroError):
@@ -1588,48 +1897,125 @@ class TestDistro(unittest.TestCase):
         self.assertIn("pacman -Syu", distro.system_update_command(distro.get_profile("arch")))
 
     def test_system_update_override_wins(self) -> None:
-        p = distro.DistroProfile(key="x", default_image="i", package_manager="apt", packages=("p",), system_update_override="custom-update")
+        p = distro.DistroProfile(family="x", image="i", version="", package_manager="apt", packages=("p",), system_update_override="custom-update")
         self.assertEqual(distro.system_update_command(p), "custom-update")
 
     def test_system_update_unknown_manager_raises(self) -> None:
-        p = distro.DistroProfile(key="x", default_image="i", package_manager="zypper", packages=("p",))
+        p = distro.DistroProfile(family="x", image="i", version="", package_manager="zypper", packages=("p",))
         with self.assertRaises(distro.UnknownPackageManagerError):
             distro.system_update_command(p)
 
     def test_profiles_registries_are_read_only(self) -> None:
-        # global-state hygiene: the two module-level registries are wrapped in
+        # global-state hygiene: the module-level registry is wrapped in
         # MappingProxyType — being that type IS the read-only guarantee (it has no
         # __setitem__/__delitem__, so any mutation raises at runtime). Assert the
         # type rather than attempting a mutation (which mypy --strict correctly
         # rejects on a Mapping — itself proof the static type is read-only too).
         from types import MappingProxyType
 
-        self.assertIsInstance(distro.PROFILES, MappingProxyType)
         self.assertIsInstance(distro._SYSTEM_UPDATE_BY_MANAGER, MappingProxyType)
+
+
+class TestVersionflatAndProfileShape(unittest.TestCase):
+    def test_versionflat_strips_to_digits(self) -> None:
+        self.assertEqual(distro.versionflat("22.04"), "2204")
+        self.assertEqual(distro.versionflat("12.1"), "121")
+        self.assertEqual(distro.versionflat("13"), "13")
+
+    def test_host_base_name_versioned_and_rolling(self) -> None:
+        self.assertEqual(distro.host_base_name("ubuntu", "22.04"), "ubuntu-2204")
+        self.assertEqual(distro.host_base_name("arch", distro.ROLLING), "arch")
+
+    def test_profile_exposes_family_image_version(self) -> None:
+        p = distro.DistroProfile(
+            family="ubuntu", image="ubuntu-24.04", package_manager="apt",
+            packages=("p",), version="24.04",
+        )
+        self.assertEqual(p.family, "ubuntu")
+        self.assertEqual(p.image, "ubuntu-24.04")
+        self.assertEqual(p.version, "24.04")
+
+    def test_registry_profiles_carry_versions(self) -> None:
+        self.assertEqual(distro.get_profile("ubuntu").version, "24.04")
+        self.assertEqual(distro.get_profile("debian").version, "13")
+        self.assertEqual(distro.get_profile("fedora").version, "43")
+        self.assertEqual(distro.get_profile("arch").version, distro.ROLLING)
+
+
+class TestRegistryAndGetProfile(unittest.TestCase):
+    def test_lookup_by_family_and_version(self) -> None:
+        p = distro.get_profile("ubuntu", "22.04")
+        self.assertEqual((p.family, p.version), ("ubuntu", "22.04"))
+        self.assertEqual(p.image, "ubuntu-22.04")
+
+    def test_new_sibling_versions_present(self) -> None:
+        self.assertEqual(distro.get_profile("debian", "12").image, "debian-12")
+        self.assertEqual(distro.get_profile("fedora", "44").image, "fedora-44")
+
+    def test_sibling_versions_share_package_set(self) -> None:
+        # DRY via dataclasses.replace — the package tuple is single-source.
+        self.assertEqual(
+            distro.get_profile("ubuntu", "22.04").packages,
+            distro.get_profile("ubuntu", "24.04").packages,
+        )
+
+    def test_bare_family_resolves_to_default(self) -> None:
+        self.assertIs(distro.get_profile("ubuntu"), distro.get_profile("ubuntu", "24.04"))
+        self.assertIs(distro.get_profile("debian"), distro.get_profile("debian", "13"))
+        self.assertIs(distro.get_profile("fedora"), distro.get_profile("fedora", "43"))
+
+    def test_default_is_explicit_and_order_independent(self) -> None:
+        # The default comes from the explicit _DEFAULT_VERSION table, NOT registry
+        # entry order. Rebuild the registry in a different order and assert the
+        # default-version pointer still picks 24.04.
+        reordered = {
+            ("ubuntu", "22.04"): distro._REGISTRY[("ubuntu", "22.04")],
+            ("ubuntu", "24.04"): distro._REGISTRY[("ubuntu", "24.04")],
+        }
+        default_version = distro._DEFAULT_VERSION["ubuntu"]
+        self.assertEqual(default_version, "24.04")
+        self.assertEqual(reordered[("ubuntu", default_version)].version, "24.04")
+
+    def test_arch_is_rolling_only(self) -> None:
+        self.assertEqual(distro.get_profile("arch").version, distro.ROLLING)
+        with self.assertRaises(distro.UnknownDistroError):
+            distro.get_profile("arch", "24.04")
+
+    def test_unknown_family_errors(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            distro.get_profile("plan9")
+
+    def test_unknown_version_of_known_family_errors(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError) as ctx:
+            distro.get_profile("ubuntu", "99.99")
+        # the message lists that family's known versions (helpful, fail-closed).
+        self.assertIn("ubuntu", str(ctx.exception))
+
+    def test_profiles_string_view_resolves_all_families(self) -> None:
+        self.assertEqual(distro.FAMILIES, frozenset(distro.DEFAULT_FAMILIES))
+        for family in distro.DEFAULT_FAMILIES:
+            self.assertEqual(distro.get_profile(family).family, family)
 
 
 # --------------------------------------------------------------------------- #
 # runner — build_host_specs + plan (zero provider calls)
 # --------------------------------------------------------------------------- #
 class TestRunner(unittest.TestCase):
-    def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.Matrix:
-        return runner.Matrix(
-            workload=_demo_workload(),
-            distro_keys=tuple(distros),
-            server_type="cpx22",
-            run_token="run-xyz",
-        )
+    def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.RunRequest:
+        return _run_request(_demo_workload(), tuple(distros), run_token="run-xyz")
 
     def test_build_host_specs_labels_and_names(self) -> None:
         specs = runner.build_host_specs(self._matrix())
-        self.assertEqual([s.distro_key for s in specs], ["ubuntu", "debian"])
+        self.assertEqual([s.family for s in specs], ["ubuntu", "debian"])
         for s in specs:
             self.assertEqual(s.labels, {"vmlease": "run-xyz"})
-            self.assertTrue(s.name.startswith("vmlease-run-xyz-"))
+            # name is the bare identity; the provider server_name carries the run-id.
+            self.assertTrue(s.server_name.startswith("vmlease-run-xyz-"))
             self.assertEqual(s.firewall, "")  # no firewall by default
+        self.assertEqual([s.name for s in specs], ["ubuntu", "debian"])
 
     def test_build_host_specs_threads_firewall(self) -> None:
-        m = runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-fw", firewall="my-firewall")
+        m = _run_request(_demo_workload(), ("ubuntu",), "cpx22", "run-fw", firewall="my-firewall")
         specs = runner.build_host_specs(m)
         self.assertEqual(specs[0].firewall, "my-firewall")
 
@@ -1650,15 +2036,15 @@ class TestRunner(unittest.TestCase):
             runner.plan(m, cost_guard=safety.CostGuard(max_hosts=2))
 
     def test_plan_unknown_distro(self) -> None:
-        m = runner.Matrix(workload=_demo_workload(), distro_keys=("nope",), server_type="cpx22", run_token="t-okay")
+        # the unknown family now fails at resolve (expander) time, before plan.
         with self.assertRaises(distro.UnknownDistroError):
-            runner.plan(m)
+            _run_request(_demo_workload(), ("nope",), run_token="t-okay")
 
     def test_plan_validates_good_upload(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             local = Path(d) / "w.whl"
             local.write_bytes(b"WHEEL")
-            m = runner.Matrix(
+            m = _run_request(
                 _demo_workload(), ("ubuntu",), "cpx22", "run-up",
                 uploads=(model.UploadSpec(local=local, remote="~/w.whl"),),
             )
@@ -1667,7 +2053,7 @@ class TestRunner(unittest.TestCase):
 
     def test_plan_rejects_bad_upload_source(self) -> None:
         # fail-closed: a bad upload aborts plan (zero provider calls) before spend
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu",), "cpx22", "run-up",
             uploads=(model.UploadSpec(local=Path("/no/such/file.whl"), remote="~/f.whl"),),
         )
@@ -1678,7 +2064,7 @@ class TestRunner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             local = Path(d) / "w.whl"
             local.write_bytes(b"WHEEL")
-            m = runner.Matrix(
+            m = _run_request(
                 _demo_workload(), ("ubuntu",), "cpx22", "run-up",
                 uploads=(model.UploadSpec(local=local, remote="~/../etc/x"),),
             )
@@ -1687,17 +2073,19 @@ class TestRunner(unittest.TestCase):
 
     # --- requires on the provisioning spine (group 2) -------------------- #
     def test_matrix_carries_requires_default_empty(self) -> None:
-        self.assertEqual(self._matrix().requires, ())
+        # requires now lives per-host on the resolved hosts (default empty).
+        for h in self._matrix().hosts:
+            self.assertEqual(h.requires, ())
 
     def test_matrix_carries_requires(self) -> None:
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu",), "cpx22", "run-req",
             requires=("docker",),
         )
-        self.assertEqual(m.requires, ("docker",))
+        self.assertEqual(m.hosts[0].requires, ("docker",))
 
     def test_build_host_specs_propagates_requires_to_every_host(self) -> None:
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-req",
             requires=("docker",),
         )
@@ -1709,7 +2097,7 @@ class TestRunner(unittest.TestCase):
     def test_build_host_specs_canonicalizes_requires(self) -> None:
         # build_host_specs funnels through capabilities.canonical_requires:
         # order + duplicates collapse to the single canonical tuple.
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu",), "cpx22", "run-req",
             requires=("docker", "docker"),
         )
@@ -1722,16 +2110,16 @@ class TestRunner(unittest.TestCase):
     def test_build_host_specs_stamps_keep_label_per_distro(self) -> None:
         # A per-distro KeepPolicy stamps LABEL_KEEP on ONLY the kept distro's spec;
         # the non-kept distro's labels carry the run label but no keep marker.
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
-            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+            keep_policy=runner.KeepPolicy(families=frozenset({"ubuntu"})),
         )
-        by_distro = {s.distro_key: s for s in runner.build_host_specs(m)}
-        self.assertIn(safety.LABEL_KEEP, by_distro["ubuntu"].labels)  # kept → stamped
-        self.assertNotIn(safety.LABEL_KEEP, by_distro["debian"].labels)  # not kept → unstamped
+        by_family = {s.family: s for s in runner.build_host_specs(m)}
+        self.assertIn(safety.LABEL_KEEP, by_family["ubuntu"].labels)  # kept → stamped
+        self.assertNotIn(safety.LABEL_KEEP, by_family["debian"].labels)  # not kept → unstamped
 
     def test_build_host_specs_deterministic_with_requires(self) -> None:
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
             requires=("docker",),
         )
@@ -1745,7 +2133,7 @@ class TestRunner(unittest.TestCase):
     def test_plan_surfaces_requires_and_no_provider_calls(self) -> None:
         # plan takes no provider (zero provider calls structurally) and surfaces
         # the host's requires on every PlanItem.
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-req",
             requires=("docker",),
         )
@@ -1759,12 +2147,257 @@ class TestRunner(unittest.TestCase):
             self.assertEqual(it.requires, ())
 
 
+class TestCutover(unittest.TestCase):
+    def test_build_host_specs_derives_server_name_and_bare_name(self) -> None:
+        req = _run_request(_demo_workload(), ("ubuntu", "ubuntu@22.04"), run_token="run-ct")
+        specs = runner.build_host_specs(req)
+        run_id = safety.make_run_id("run-ct")
+        self.assertEqual([s.name for s in specs], ["ubuntu-2404", "ubuntu-2204"])
+        self.assertEqual(
+            [s.server_name for s in specs],
+            [f"vmlease-{run_id}-ubuntu-2404", f"vmlease-{run_id}-ubuntu-2204"],
+        )
+        # os is set per-host; image is baked (no re-resolution)
+        self.assertEqual(specs[1].os, model.Os("ubuntu", "22.04"))
+        self.assertEqual(specs[1].image, "ubuntu-22.04")
+
+    def test_build_host_specs_duplicate_bare_name_fails_closed(self) -> None:
+        # the expander guarantees uniqueness; build_host_specs is the backstop —
+        # construct duplicate ResolvedHosts directly to exercise it.
+        dup = model.ResolvedHost(name="dup", os=model.Os("ubuntu", "24.04"),
+                                 image="ubuntu-24.04", server_type="cpx22")
+        req = runner.RunRequest(workload=_demo_workload(), hosts=(dup, dup), run_token="run-dup")
+        with self.assertRaises(ValueError):
+            runner.build_host_specs(req)
+
+    def test_build_host_specs_makes_no_provider_calls(self) -> None:
+        # structural: build_host_specs takes no provider parameter and returns
+        # specs from pure data — a provider is never constructed or passed.
+        import inspect
+        sig = inspect.signature(runner.build_host_specs)
+        self.assertEqual(list(sig.parameters), ["req"])
+
+
+class TestPlanRendering(unittest.TestCase):
+    def test_plan_items_carry_os(self) -> None:
+        req = _run_request(_demo_workload(), ("ubuntu@22.04", "arch"), run_token="run-os")
+        items = runner.plan(req)
+        self.assertEqual(items[0].os, model.Os("ubuntu", "22.04"))
+        self.assertEqual(items[1].os, model.Os("arch", distro.ROLLING))
+
+    def test_format_os_versioned_and_rolling(self) -> None:
+        self.assertEqual(cli._format_os(model.Os("ubuntu", "22.04")), "ubuntu@22.04")
+        self.assertEqual(cli._format_os(model.Os("arch", distro.ROLLING)), "arch")
+
+    def test_plan_render_shows_family_at_version_and_bare_rolling(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main([
+                    "plan", "--battery", battery, "--hosts", "ubuntu@22.04,ubuntu@24.04,arch",
+                    "--run-token", "cli-plan",
+                ])
+            out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        # versioned hosts (two ubuntu versions → suffixed names) → family@version
+        self.assertIn("- ubuntu-2204  [ubuntu@22.04]", out)
+        self.assertIn("- ubuntu-2404  [ubuntu@24.04]", out)
+        # rolling → bare [arch], never [arch@rolling]
+        self.assertIn("- arch  [arch]", out)
+        self.assertNotIn("@rolling", out)
+
+    def test_plan_makes_zero_provider_calls(self) -> None:
+        # plan() takes no provider parameter — structurally call-free.
+        import inspect
+        self.assertNotIn("provider", inspect.signature(runner.plan).parameters)
+
+
+class TestKeepPolicy(unittest.TestCase):
+    def test_keeps_name_hit(self) -> None:
+        p = runner.KeepPolicy(names=frozenset({"api"}))
+        self.assertTrue(p.keeps("api", "ubuntu"))
+        self.assertFalse(p.keeps("worker", "ubuntu"))
+
+    def test_keeps_family_hit(self) -> None:
+        p = runner.KeepPolicy(families=frozenset({"ubuntu"}))
+        self.assertTrue(p.keeps("ubuntu-2204", "ubuntu"))
+        self.assertFalse(p.keeps("debian", "debian"))
+
+    def test_keeps_keep_all(self) -> None:
+        p = runner.KeepPolicy(keep_all=True)
+        self.assertTrue(p.keeps("anything", "whatever"))
+        self.assertTrue(p.any_kept)
+
+    def test_keeps_miss_and_any_kept(self) -> None:
+        p = runner.KeepPolicy()
+        self.assertFalse(p.keeps("api", "ubuntu"))
+        self.assertFalse(p.any_kept)
+        self.assertTrue(runner.KeepPolicy(names=frozenset({"x"})).any_kept)
+        self.assertTrue(runner.KeepPolicy(families=frozenset({"x"})).any_kept)
+
+
+class TestLiveRunPreflight(unittest.TestCase):
+    def _provider_with_live_host(self, run_id: str) -> FakeProvider:
+        prov = FakeProvider()
+        prov.create_with_cloudinit(
+            model.HostSpec(
+                name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+                os=model.Os("ubuntu", ""), labels={safety.LABEL_KEY: run_id},
+                server_name=f"vmlease-{run_id}-ubuntu",
+            ),
+            "ci",
+        )
+        return prov
+
+    # --- safety.assert_no_live_run ---------------------------------------- #
+    def test_live_run_error_is_exception_not_value_error(self) -> None:
+        self.assertTrue(issubclass(safety.LiveRunError, Exception))
+        self.assertFalse(issubclass(safety.LiveRunError, ValueError))
+
+    def test_assert_no_live_run_raises_on_live_hosts(self) -> None:
+        run_id = safety.make_run_id("tok-live")
+        prov = self._provider_with_live_host(run_id)
+        with self.assertRaises(safety.LiveRunError) as ctx:
+            safety.assert_no_live_run(prov, run_id, "tok-live")
+        msg = str(ctx.exception)
+        self.assertIn("ubuntu", msg)  # the live host name
+        self.assertIn("vmlease reap --run-token tok-live", msg)  # the hint
+
+    def test_assert_no_live_run_clean_does_not_raise(self) -> None:
+        run_id = safety.make_run_id("tok-clean")
+        safety.assert_no_live_run(FakeProvider(), run_id, "tok-clean")  # must not raise
+
+    def test_assert_no_live_run_propagates_provider_error(self) -> None:
+        class _Boom(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("api down")
+
+        with self.assertRaises(providers.ProviderError):
+            safety.assert_no_live_run(_Boom(), "rid", "tok")
+
+    # --- _cmd_run wiring -------------------------------------------------- #
+    def _run_cmd(self, d: str, prov: FakeProvider, token: str) -> tuple[int, str, list[str]]:
+        from unittest import mock
+        battery = _write_battery_bundle(d, _DEMO_BATTERY)
+        ns = cli.build_parser().parse_args([
+            "run", "--battery", battery, "--hosts", "ubuntu",
+            "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", token, "--yes",
+        ])
+        gen_calls: list[str] = []
+
+        def _spy_keygen(rid: str) -> keypair.Keypair:
+            gen_calls.append(rid)
+            return _fake_keypair(Path(d))
+
+        err = io.StringIO()
+        with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                mock.patch.object(cli, "generate_keypair", _spy_keygen), \
+                mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli._cmd_run(ns, reader=lambda _p: "y")
+        return rc, err.getvalue(), gen_calls
+
+    def test_cmd_run_live_token_exits_2_nothing_provisioned(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            run_id = safety.make_run_id("cli-live")
+            prov = self._provider_with_live_host(run_id)
+            rc, err, gen = self._run_cmd(d, prov, token="cli-live")
+            self.assertEqual(rc, 2)
+            self.assertIn("live host", err)
+            self.assertEqual(gen, [])  # no keypair → nothing provisioned
+
+    def test_cmd_run_preflight_provider_error_exits_1(self) -> None:
+        class _Boom(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("api down")
+
+        with tempfile.TemporaryDirectory() as d:
+            rc, _err, gen = self._run_cmd(d, _Boom(), token="cli-pe")
+            self.assertEqual(rc, 1)
+            self.assertEqual(gen, [])
+
+    def test_cmd_run_clean_token_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _err, gen = self._run_cmd(d, FakeProvider(), token="cli-ok")
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(gen), 1)  # keypair generated → proceeded past pre-flight
+
+    def test_plan_command_makes_no_preflight_call(self) -> None:
+        from unittest import mock
+
+        class _NoLive(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise AssertionError("plan must make no pre-flight call")
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            with mock.patch.object(cli, "HetznerProvider", _NoLive), redirect_stdout(io.StringIO()):
+                rc = cli.main(["plan", "--battery", battery, "--hosts", "ubuntu", "--run-token", "cli-plan"])
+            self.assertEqual(rc, 0)
+
+    # --- KeptHost reattach record carries name/family/version ------------- #
+    def test_kept_host_record_carries_name_family_version(self) -> None:
+        kh = model.KeptHost(
+            name="ubuntu-2204", id="id-1", ipv4="10.0.0.1",
+            family="ubuntu", version="22.04", operator="probe", key_path="/k",
+        )
+        self.assertEqual((kh.name, kh.family, kh.version), ("ubuntu-2204", "ubuntu", "22.04"))
+
+
 # --------------------------------------------------------------------------- #
 # cli — plan subcommand (zero provider calls)
 # --------------------------------------------------------------------------- #
 class TestCli(unittest.TestCase):
     def _write_battery(self, d: str) -> str:
         return _write_battery_bundle(d, _DEMO_BATTERY)
+
+    def test_default_host_list_is_four_bare_families(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--run-token", "cli-run",
+            ])
+            req = cli._run_request_from_args(ns, _demo_workload())
+            self.assertEqual([h.name for h in req.hosts], list(distro.DEFAULT_FAMILIES))
+            self.assertEqual(tuple(h.os.family for h in req.hosts), distro.DEFAULT_FAMILIES)
+
+    def test_hosts_flag_end_to_end_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ns = cli.build_parser().parse_args([
+                "plan", "--battery", self._write_battery(d), "--run-token", "cli-run",
+                "--hosts", "api=ubuntu@24.04,debian",
+            ])
+            req = cli._run_request_from_args(ns, _demo_workload())
+            self.assertEqual([h.name for h in req.hosts], ["api", "debian"])
+            self.assertEqual(req.hosts[0].os, model.Os("ubuntu", "24.04"))
+            self.assertEqual(req.hosts[1].os, model.Os("debian", "13"))
+
+    def test_distros_alias_emits_deprecation_notice(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            ns = cli.build_parser().parse_args(["plan", "--battery", "b", "--run-token", "t", "--distros", "ubuntu"])
+        self.assertIn("--distros is deprecated", err.getvalue())
+        self.assertEqual(ns.hosts, "ubuntu")
+
+    def test_hosts_and_distros_last_wins(self) -> None:
+        # shared dest → last flag on the command line wins
+        with redirect_stderr(io.StringIO()):
+            ns1 = cli.build_parser().parse_args(
+                ["plan", "--battery", "b", "--run-token", "t", "--hosts", "ubuntu", "--distros", "debian"]
+            )
+            ns2 = cli.build_parser().parse_args(
+                ["plan", "--battery", "b", "--run-token", "t", "--distros", "debian", "--hosts", "ubuntu"]
+            )
+        self.assertEqual(ns1.hosts, "debian")  # --distros last
+        self.assertEqual(ns2.hosts, "ubuntu")  # --hosts last
+
+    def test_bad_hosts_returns_2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc = cli.main([
+                "plan", "--battery", self._write_battery(d),
+                "--hosts", "ubuntu,,debian", "--run-token", "cli-run",
+            ])
+            self.assertEqual(rc, 2)
 
     def test_plan_surfaces_lint_warnings_to_stderr(self) -> None:
         # a vacuously-ok probe → plan warns (non-fatal) on stderr, still exits 0
@@ -1789,7 +2422,9 @@ class TestCli(unittest.TestCase):
             out = buf.getvalue()
             self.assertIn("demo-battery", out)
             self.assertIn("NOTHING PROVISIONED", out)
-            self.assertIn("vmlease-cli-run-ubuntu", out)
+            # the plan shows the bare host identity (post-cutover), not the
+            # provider server name (which carries the run-id).
+            self.assertIn("- ubuntu  [ubuntu@24.04]", out)
 
     def test_plan_bad_battery_returns_2(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1827,26 +2462,27 @@ class TestCli(unittest.TestCase):
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
                 "--upload", "/a/x.whl", "--upload", "/b/y.bin:~/dest/y.bin",
             ])
-            m = cli._matrix_from_args(ns, _demo_workload())
+            m = cli._run_request_from_args(ns, _demo_workload())
             self.assertEqual(len(m.uploads), 2)
             self.assertEqual(m.uploads[0].remote, "~/x.whl")
             self.assertEqual((m.uploads[1].local, m.uploads[1].remote), (Path("/b/y.bin"), "~/dest/y.bin"))
 
-    def test_matrix_from_args_default_requires_empty(self) -> None:
+    def test_run_request_from_args_default_requires_empty(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             ns = cli.build_parser().parse_args([
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
             ])
-            self.assertEqual(cli._matrix_from_args(ns, _demo_workload()).requires, ())
+            req = cli._run_request_from_args(ns, _demo_workload())
+            self.assertEqual(req.hosts[0].requires, ())
 
-    def test_matrix_from_args_carries_requires(self) -> None:
-        # the requires arg is already canonicalized (D-I.4) and lands on Matrix.
+    def test_run_request_from_args_carries_requires(self) -> None:
+        # the requires arg is already canonicalized (D-I.4) and lands on each host.
         with tempfile.TemporaryDirectory() as d:
             ns = cli.build_parser().parse_args([
                 "plan", "--battery", self._write_battery(d), "--distros", "ubuntu", "--run-token", "cli-run",
             ])
-            m = cli._matrix_from_args(ns, _demo_workload(), ("docker",))
-            self.assertEqual(m.requires, ("docker",))
+            m = cli._run_request_from_args(ns, _demo_workload(), ("docker",))
+            self.assertEqual(m.hosts[0].requires, ("docker",))
 
     def test_plan_rejects_bad_upload_no_provider_call(self) -> None:
         # the free-plan fail-closed path: a symlink source is refused at plan,
@@ -2243,7 +2879,7 @@ class TestCloudInit(unittest.TestCase):
         self.assertIn("dnf -y install", out)
 
     def test_unknown_manager_raises(self) -> None:
-        bad = distro.DistroProfile(key="x", default_image="img", package_manager="zypper", packages=("p",))
+        bad = distro.DistroProfile(family="x", image="img", version="", package_manager="zypper", packages=("p",))
         with self.assertRaises(cloudinit.CloudInitError):
             cloudinit.render_install_block(bad, ())
 
@@ -2335,7 +2971,7 @@ class TestCloudInit(unittest.TestCase):
             def finalize_fragment(self) -> str:
                 return "does-not-exist"
 
-        bad = _BadFinalizeProfile(key="x", default_image="img", package_manager="apt", packages=("p",))
+        bad = _BadFinalizeProfile(family="x", image="img", version="", package_manager="apt", packages=("p",))
         with self.assertRaises(cloudinit.CloudInitError):
             cloudinit.render_finalize_block(bad)
 
@@ -2877,7 +3513,7 @@ def OpenSshRunnerForTest(
 class TestReap(unittest.TestCase):
     def test_reap_destroys_labeled(self) -> None:
         prov = FakeProvider()
-        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "r1"}), "ci")
+        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n", labels={"vmlease": "r1"}), "ci")
         reaped = safety.reap(prov, "r1")
         self.assertEqual(len(reaped), 1)
         self.assertEqual(len(prov.destroyed), 1)
@@ -2888,10 +3524,10 @@ class TestReap(unittest.TestCase):
         # kept host stays live (still found by list_labeled).
         prov = FakeProvider()
         prov.create_with_cloudinit(
-            HostSpec(name="keep-me", image="i", server_type="cpx22", distro_key="ubuntu",
+            HostSpec(name="keep-me", image="i", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="keep-me",
                      labels={"vmlease": "r1", safety.LABEL_KEEP: "1"}), "ci")
         prov.create_with_cloudinit(
-            HostSpec(name="reap-me", image="i", server_type="cpx22", distro_key="debian",
+            HostSpec(name="reap-me", image="i", server_type="cpx22", os=model.Os("debian", ""), server_name="reap-me",
                      labels={"vmlease": "r1"}), "ci")
         reaped = safety.reap_except_kept(prov, "r1")
         self.assertEqual([h.name for h in reaped], ["reap-me"])  # only the non-kept returned
@@ -3043,7 +3679,7 @@ class TestUploadValidation(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestResults(unittest.TestCase):
     def _run(self) -> model.HostRun:
-        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="vmlease-r1-ubuntu")
         res = (
             make_probe_result("P1", ProbeTag.READ_ONLY, 0, "ok"),
             make_probe_result("P2", ProbeTag.READ_ONLY, 124, "", "probe timed out after 5.0s", timed_out=True),
@@ -3085,11 +3721,24 @@ class TestResults(unittest.TestCase):
         self.assertEqual(doc["hosts"][0]["probes"][1]["exit_code"], 124)
         self.assertTrue(doc["hosts"][0]["probes"][1]["timed_out"])  # timed-out probe is marked in the JSON
 
+    def test_serialize_emits_name_family_version(self) -> None:
+        # D-8 raw shape: bare `name`, raw `distro` = family, plus new `version`.
+        spec = HostSpec(
+            name="ubuntu-2204", image="ubuntu-22.04", server_type="cpx22",
+            os=model.Os("ubuntu", "22.04"),
+            server_name="vmlease-r1-ubuntu-2204",
+        )
+        hr = model.HostRun(host_spec=spec, detail="ok", results=())
+        host = json.loads(results.serialize_run("r1", "TS", [hr]))["hosts"][0]
+        self.assertEqual(host["name"], "ubuntu-2204")  # bare identity
+        self.assertEqual(host["distro"], "ubuntu")      # raw distro = family (back-compat)
+        self.assertEqual(host["version"], "22.04")
+
     def test_serialize_passing_assertion_probe_carries_declared_count_true(self) -> None:
         # (7.5) DECLARED-count: a PASSING assertion probe (assertion_failures=())
         # serializes has_assertions=True and assertion_failures=[] — has_assertions
         # is the declared count, NOT derived from the (empty) failures list.
-        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="vmlease-r1-ubuntu")
         res = (make_probe_result("P1", ProbeTag.READ_ONLY, 0, "out", ok=True, has_assertions=True),)
         hr = model.HostRun(host_spec=spec, detail="ok", results=res)
         doc = json.loads(results.serialize_run("r1", "20260601T000000Z", [hr]))
@@ -3098,7 +3747,7 @@ class TestResults(unittest.TestCase):
         self.assertEqual(probe["assertion_failures"], [])
 
     def test_serialize_failing_assertion_probe_carries_failures(self) -> None:
-        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        spec = HostSpec(name="vmlease-r1-ubuntu", image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="vmlease-r1-ubuntu")
         res = (
             make_probe_result(
                 "P1", ProbeTag.READ_ONLY, 0, "out", ok=False,
@@ -3118,7 +3767,7 @@ class TestResults(unittest.TestCase):
             self.assertEqual(path.name, "vmlease-r1-20260601T000000Z.json")
 
     def _run_named(self, name: str) -> model.HostRun:
-        spec = HostSpec(name=name, image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        spec = HostSpec(name=name, image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name=name)
         return model.HostRun(host_spec=spec, detail="ok", results=())
 
     def test_incremental_writer_path_known_before_first_write(self) -> None:
@@ -3143,8 +3792,8 @@ class TestResults(unittest.TestCase):
 # runner.execute — the teardown-ALWAYS guarantee
 # --------------------------------------------------------------------------- #
 class TestExecute(unittest.TestCase):
-    def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.Matrix:
-        return runner.Matrix(_demo_workload(), distros, "cpx22", "run-xyz")
+    def _matrix(self, distros: tuple[str, ...] = ("ubuntu", "debian")) -> runner.RunRequest:
+        return _run_request(_demo_workload(), distros, "cpx22", "run-xyz")
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -3160,12 +3809,12 @@ class TestExecute(unittest.TestCase):
         # battery ran in authoring order on each host (P1 first, P12 authored last)
         self.assertEqual(fssh.ran[-1], "P12")
 
-    def _upload_matrix(self, remote: str = "~/w.whl") -> tuple[runner.Matrix, Path]:
+    def _upload_matrix(self, remote: str = "~/w.whl") -> tuple[runner.RunRequest, Path]:
         # a matrix carrying one upload; returns it plus the (real, valid) local file
         tmp = Path(tempfile.mkdtemp())
         local = tmp / "w.whl"
         local.write_bytes(b"WHEEL")
-        m = runner.Matrix(
+        m = _run_request(
             _demo_workload(), ("ubuntu",), "cpx22", "run-up",
             uploads=(model.UploadSpec(local=local, remote=remote),),
         )
@@ -3200,7 +3849,7 @@ class TestExecute(unittest.TestCase):
         prov = FakeProvider()
         # The distro-specific docker repo path (linux/<distro>) is now part of the
         # docker capability recipe, so render the docker variant to assert it.
-        m = runner.Matrix(_demo_workload(), ("debian", "ubuntu"), "cpx22", "run-xyz", requires=("docker",))
+        m = _run_request(_demo_workload(), ("debian", "ubuntu"), "cpx22", "run-xyz", requires=("docker",))
         with tempfile.TemporaryDirectory() as d:
             runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe")
         self.assertIn("linux/debian", prov.cloud_inits[0])
@@ -3246,8 +3895,8 @@ class TestExecute(unittest.TestCase):
             runs = runner.execute(self._matrix(("ubuntu", "debian")), prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe")
         self.assertEqual(len(runs), 2)  # BOTH recorded
         self.assertEqual(len(prov.destroyed), 2)  # both torn down
-        ubuntu = next(r for r in runs if r.host_spec.distro_key == "ubuntu")
-        debian = next(r for r in runs if r.host_spec.distro_key == "debian")
+        ubuntu = next(r for r in runs if r.host_spec.family == "ubuntu")
+        debian = next(r for r in runs if r.host_spec.family == "debian")
         self.assertTrue(ubuntu.results)  # ubuntu data preserved
         self.assertTrue(debian.detail.startswith("ERROR:"))  # debian error captured
 
@@ -3268,12 +3917,12 @@ class TestExecute(unittest.TestCase):
 
     def test_parallel_preserves_order_and_tears_down_all(self) -> None:
         prov = FakeProvider()
-        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-par")
+        m = _run_request(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-par")
         # a fresh FakeSshRunner per host (thread-safe-ish; each host independent)
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe", max_parallel=3)
         # results in MATRIX order regardless of completion order
-        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian", "fedora"])
+        self.assertEqual([r.host_spec.family for r in runs], ["ubuntu", "debian", "fedora"])
         self.assertEqual(len(prov.created), 3)
         self.assertEqual(len(prov.destroyed), 3)  # all torn down
 
@@ -3389,13 +4038,13 @@ class TestExecute(unittest.TestCase):
             # fedora are done — so debian's raise and fedora's clean completion both
             # land while the consumer is held, making fedora the done-but-unyielded
             # host that ONLY the abort-time drain can persist.
-            if hr.host_spec.distro_key == "ubuntu":
+            if hr.host_spec.family == "ubuntu":
                 ubuntu_done.set()
                 fedora_done.wait(timeout=5.0)
             with seen_lock:
-                seen.append(hr.host_spec.distro_key)
+                seen.append(hr.host_spec.family)
 
-        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-abort")
+        m = _run_request(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-abort")
         with tempfile.TemporaryDirectory() as d, self.assertRaises(KeyboardInterrupt):
             runner.execute(
                 m, prov, lambda _o, _k: _OrchestratedAbort(), _fake_keypair(Path(d)), "probe",
@@ -3415,10 +4064,10 @@ class TestExecute(unittest.TestCase):
             runs = runner.execute(
                 self._matrix(("ubuntu", "debian")), prov, self._factory(FakeSshRunner()),
                 _fake_keypair(Path(d)), "probe",
-                on_host_complete=lambda hr: seen.append(hr.host_spec.distro_key),
+                on_host_complete=lambda hr: seen.append(hr.host_spec.family),
             )
         self.assertEqual(seen, ["ubuntu", "debian"])  # one call per host
-        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])
+        self.assertEqual([r.host_spec.family for r in runs], ["ubuntu", "debian"])
 
     def test_parallel_on_host_complete_called_once_per_host_main_thread(self) -> None:
         # parallel path: sink fires once per host from the MAIN thread; aggregate
@@ -3430,9 +4079,9 @@ class TestExecute(unittest.TestCase):
 
         def sink(hr: model.HostRun) -> None:
             threads_seen.append(threading.current_thread() is main_thread)
-            seen.append(hr.host_spec.distro_key)
+            seen.append(hr.host_spec.family)
 
-        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-sink")
+        m = _run_request(_demo_workload(), ("ubuntu", "debian", "fedora"), "cpx22", "run-sink")
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(
                 m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe",
@@ -3440,7 +4089,7 @@ class TestExecute(unittest.TestCase):
             )
         self.assertEqual(sorted(seen), ["debian", "fedora", "ubuntu"])  # each host once
         self.assertTrue(all(threads_seen))  # all sink calls on the main thread
-        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian", "fedora"])
+        self.assertEqual([r.host_spec.family for r in runs], ["ubuntu", "debian", "fedora"])
 
     def test_parallel_one_failure_does_not_discard_others(self) -> None:
         prov = FakeProvider()
@@ -3463,14 +4112,14 @@ class TestExecute(unittest.TestCase):
             def upload_dir(self, host: Host, local: Path, remote: str) -> None:
                 return None
 
-        m = runner.Matrix(_demo_workload(), ("ubuntu", "debian"), "cpx22", "run-par2")
+        m = _run_request(_demo_workload(), ("ubuntu", "debian"), "cpx22", "run-par2")
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: _SelectiveSsh(), _fake_keypair(Path(d)), "probe", max_parallel=2)
         self.assertEqual(len(runs), 2)
         self.assertEqual(len(prov.destroyed), 2)
-        by_distro = {r.host_spec.distro_key: r for r in runs}
-        self.assertTrue(by_distro["ubuntu"].results)  # preserved
-        self.assertTrue(by_distro["debian"].detail.startswith("ERROR:"))
+        by_family = {r.host_spec.family: r for r in runs}
+        self.assertTrue(by_family["ubuntu"].results)  # preserved
+        self.assertTrue(by_family["debian"].detail.startswith("ERROR:"))
 
 
 # --------------------------------------------------------------------------- #
@@ -3500,10 +4149,10 @@ class TestWorkloadSeam(unittest.TestCase):
     def test_injected_workload_runs_once_per_host_in_matrix_order(self) -> None:
         prov = FakeProvider()
         rec = _RecordingWorkload()
-        m = runner.Matrix(rec, ("ubuntu", "debian"), "cpx22", "run-inj")
+        m = _run_request(rec, ("ubuntu", "debian"), "cpx22", "run-inj")
         with tempfile.TemporaryDirectory() as d:
             runs = runner.execute(m, prov, lambda _o, _k: FakeSshRunner(), _fake_keypair(Path(d)), "probe")
-        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])  # matrix order
+        self.assertEqual([r.host_spec.family for r in runs], ["ubuntu", "debian"])  # matrix order
         self.assertEqual(len(rec.calls), 2)  # exactly one run() per host
         self.assertEqual([n.rsplit("-", 1)[-1] for n in rec.calls], ["ubuntu", "debian"])
 
@@ -3535,14 +4184,14 @@ class TestWorkloadSeam(unittest.TestCase):
                 order.append("run")
                 return model.HostRun(host_spec=spec, detail="", results=())
 
-        m = runner.Matrix(_OrderWorkload(), ("ubuntu",), "cpx22", "run-ready")
+        m = _run_request(_OrderWorkload(), ("ubuntu",), "cpx22", "run-ready")
         with tempfile.TemporaryDirectory() as d:
             runner.execute(m, prov, lambda _o, _k: _ReadyRecordingSsh(), _fake_keypair(Path(d)), "probe")
         self.assertEqual(order, ["ready", "run"])
 
     def test_plan_renders_the_workload_summary(self) -> None:
         wl = _demo_workload()
-        items = runner.plan(runner.Matrix(wl, ("ubuntu",), "cpx22", "run-ps"))
+        items = runner.plan(_run_request(wl, ("ubuntu",), "cpx22", "run-ps"))
         self.assertEqual(items[0].workload_summary, "probes=3")
         self.assertEqual(items[0].workload_summary, wl.plan_summary)
 
@@ -3600,8 +4249,8 @@ class TestKeepFlag(unittest.TestCase):
         wl: workload.Workload | None = None,
         *,
         keep_all: bool = False,
-    ) -> runner.Matrix:
-        return runner.Matrix(
+    ) -> runner.RunRequest:
+        return _run_request(
             wl or _demo_workload(),
             distros,
             "cpx22",
@@ -3650,7 +4299,7 @@ class TestKeepFlag(unittest.TestCase):
             runs = runner.execute(m, prov, self._factory(fssh), _fake_keypair(Path(d)), "probe")
         self.assertEqual(prov.destroyed, [])  # neither host torn down
         self.assertEqual(len(runs), 2)
-        self.assertEqual([r.host_spec.distro_key for r in runs], ["ubuntu", "debian"])  # matrix order
+        self.assertEqual([r.host_spec.family for r in runs], ["ubuntu", "debian"])  # matrix order
         for r in runs:
             self.assertIn("ERROR:", r.detail)  # the workload raise mapped to error
             self.assertIn(runner.KEPT_HOST_PREFIX, r.detail)  # AND kept
@@ -3689,8 +4338,9 @@ class TestKeepFlag(unittest.TestCase):
         )
         spec = HostSpec(
             name="vmlease-build-ubuntu",
-            image=distro.get_profile("ubuntu").default_image,
-            server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "build-run"},
+            image=distro.get_profile("ubuntu").image,
+            server_type="cpx22", os=model.Os("ubuntu", ""),
+            server_name="vmlease-build-ubuntu", labels={"vmlease": "build-run"},
         )
         with tempfile.TemporaryDirectory() as d:
             runner.build_one_image(
@@ -3821,12 +4471,12 @@ class TestKeepFlag(unittest.TestCase):
             self.assertIn("not reaped", msg)  # the operator is told it was left LIVE
             self.assertIn("`vmlease reap --run-token cli-keep`", msg)  # + how to reap later
 
-    def _partial_matrix(self) -> runner.Matrix:
+    def _partial_matrix(self) -> runner.RunRequest:
         # A per-distro keep policy (only ``ubuntu`` kept) over a 2-distro run — the
         # generalization of the all-or-nothing ``_matrix(keep_all=...)`` helper.
-        return runner.Matrix(
+        return _run_request(
             _demo_workload(), ("ubuntu", "debian"), "cpx22", "run-keep",
-            keep_policy=runner.KeepPolicy(distros=frozenset({"ubuntu"})),
+            keep_policy=runner.KeepPolicy(families=frozenset({"ubuntu"})),
         )
 
     def test_partial_keep_spares_kept_distro_and_tears_down_the_rest(self) -> None:
@@ -3837,17 +4487,18 @@ class TestKeepFlag(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             kp = _fake_keypair(Path(d))
             runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
-        by_distro = {r.host_spec.distro_key: r for r in runs}
-        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-run-keep-debian"])  # only debian reaped
-        kept = by_distro["ubuntu"].kept_host
+        by_family = {r.host_spec.family: r for r in runs}
+        self.assertEqual([h.name for h in prov.destroyed], ["debian"])  # only debian reaped (bare identity)
+        kept = by_family["ubuntu"].kept_host
         self.assertIsNotNone(kept)
         assert kept is not None  # narrow for the type checker
-        self.assertEqual(kept.name, "vmlease-run-keep-ubuntu")
-        self.assertEqual(kept.distro, "ubuntu")
+        self.assertEqual(kept.name, "ubuntu")  # bare identity post-cutover
+        self.assertEqual(kept.family, "ubuntu")
+        self.assertEqual(kept.version, "24.04")
         self.assertEqual(kept.ipv4, "10.0.0.1")  # the ubuntu host's ip
         self.assertEqual(kept.operator, "probe")
         self.assertEqual(kept.key_path, str(kp.private_key_path))
-        self.assertIsNone(by_distro["debian"].kept_host)  # torn-down host → no record
+        self.assertIsNone(by_family["debian"].kept_host)  # torn-down host → no record
 
     def test_partial_keep_abort_spares_kept_host_and_backstop_reaps_the_rest(self) -> None:
         # BLOCKER generalization (F-010, per-distro): a Ctrl-C during a PARTIAL
@@ -3894,8 +4545,8 @@ class TestKeepFlag(unittest.TestCase):
                 cli._cmd_run(ns, reader=lambda _p: "n")  # reader ignored under --yes
             self.assertEqual(len(prov.created), 2)  # both distros provisioned
             destroyed = {h.name for h in prov.destroyed}
-            self.assertIn("vmlease-cli-keep-debian", destroyed)  # non-kept reaped
-            self.assertNotIn("vmlease-cli-keep-ubuntu", destroyed)  # kept SPARED despite abort
+            self.assertIn("debian", destroyed)  # non-kept reaped (bare identity)
+            self.assertNotIn("ubuntu", destroyed)  # kept SPARED despite abort
 
     def test_cli_keep_subset_validation_rejects_unknown_distro(self) -> None:
         # --keep names a distro NOT in --distros → exit 2, error names the unknown
@@ -3922,6 +4573,70 @@ class TestKeepFlag(unittest.TestCase):
             self.assertIn("fedora", err.getvalue())  # the unknown distro is named
             self.assertEqual(generated, [])  # no keypair → no provisioning
             self.assertFalse((Path(d) / "r").exists())  # no results dir created
+
+    def _keep_run(self, d: str, distros: str, keep: list[str], *, prov: FakeProvider | None = None,
+                  reader: Callable[[str], str] = lambda _p: "y") -> tuple[int, str, str, FakeProvider]:
+        """Drive `_cmd_run` with a fake provider; return (rc, stdout, stderr, prov)."""
+        from unittest import mock
+        battery = _write_battery_bundle(d, _DEMO_BATTERY)
+        ns = cli.build_parser().parse_args([
+            "run", "--battery", battery, "--hosts", distros, "--keep", *keep, "--yes",
+            "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", "cli-keep",
+        ])
+        kp = _fake_keypair(Path(d))
+        prov = prov or FakeProvider()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "generate_keypair", lambda _rid: kp), \
+                mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                redirect_stdout(out), redirect_stderr(err):
+            rc = cli._cmd_run(ns, reader=reader)
+        return rc, out.getvalue(), err.getvalue(), prov
+
+    def test_cli_keep_bare_token_keeps_only_named_host(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, _err, prov = self._keep_run(d, "ubuntu,debian", ["ubuntu"])
+            self.assertEqual(rc, 0)
+            destroyed = {h.name for h in prov.destroyed}
+            self.assertIn("debian", destroyed)  # non-kept torn down
+            self.assertNotIn("ubuntu", destroyed)  # named host kept
+
+    def test_cli_keep_family_selector_keeps_whole_family(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, _err, prov = self._keep_run(d, "ubuntu@24.04,ubuntu@22.04,debian", ["family:ubuntu"])
+            self.assertEqual(rc, 0)
+            destroyed = {h.name for h in prov.destroyed}
+            self.assertEqual(destroyed, {"debian"})  # both ubuntu hosts kept, debian reaped
+
+    def test_cli_keep_unresolved_bare_token_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["nope"])
+            self.assertEqual(rc, 2)
+            self.assertIn("matched no host name", err)
+            self.assertIn("family:", err)  # the hint
+            self.assertEqual(prov.created, [])  # nothing provisioned
+
+    def test_cli_keep_family_zero_match_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["family:fedora"])
+            self.assertEqual(rc, 2)
+            self.assertIn("family:fedora", err)
+            self.assertIn("matched no host", err)
+            self.assertEqual(prov.created, [])
+
+    def test_cli_keep_empty_family_distinct_error(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err, prov = self._keep_run(d, "ubuntu,debian", ["family:"])
+            self.assertEqual(rc, 2)
+            self.assertIn("requires a family name", err)
+            self.assertEqual(prov.created, [])
+
+    def test_cli_keep_set_echoed_under_yes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _err, _prov = self._keep_run(d, "ubuntu,debian", ["ubuntu"])
+            self.assertEqual(rc, 0)
+            self.assertIn("keep: 1 host(s) will be left LIVE", out)
+            self.assertIn("ubuntu", out)
 
     def test_cli_keep_yes_emits_noninteractive_billing_warning(self) -> None:
         # --keep --yes skips the interactive confirm but MUST still emit the
@@ -3988,20 +4703,21 @@ class TestKeepFlag(unittest.TestCase):
             kp = _fake_keypair(Path(d))
             runs = runner.execute(self._partial_matrix(), prov, self._factory(FakeSshRunner()), kp, "probe")
         doc = json.loads(results.serialize_run("run-keep", "TS", runs))
-        by_distro = {h["distro"]: h for h in doc["hosts"]}
-        kept = by_distro["ubuntu"]["kept_host"]
+        by_family = {h["distro"]: h for h in doc["hosts"]}
+        kept = by_family["ubuntu"]["kept_host"]
         self.assertEqual(
             kept,
             {
-                "name": "vmlease-run-keep-ubuntu",
-                "id": "id-vmlease-run-keep-ubuntu",
+                "name": "ubuntu",
+                "id": "id-ubuntu",
                 "ipv4": "10.0.0.1",
-                "distro": "ubuntu",
+                "family": "ubuntu",
+                "version": "24.04",
                 "operator": "probe",
                 "key_path": str(kp.private_key_path),
             },
         )
-        self.assertIsNone(by_distro["debian"]["kept_host"])  # torn-down host → null
+        self.assertIsNone(by_family["debian"]["kept_host"])  # torn-down host → null
 
 
 class _ScriptedTimeoutSsh:
@@ -4049,7 +4765,7 @@ class TestProbeWorkloadBreaker(unittest.TestCase):
         return _resolve_toml(manifest)
 
     def _spec(self) -> model.HostSpec:
-        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu")
+        return model.HostSpec(name="n", image="i", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n")
 
     def _host(self) -> Host:
         return Host(id="1", name="n", ipv4="9.9.9.9")
@@ -4178,8 +4894,11 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
     def _battery(self, prep_body: str) -> model.Battery:
         return _resolve_toml(f"name = '''b'''\n{prep_body}{self._PROBE}")
 
-    def _spec(self, distro_key: str = "ubuntu") -> model.HostSpec:
-        return model.HostSpec(name="n", image="i", server_type="cpx22", distro_key=distro_key)
+    def _spec(self, family: str = "ubuntu") -> model.HostSpec:
+        return model.HostSpec(
+            name="n", image="i", server_type="cpx22",
+            os=model.Os(family, ""), server_name="n",
+        )
 
     def _host(self) -> Host:
         return Host(id="1", name="n", ipv4="9.9.9.9")
@@ -4231,6 +4950,31 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
         run = wl.run(self._spec("ubuntu"), self._host(), ssh_fake)
         self.assertNotIn("arch-only", ssh_fake.ran)
         self.assertEqual([p.id for p in run.prep_phase], ["everywhere"])
+
+    def _versioned_spec(self, family: str, version: str) -> model.HostSpec:
+        return model.HostSpec(
+            name="n", image="i", server_type="cpx22",
+            os=model.Os(family, version), server_name="n",
+        )
+
+    def test_family_selector_matches_every_version(self) -> None:
+        # D-11: a `distros = ["ubuntu"]` step runs on BOTH ubuntu@22.04 and @24.04.
+        prep = "[[prep.setup]]\nid = '''ubuntu-only'''\nrun = '''c'''\ndistros = ['''ubuntu''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        for version in ("22.04", "24.04"):
+            ssh_fake = _ScriptedPrepSsh()
+            run = wl.run(self._versioned_spec("ubuntu", version), self._host(), ssh_fake)
+            self.assertIn("ubuntu-only", ssh_fake.ran)
+            self.assertEqual([p.id for p in run.prep_phase], ["ubuntu-only"])
+
+    def test_package_family_key_matches_every_version(self) -> None:
+        # an [prep.packages] family key contributes to any version of that family.
+        prep = "[prep.packages]\napt = ['''a''']\nubuntu = ['''u''']\n"
+        wl = workload.ProbeWorkload(self._battery(prep))
+        ssh_fake = _ScriptedPrepSsh()
+        wl.run(self._versioned_spec("ubuntu", "22.04"), self._host(), ssh_fake)
+        pkg_cmd = ssh_fake.commands[ssh_fake.ran.index("_packages")]
+        self.assertIn("apt-get install -y a u", pkg_cmd)  # manager-first union by family key
 
     def test_hard_package_fail_returns_zero_probe_hostrun_with_prep_phase(self) -> None:
         # the package pass is always hard: a non-zero exit aborts before any setup
@@ -4321,7 +5065,7 @@ class TestProbeWorkloadPrepPhase(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestSerializeRunPrepPhase(unittest.TestCase):
     def _spec(self) -> model.HostSpec:
-        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", distro_key="ubuntu")
+        return model.HostSpec(name="n", image="ubuntu-24.04", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n")
 
     def test_prep_phase_emitted_as_list_of_dicts(self) -> None:
         hr = model.HostRun(
@@ -4710,8 +5454,9 @@ class TestCliRun(unittest.TestCase):
                 ])
             self.assertEqual(rc, 1)
             self.assertIn("teardown failed", buf.getvalue())
-            # the backstop reap names the host(s) it cleaned up (like `vmlease reap`)
-            self.assertIn("reaped vmlease-cli-run-ubuntu", buf.getvalue())
+            # the backstop reap names the host(s) it cleaned up (like `vmlease reap`);
+            # the host name is the bare identity post-cutover.
+            self.assertIn("reaped ubuntu", buf.getvalue())
             # reap was attempted: list_labeled then destroy on the still-live host.
             self.assertTrue(prov.list_labeled(safety.make_run_id("cli-run")) == [])
 
@@ -4782,7 +5527,16 @@ class TestCliRun(unittest.TestCase):
                 raise KeyboardInterrupt("operator hit Ctrl-C")
 
         class _ReapFails(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self._calls = 0
+
             def list_labeled(self, run_id: str) -> list[Host]:
+                # the D-17 pre-flight reads first (clean token → []); the LATER
+                # backstop reap is the one that fails.
+                self._calls += 1
+                if self._calls == 1:
+                    return []
                 raise providers.ProviderError("request timeout")
 
         prov = _ReapFails()
@@ -4806,7 +5560,7 @@ class TestCliRun(unittest.TestCase):
         from unittest import mock
 
         prov = FakeProvider()
-        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "cli-run"}), "ci")
+        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n", labels={"vmlease": "cli-run"}), "ci")
         buf = io.StringIO()
         with mock.patch.object(cli, "HetznerProvider", lambda: prov), redirect_stdout(buf):
             rc = cli.main(["reap", "--run-token", "cli-run"])
@@ -4817,7 +5571,7 @@ class TestCliRun(unittest.TestCase):
         from unittest import mock
 
         prov = FakeProvider()
-        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", distro_key="ubuntu", labels={"vmlease": "cli-run"}), "ci")
+        prov.create_with_cloudinit(HostSpec(name="n", image="i", server_type="cpx22", os=model.Os("ubuntu", ""), server_name="n", labels={"vmlease": "cli-run"}), "ci")
         buf = io.StringIO()
         with mock.patch.object(cli, "HetznerProvider", lambda: prov), redirect_stdout(buf):
             rc = cli.main(["status", "--run-token", "cli-run"])
@@ -4965,8 +5719,8 @@ class TestArchImage(unittest.TestCase):
 # runner — the rescue-write seam
 # --------------------------------------------------------------------------- #
 class TestRunnerRescueWrite(unittest.TestCase):
-    def _arch_matrix(self) -> runner.Matrix:
-        return runner.Matrix(_demo_workload(), ("arch",), "cpx22", "run-rw")
+    def _arch_matrix(self) -> runner.RunRequest:
+        return _run_request(_demo_workload(), ("arch",), "cpx22", "run-rw")
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -4976,7 +5730,7 @@ class TestRunnerRescueWrite(unittest.TestCase):
         calls: list[tuple[str, str]] = []
 
         def writer(host: Host, profile: distro.DistroProfile) -> None:
-            calls.append((host.name, profile.key))
+            calls.append((host.name, profile.family))
 
         with tempfile.TemporaryDirectory() as d:
             runner.execute(self._arch_matrix(), prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe", rescue_writer=writer)
@@ -4987,7 +5741,7 @@ class TestRunnerRescueWrite(unittest.TestCase):
     def test_native_distro_does_not_invoke_writer(self) -> None:
         prov = FakeProvider()
         calls: list[str] = []
-        m = runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-nat")
+        m = _run_request(_demo_workload(), ("ubuntu",), "cpx22", "run-nat")
         with tempfile.TemporaryDirectory() as d:
             runner.execute(m, prov, self._factory(FakeSshRunner()), _fake_keypair(Path(d)), "probe",
                            rescue_writer=lambda h, p: calls.append(h.name))
@@ -5154,7 +5908,7 @@ class TestArchBuild(unittest.TestCase):
             local = Path(d) / "golden.qcow2"
             local.write_bytes(qcow)
             profile = distro.DistroProfile(
-                key="golden", default_image="debian-13", package_manager="apt",
+                family="golden", image="debian-13", version="", package_manager="apt",
                 packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
             )
             push_calls: list[tuple[str, Path, str]] = []
@@ -5171,7 +5925,7 @@ class TestArchBuild(unittest.TestCase):
         from vmlease.archimage import ArchImageError
         from vmlease.rescue_image import GoldenRescueImageSpec
         profile = distro.DistroProfile(
-            key="golden", default_image="debian-13", package_manager="apt",
+            family="golden", image="debian-13", version="", package_manager="apt",
             packages=(), rescue_image=GoldenRescueImageSpec(sha256="0" * 64, url="https://m/x.qcow2"),
         )
         # the fetched bytes' sha will NOT match the pinned digest → refusal.
@@ -5249,7 +6003,7 @@ class TestArchBuild(unittest.TestCase):
             local = Path(d) / "golden.qcow2"
             local.write_bytes(qcow)
             profile = distro.DistroProfile(
-                key="golden", default_image="debian-13", package_manager="apt",
+                family="golden", image="debian-13", version="", package_manager="apt",
                 packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
             )
             writer = archbuild.build_live_rescue_writer(
@@ -5279,7 +6033,7 @@ class TestArchBuild(unittest.TestCase):
             local = Path(d) / "golden.qcow2"
             local.write_bytes(qcow)
             profile = distro.DistroProfile(
-                key="golden", default_image="debian-13", package_manager="apt",
+                family="golden", image="debian-13", version="", package_manager="apt",
                 packages=(), rescue_image=GoldenRescueImageSpec(sha256=sha, path=local),
             )
             writer = archbuild.build_live_rescue_writer(
@@ -5291,7 +6045,7 @@ class TestArchBuild(unittest.TestCase):
     def test_rescue_write_host_no_spec_raises(self) -> None:
         # a profile with no rescue_image spec cannot be rescue-written (guard).
         profile = distro.DistroProfile(
-            key="nope", default_image="debian-13", package_manager="apt", packages=(),
+            family="nope", image="debian-13", version="", package_manager="apt", packages=(),
         )
         deps, _ = self._deps()
         with self.assertRaises(archbuild.ArchBuildError):
@@ -5462,7 +6216,7 @@ class TestDistroRescue(unittest.TestCase):
         self.assertIsInstance(arch.rescue_image, RescueImageSpec)  # Protocol conformance
         assert isinstance(arch.rescue_image, ArchRescueImageSpec)
         self.assertEqual(arch.rescue_image.fingerprint, archimage.DEFAULT_ARCH_KEY_FINGERPRINT)
-        self.assertEqual(arch.default_image, "debian-13")  # cheap base to rescue-write
+        self.assertEqual(arch.image, "debian-13")  # cheap base to rescue-write
 
     def test_native_distros_do_not_need_rescue_write(self) -> None:
         for key in ("ubuntu", "debian", "fedora"):
@@ -5514,21 +6268,24 @@ def _rescue_profile(spec: object) -> distro.DistroProfile:
     assert isinstance(spec, RescueImageSpec)
     base = distro.get_profile("arch")
     return distro.DistroProfile(
-        key=base.key, default_image=base.default_image, package_manager=base.package_manager,
+        family=base.family, image=base.image, version=base.version, package_manager=base.package_manager,
         packages=base.packages, extra_setup=base.extra_setup,
         system_update_override=base.system_update_override, rescue_image=spec, notes=base.notes,
     )
 
 
 def _cache_image(
-    *, distro_key: str, arch: str, key: str, img_id: str = "img-1",
-    requires: tuple[str, ...] = (),
+    *, family: str, arch: str, key: str, img_id: str = "img-1",
+    requires: tuple[str, ...] = (), version: str | None = None,
 ) -> Image:
-    """A cache Image carrying the supersession-relevant labels (incl. requires-hash)."""
+    """A cache Image carrying the supersession-relevant labels (incl. version + requires-hash)."""
+    if version is None:
+        version = distro.get_profile(family).version
     return Image(
         id=img_id, created="2024-04-25T13:26:27+00:00", disk_size=40.0, arch=arch,
         labels={
-            imagecache.LABEL_DISTRO: distro_key,
+            imagecache.LABEL_DISTRO: family,
+            imagecache.LABEL_VERSION: version,
             imagecache.LABEL_ARCH: arch,
             imagecache.LABEL_CACHE_KEY: key,
             imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -5576,7 +6333,7 @@ class TestImageCacheContentKey(unittest.TestCase):
     def test_recipe_change_changes_key(self) -> None:
         ubuntu = distro.get_profile("ubuntu")
         mutated = distro.DistroProfile(
-            key=ubuntu.key, default_image=ubuntu.default_image, package_manager=ubuntu.package_manager,
+            family=ubuntu.family, image=ubuntu.image, version=ubuntu.version, package_manager=ubuntu.package_manager,
             packages=(*ubuntu.packages, "htop"),  # a recipe change
         )
         self.assertNotEqual(
@@ -5591,6 +6348,15 @@ class TestImageCacheContentKey(unittest.TestCase):
             imagecache.content_key(ubuntu, "x86", "probe", (), _null_deps()),
             imagecache.content_key(ubuntu, "arm", "probe", (), _null_deps()),
         )
+
+    def test_distinct_version_distinct_key(self) -> None:
+        # (D-9) (ubuntu, 22.04) vs (ubuntu, 24.04): different base image slug → the
+        # digest differs, so the content keys differ; the family component stays family.
+        k22 = imagecache.content_key(distro.get_profile("ubuntu", "22.04"), "x86", "probe", (), _null_deps())
+        k24 = imagecache.content_key(distro.get_profile("ubuntu", "24.04"), "x86", "probe", (), _null_deps())
+        self.assertNotEqual(k22, k24)
+        self.assertTrue(k22.startswith("v1-ubuntu-"))
+        self.assertTrue(k24.startswith("v1-ubuntu-"))
 
     def test_operator_changes_key(self) -> None:
         # operator is part of the canonical render (baked user), so it is in the key.
@@ -5745,8 +6511,8 @@ class TestRunCacheConsumption(unittest.TestCase):
     def _key(self, arch: str = "x86") -> str:
         return imagecache.content_key(self._ubuntu(), arch, "probe", (), _null_deps())
 
-    def _matrix(self) -> runner.Matrix:
-        return runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
+    def _matrix(self) -> runner.RunRequest:
+        return _run_request(_demo_workload(), ("ubuntu",), "cpx22", "run-cache")
 
     def _factory(self, ssh_runner: ssh.SshRunner) -> Callable[[str, keypair.Keypair], ssh.SshRunner]:
         return lambda _op, _kp: ssh_runner
@@ -5790,7 +6556,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         # no cached image → cold default image, full cloud-init.
         prov = FakeProvider()
         runs = self._exec(prov)
-        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertEqual(prov.created[0].image, self._ubuntu().image)
         self.assertTrue(runs[0].results)
         self.assertEqual(prov.created_images, [])
 
@@ -5809,7 +6575,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertTrue(runs[0].results)  # ran cold, did NOT fail
         # exactly one host created — the COLD one (the restore create raised first)
-        self.assertEqual([s.image for s in prov.created], [self._ubuntu().default_image])
+        self.assertEqual([s.image for s in prov.created], [self._ubuntu().image])
         self.assertEqual(len(prov.destroyed), 1)  # cold host torn down
         self.assertEqual(prov.created_images, [])
 
@@ -5891,7 +6657,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         runs_a = self._exec(prov_a)
         # create-fail → cold success (workload ran, one cold host)
         self.assertTrue(runs_a[0].results)
-        self.assertEqual([s.image for s in prov_a.created], [self._ubuntu().default_image])
+        self.assertEqual([s.image for s in prov_a.created], [self._ubuntu().image])
 
         prov_b = FakeProvider()
         prov_b.images["img-cache"] = _cached_run_image(key=self._key())
@@ -5911,7 +6677,7 @@ class TestRunCacheConsumption(unittest.TestCase):
         prov.images["img-cache"] = _cached_run_image(key=self._key())
         runs = self._exec(prov)
         self.assertTrue(runs[0].results)  # ran cold
-        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertEqual(prov.created[0].image, self._ubuntu().image)
         self.assertEqual(prov.created_images, [])
 
     def test_resolve_deps_none_is_pure_cold_no_disk_call(self) -> None:
@@ -5930,7 +6696,7 @@ class TestRunCacheConsumption(unittest.TestCase):
                 _fake_keypair(Path(d)), "probe", resolve_deps=None,
             )
         self.assertTrue(runs[0].results)
-        self.assertEqual(prov.created[0].image, self._ubuntu().default_image)
+        self.assertEqual(prov.created[0].image, self._ubuntu().image)
 
     def test_run_makes_zero_create_image_calls_on_hit_and_miss(self) -> None:
         # D3: run NEVER builds — zero create_image calls on both a hit and a miss.
@@ -5964,7 +6730,7 @@ class TestPlanZeroProviderCalls(unittest.TestCase):
         )
         # plan takes no provider at all — it is call-free by construction. Asserting
         # the matrix plans without touching the provider object is the guarantee.
-        items = runner.plan(runner.Matrix(_demo_workload(), ("ubuntu",), "cpx22", "run-plan"))
+        items = runner.plan(_run_request(_demo_workload(), ("ubuntu",), "cpx22", "run-plan"))
         self.assertEqual(len(items), 1)
         self.assertEqual(prov.created, [])
         self.assertEqual(prov.created_images, [])
@@ -5982,6 +6748,7 @@ class TestImageCacheLabels(unittest.TestCase):
             "vmlease-cache-key": "v1-ubuntu-abc",
             "vmlease-schema": "v1",
             "vmlease-distro": "ubuntu",
+            "vmlease-version": "24.04",
             "vmlease-arch": "x86",
             "vmlease-source-fp": "ubuntu-24.04",
             "vmlease-built": "run-xyz",
@@ -6007,29 +6774,43 @@ class TestImageCacheLabels(unittest.TestCase):
         self.assertEqual(len(labels["vmlease-source-fp"]), 63)
         self.assertEqual(labels["vmlease-source-fp"], "f" * 63)
 
+    def test_emits_version_label_for_versioned_profile(self) -> None:
+        labels = imagecache.cache_labels(
+            distro.get_profile("ubuntu", "22.04"), "x86", key="k", source_fp="fp",
+            run_token="r", requires=(),
+        )
+        self.assertEqual(labels[imagecache.LABEL_VERSION], "22.04")
+        self.assertEqual(labels[imagecache.LABEL_DISTRO], "ubuntu")  # LABEL_DISTRO stays family
+
+    def test_emits_rolling_version_label_for_arch(self) -> None:
+        labels = imagecache.cache_labels(
+            distro.get_profile("arch"), "x86", key="k", source_fp="fp", run_token="r", requires=(),
+        )
+        self.assertEqual(labels[imagecache.LABEL_VERSION], distro.ROLLING)
+
 
 class TestImageCacheSupersession(unittest.TestCase):
     def test_superseded_subset(self) -> None:
-        current = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-CUR", img_id="cur")
-        old = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD", img_id="old")
+        current = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-CUR", img_id="cur")
+        old = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-OLD", img_id="old")
         result = imagecache.superseded([current, old], "v1-ubuntu-CUR")
         self.assertEqual([img.id for img in result], ["old"])
 
     def test_accept_a_no_current_image_all_superseded(self) -> None:
         # accept-(a): current image absent ⇒ every image in the group is superseded.
-        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD1", img_id="a")
-        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-OLD2", img_id="b")
+        a = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-OLD1", img_id="a")
+        b = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-OLD2", img_id="b")
         result = imagecache.superseded([a, b], "v1-ubuntu-CUR")
         self.assertEqual({img.id for img in result}, {"a", "b"})
 
     def test_resolve_current_keys_native(self) -> None:
-        img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-anything")
+        img = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-anything")
         warnings: list[str] = []
         keys = imagecache.resolve_current_keys(
             [img], distro.get_profile, "probe", _null_deps(), warnings.append,
         )
         expected = imagecache.content_key(distro.get_profile("ubuntu"), "x86", "probe", (), _null_deps())
-        self.assertEqual(keys, {("ubuntu", "x86", imagecache.requires_hash(())): expected})
+        self.assertEqual(keys, {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): expected})
         self.assertEqual(warnings, [])
 
     def test_resolve_current_keys_fail_safe_keeps_group(self) -> None:
@@ -6037,31 +6818,77 @@ class TestImageCacheSupersession(unittest.TestCase):
         from vmlease.archbuild import ArchBuildError
         raising_spec = _FakeResolveSpec(raises=ArchBuildError("mirror down"))
 
-        def profile_for(key: str) -> distro.DistroProfile:
-            if key == "arch":
+        def profile_for(family: str, version: str = "") -> distro.DistroProfile:
+            if family == "arch":
                 return _rescue_profile(raising_spec)
-            return distro.get_profile(key)
+            return distro.get_profile(family, version)
 
-        arch_img = _cache_image(distro_key="arch", arch="x86", key="v1-arch-OLD", img_id="arch1")
-        ubuntu_img = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-X", img_id="ub1")
+        arch_img = _cache_image(family="arch", arch="x86", key="v1-arch-OLD", img_id="arch1")
+        ubuntu_img = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-X", img_id="ub1")
         warnings: list[str] = []
         keys = imagecache.resolve_current_keys(
             [arch_img, ubuntu_img], profile_for, "probe", _null_deps(), warnings.append,
         )
         # ubuntu resolved; arch skipped (kept) with a warning.
-        self.assertIn(("ubuntu", "x86", imagecache.requires_hash(())), keys)
-        self.assertNotIn(("arch", "x86", imagecache.requires_hash(())), keys)
+        self.assertIn(("ubuntu", "24.04", "x86", imagecache.requires_hash(())), keys)
+        self.assertNotIn(("arch", distro.ROLLING, "x86", imagecache.requires_hash(())), keys)
         self.assertEqual(len(warnings), 1)
         self.assertIn("arch", warnings[0])
 
     def test_resolve_current_keys_dedups_group(self) -> None:
         # two images of the same group ⇒ the key is resolved once.
-        a = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-A", img_id="a")
-        b = _cache_image(distro_key="ubuntu", arch="x86", key="v1-ubuntu-B", img_id="b")
+        a = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-A", img_id="a")
+        b = _cache_image(family="ubuntu", arch="x86", key="v1-ubuntu-B", img_id="b")
         keys = imagecache.resolve_current_keys(
             [a, b], distro.get_profile, "probe", _null_deps(), lambda _m: None,
         )
         self.assertEqual(len(keys), 1)
+
+    def test_group_of_is_four_tuple_with_version(self) -> None:
+        img = _cache_image(family="ubuntu", version="22.04", arch="x86", key="k")
+        group = imagecache.group_of(img)
+        self.assertEqual(len(group), 4)
+        self.assertEqual(group, ("ubuntu", "22.04", "x86", imagecache.requires_hash(())))
+
+    def test_sibling_versions_are_distinct_groups(self) -> None:
+        v22 = _cache_image(family="ubuntu", version="22.04", arch="x86", key="k22", img_id="v22")
+        v24 = _cache_image(family="ubuntu", version="24.04", arch="x86", key="k24", img_id="v24")
+        self.assertNotEqual(imagecache.group_of(v22), imagecache.group_of(v24))
+
+    def test_sibling_versions_resolve_independently_not_superseded(self) -> None:
+        # D-9: each (family, version) group resolves its own current key; a 24.04
+        # build never supersedes the 22.04 image (distinct groups).
+        v22 = _cache_image(family="ubuntu", version="22.04", arch="x86", key="k22", img_id="v22")
+        v24 = _cache_image(family="ubuntu", version="24.04", arch="x86", key="k24", img_id="v24")
+        keys = imagecache.resolve_current_keys(
+            [v22, v24], distro.get_profile, "probe", _null_deps(), lambda _m: None,
+        )
+        self.assertEqual(len(keys), 2)  # two distinct groups
+        self.assertEqual(
+            keys[imagecache.group_of(v22)],
+            imagecache.content_key(distro.get_profile("ubuntu", "22.04"), "x86", "probe", (), _null_deps()),
+        )
+        self.assertEqual(
+            keys[imagecache.group_of(v24)],
+            imagecache.content_key(distro.get_profile("ubuntu", "24.04"), "x86", "probe", (), _null_deps()),
+        )
+
+    def test_image_missing_version_label_is_kept_fail_safe(self) -> None:
+        # an OLD image with no LABEL_VERSION → version="" → profile_for(family, "")
+        # raises (unknown version) → group skipped + warned, never deleted (D-9).
+        old = Image(
+            id="old", created="2024-01-01T00:00:00+00:00", disk_size=40.0, arch="x86",
+            labels={
+                imagecache.LABEL_DISTRO: "ubuntu",
+                imagecache.LABEL_ARCH: "x86",
+                imagecache.LABEL_CACHE_KEY: "v1-ubuntu-OLD",
+                imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(()),
+            },
+        )
+        warnings: list[str] = []
+        keys = imagecache.resolve_current_keys([old], distro.get_profile, "probe", _null_deps(), warnings.append)
+        self.assertEqual(keys, {})  # unresolved → kept
+        self.assertEqual(len(warnings), 1)
 
 
 class TestWaitUntilOff(unittest.TestCase):
@@ -6097,12 +6924,13 @@ class TestWaitUntilOff(unittest.TestCase):
 
 
 class TestBuildOneImage(unittest.TestCase):
-    def _spec(self, distro_key: str = "ubuntu") -> HostSpec:
+    def _spec(self, family: str = "ubuntu") -> HostSpec:
         return HostSpec(
-            name=f"vmlease-build-{distro_key}",
-            image=distro.get_profile(distro_key).default_image,
+            name=f"vmlease-build-{family}",
+            image=distro.get_profile(family).image,
             server_type="cpx22",
-            distro_key=distro_key,
+            os=model.Os(family, ""),
+            server_name=f"vmlease-build-{family}",
             labels={"vmlease": "build-run"},
         )
 
@@ -6113,7 +6941,7 @@ class TestBuildOneImage(unittest.TestCase):
         *,
         description: str = "v1-ubuntu-key",
         labels: dict[str, str] | None = None,
-        distro_key: str = "ubuntu",
+        family: str = "ubuntu",
     ) -> tuple[Image, list[str]]:
         labels = labels if labels is not None else {"vmlease-cache-key": "v1-ubuntu-key"}
         note_sink: list[str] = []
@@ -6122,8 +6950,8 @@ class TestBuildOneImage(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as d:
             image = runner.build_one_image(
-                self._spec(distro_key),
-                distro.get_profile(distro_key),
+                self._spec(family),
+                distro.get_profile(family),
                 prov,
                 lambda _o, _k: fssh,
                 _fake_keypair(Path(d)),
@@ -6245,20 +7073,24 @@ class TestContentKeyFromBaseFp(unittest.TestCase):
 class TestCliBuildImage(unittest.TestCase):
     """``vmlease build-image`` lifecycle (tasks 6.2-6.6), fully mocked (no network)."""
 
-    def _key(self, distro_key: str = "ubuntu", arch: str = "x86", operator: str = "probe") -> str:
-        prof = distro.get_profile(distro_key)
+    def _key(self, family: str = "ubuntu", arch: str = "x86", operator: str = "probe") -> str:
+        prof = distro.get_profile(family)
         base_fp = imagecache.base_fingerprint(prof, arch, _null_deps())
         return imagecache.content_key_from_base_fp(base_fp, prof, arch, operator, ())
 
     def _cache_img(
-        self, *, key: str, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
+        self, *, key: str, img_id: str, family: str = "ubuntu", arch: str = "x86",
         created: str = "2024-01-01T00:00:00+00:00", requires: tuple[str, ...] = (),
+        version: str | None = None,
     ) -> Image:
+        if version is None:
+            version = distro.get_profile(family).version
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
             labels={
                 imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
-                imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_DISTRO: family,
+                imagecache.LABEL_VERSION: version,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
                 imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -6292,7 +7124,9 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(len(prov.created), 1)
         spec = prov.created[0]
         self.assertEqual(spec.labels.get("vmlease"), "bird")  # builder carries the reap label
-        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu")
+        # the builder name uses the versionflat form (bare ubuntu → default 24.04)
+        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu-2404")
+        self.assertEqual(spec.os, model.Os("ubuntu", "24.04"))
         # the image was created and carries the cache key (NOT vmlease=<run-id>).
         self.assertEqual(len(prov.created_images), 1)
         img_labels = prov.created_images[0][2]
@@ -6308,6 +7142,65 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(prov.created, [])
         self.assertIn("error:", err)
+
+    def test_versioned_distro_builds_versionflat_name_and_image(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu@22.04", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        spec = prov.created[0]
+        self.assertEqual(spec.name, "vmlease-bird-build-ubuntu-2204")  # versionflat
+        self.assertEqual(spec.image, "ubuntu-22.04")
+        self.assertEqual(spec.os, model.Os("ubuntu", "22.04"))
+        self.assertIn("ubuntu@22.04", out)  # display shows family@version
+
+    def test_bare_distro_builds_default_version(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(prov.created[0].image, "ubuntu-24.04")  # default version
+
+    def test_malformed_distro_with_name_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "api=ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+        self.assertIn("single", err)
+
+    def test_malformed_distro_with_comma_exits_2(self) -> None:
+        prov = FakeProvider()
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu,debian", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual(prov.created, [])
+
+    def test_sibling_version_image_not_superseded(self) -> None:
+        # building ubuntu@22.04 with an ubuntu@24.04 cache image present → the 24.04
+        # image is NOT in same_group → never pruned (D-9/D-10). (Default quota has
+        # room, so the build proceeds and the sibling simply survives.)
+        prov = FakeProvider()
+        prov.images["v24"] = self._cache_img(
+            key="v1-ubuntu-24OLD", img_id="v24", family="ubuntu", version="24.04",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, _e = self._run(
+                prov,
+                ["build-image", "--distro", "ubuntu@22.04", "--run-token", "bird", "--yes"],
+                tmp=d,
+            )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("v24", prov.deleted_images)  # sibling version survives
+        self.assertEqual(prov.created[0].image, "ubuntu-22.04")  # the 22.04 build ran
 
     def test_non_allowlisted_server_type_exits_2(self) -> None:
         prov = FakeProvider()
@@ -6345,12 +7238,44 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(prov.created_images, [])  # no new image
         self.assertIn("already cached", out)
 
+    def test_build_image_live_token_exits_2(self) -> None:
+        # D-17: a build-image whose run-token already has live hosts is refused
+        # (exit 2) before any build.
+        run_id = safety.make_run_id("bird")
+        prov = FakeProvider()
+        prov.create_with_cloudinit(
+            model.HostSpec(name="x", image="i", server_type="cpx22", os=model.Os("ubuntu", ""),
+                           server_name="x", labels={safety.LABEL_KEY: run_id}), "ci")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("live host", err)
+        self.assertEqual(prov.created_images, [])  # nothing built
+
+    def test_build_image_cached_noop_skips_preflight(self) -> None:
+        # the idempotent no-op returns 0 BEFORE the pre-flight — even with a live host
+        # on the token, a cached build stays a free no-op (pre-flight NOT reached).
+        run_id = safety.make_run_id("bird")
+        prov = FakeProvider()
+        prov.images["img-cur"] = self._cache_img(key=self._key(), img_id="img-cur")
+        prov.create_with_cloudinit(
+            model.HostSpec(name="x", image="i", server_type="cpx22", os=model.Os("ubuntu", ""),
+                           server_name="x", labels={safety.LABEL_KEY: run_id}), "ci")
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)  # no-op wins over the pre-flight
+        self.assertIn("already cached", out)
+
     def test_at_cap_s_empty_refuses_exit_1_no_builder(self) -> None:
         # max-images=1, one cached image of a DIFFERENT group/key (not superseded
         # of THIS group, since this group is absent ⇒ S of this group is empty).
         prov = FakeProvider()
         prov.images["img-other"] = self._cache_img(
-            key="v1-fedora-X", img_id="img-other", distro_key="fedora",
+            key="v1-fedora-X", img_id="img-other", family="fedora",
         )
         with tempfile.TemporaryDirectory() as d:
             rc, _o, err = self._run(
@@ -6508,7 +7433,7 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("reap-images", err)
         # the builder was torn down by the scaffold's finally.
-        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu-2404"])
 
     def test_builder_teardown_failure_exits_nonzero_keeps_image(self) -> None:
         # G8: a builder-teardown failure → reap attempted, image KEPT, non-zero exit.
@@ -6548,7 +7473,7 @@ class TestCliBuildImage(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 cli._cmd_build_image(ns, reader=lambda _p: "y")
         # the builder was reaped by run-label (list_labeled then destroy).
-        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu"])
+        self.assertEqual([h.name for h in prov.destroyed], ["vmlease-bird-build-ubuntu-2404"])
 
     def test_generic_provider_error_during_build_exits_1(self) -> None:
         # a sysprep failure raises RuntimeError inside the build → exit 1, no traceback.
@@ -6584,15 +7509,18 @@ class TestCliReapImages(unittest.TestCase):
     """``vmlease reap-images`` (tasks 7.1), fully mocked (no network)."""
 
     def _img(
-        self, *, img_id: str, distro_key: str = "ubuntu", arch: str = "x86",
+        self, *, img_id: str, family: str = "ubuntu", arch: str = "x86",
         key: str = "v1-ubuntu-CUR", created: str = "2024-04-25T13:26:27+00:00",
-        requires: tuple[str, ...] = (),
+        requires: tuple[str, ...] = (), version: str | None = None,
     ) -> Image:
+        if version is None:
+            version = distro.get_profile(family).version
         return Image(
             id=img_id, created=created, disk_size=40.0, arch=arch,
             labels={
                 imagecache.LABEL_PURPOSE: imagecache.PURPOSE_IMAGE_CACHE,
-                imagecache.LABEL_DISTRO: distro_key,
+                imagecache.LABEL_DISTRO: family,
+                imagecache.LABEL_VERSION: version,
                 imagecache.LABEL_ARCH: arch,
                 imagecache.LABEL_CACHE_KEY: key,
                 imagecache.LABEL_REQUIRES_HASH: imagecache.requires_hash(requires),
@@ -6602,7 +7530,7 @@ class TestCliReapImages(unittest.TestCase):
 
     def _run(
         self, prov: FakeProvider, argv: list[str], *,
-        resolve_current_keys: Callable[..., dict[tuple[str, str, str], str]] | None = None,
+        resolve_current_keys: Callable[..., dict[tuple[str, str, str, str], str]] | None = None,
     ) -> tuple[int, str, str]:
         from contextlib import ExitStack
         from unittest import mock
@@ -6629,11 +7557,21 @@ class TestCliReapImages(unittest.TestCase):
     # --- --distro scope ------------------------------------------------------ #
     def test_distro_scope_reaps_only_that_distro(self) -> None:
         prov = FakeProvider()
-        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu")
-        prov.images["f1"] = self._img(img_id="f1", distro_key="fedora", key="v1-fedora-X")
+        prov.images["u1"] = self._img(img_id="u1", family="ubuntu")
+        prov.images["f1"] = self._img(img_id="f1", family="fedora", key="v1-fedora-X")
         rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
         self.assertEqual(rc, 0)
         self.assertEqual(prov.deleted_images, ["u1"])  # fedora untouched
+
+    def test_distro_scope_reaps_all_versions_of_family(self) -> None:
+        # --distro stays family-scoped (D-9): it reaps EVERY version of that family.
+        prov = FakeProvider()
+        prov.images["u22"] = self._img(img_id="u22", family="ubuntu", version="22.04", key="v1-ubuntu-22")
+        prov.images["u24"] = self._img(img_id="u24", family="ubuntu", version="24.04", key="v1-ubuntu-24")
+        prov.images["f1"] = self._img(img_id="f1", family="fedora", key="v1-fedora-X")
+        rc, _o, _e = self._run(prov, ["reap-images", "--distro", "ubuntu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(prov.deleted_images), ["u22", "u24"])  # both ubuntu versions, fedora untouched
 
     # --- --older-than -------------------------------------------------------- #
     def test_older_than_selects_only_older(self) -> None:
@@ -6691,7 +7629,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["old"] = self._img(img_id="old", key="v1-ubuntu-OLD")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -6699,13 +7637,13 @@ class TestCliReapImages(unittest.TestCase):
 
     def test_superseded_fail_safe_keeps_unresolvable_group_and_warns(self) -> None:
         prov = FakeProvider()
-        prov.images["a1"] = self._img(img_id="a1", distro_key="arch", key="v1-arch-OLD")
-        prov.images["u1"] = self._img(img_id="u1", distro_key="ubuntu", key="v1-ubuntu-OLD")
+        prov.images["a1"] = self._img(img_id="a1", family="arch", key="v1-arch-OLD")
+        prov.images["u1"] = self._img(img_id="u1", family="ubuntu", key="v1-ubuntu-OLD")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             # arch unresolvable (omitted + warned); ubuntu resolves to a new key.
-            warn("cannot resolve current cache key for group (distro='arch', arch='x86'): mirror down")
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
+            warn("cannot resolve current cache key for group (family='arch', version='rolling', arch='x86'): mirror down")
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}
 
         rc, _o, err = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -6720,7 +7658,7 @@ class TestCliReapImages(unittest.TestCase):
         prov.images["o2"] = self._img(img_id="o2", key="v1-ubuntu-OLD2")
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
-            return {("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
+            return {("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-CUR"}  # no image carries CUR
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
         self.assertEqual(rc, 0)
@@ -6739,8 +7677,8 @@ class TestCliReapImages(unittest.TestCase):
 
         def resolve(images, profile_for, operator, deps, warn):  # type: ignore[no-untyped-def]
             return {
-                ("ubuntu", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
-                ("ubuntu", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
+                ("ubuntu", "24.04", "x86", imagecache.requires_hash(())): "v1-ubuntu-DLCUR",
+                ("ubuntu", "24.04", "x86", imagecache.requires_hash(("docker",))): "v1-ubuntu-DKCUR",
             }
 
         rc, _o, _e = self._run(prov, ["reap-images", "--superseded"], resolve_current_keys=resolve)
@@ -6807,7 +7745,8 @@ class TestCacheImagePerRunReapIsolation(unittest.TestCase):
         # a labelled run host (the ephemeral reap target).
         spec = HostSpec(
             name="vmlease-bird-host", image="ubuntu-24.04", server_type="cpx22",
-            distro_key="ubuntu", labels=safety.run_label(run_id),
+            os=model.Os("ubuntu", ""), server_name="vmlease-bird-host",
+            labels=safety.run_label(run_id),
         )
         host = prov.create_with_cloudinit(spec, "#cloud-config")
 

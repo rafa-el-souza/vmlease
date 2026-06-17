@@ -9,7 +9,7 @@ Reference probe batteries you can run against real hosts with `vmlease run`.
 
   ```sh
   uv run vmlease run --battery examples/compose-plugin-check/battery.toml \
-    --distros ubuntu,debian,fedora,arch --run-token compose-check \
+    --hosts ubuntu,debian,fedora,arch --run-token compose-check \
     --results-dir /tmp/vmlease-results --timestamp "$(date -u +%Y%m%dT%H%M%SZ)" \
     --ssh-key <registered-name> --ssh-key-path <local-priv> --yes
   ```

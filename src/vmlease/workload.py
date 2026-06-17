@@ -68,16 +68,16 @@ MAX_CONSECUTIVE_TIMEOUTS = 2
 
 
 def _effective_packages(
-    packages: Mapping[str, tuple[str, ...]], manager: str, distro_key: str
+    packages: Mapping[str, tuple[str, ...]], manager: str, family: str
 ) -> tuple[str, ...]:
-    """The effective per-host package set: union(manager-list, distro-list), deduped.
+    """The effective per-host package set: union(manager-list, family-list), deduped.
 
-    ``[prep.packages]`` keys are package-managers OR distros (disjoint, validated
+    ``[prep.packages]`` keys are package-managers OR families (disjoint, validated
     at load). The effective set for one host is the union of its manager's list and
-    its distro's list, deduplicated in first-seen order with the manager entries
+    its family's list, deduplicated in first-seen order with the manager entries
     first (D-E). Selectors absent from the mapping contribute nothing.
     """
-    ordered = (*packages.get(manager, ()), *packages.get(distro_key, ()))
+    ordered = (*packages.get(manager, ()), *packages.get(family, ()))
     seen: dict[str, None] = {}
     for pkg in ordered:
         seen.setdefault(pkg, None)
@@ -177,18 +177,19 @@ class ProbeWorkload:
         prep = self._battery.prep
         if prep is None:
             return False
-        profile = distro.get_profile(spec.distro_key)
+        profile = distro.get_profile(spec.family)
         manager = profile.package_manager
 
         # 1) The package install pass — apt-get update first on apt (D13.2), then
         # one ``<install> <pkgs>`` pass. Always hard: any non-zero exit aborts.
-        packages = _effective_packages(prep.packages, manager, spec.distro_key)
+        # The prep selector keys on the host FAMILY (D-11), version-agnostic.
+        packages = _effective_packages(prep.packages, manager, spec.family)
         if packages and not self._run_package_pass(host, ssh, manager, packages, prep_phase):
             return True
 
-        # 2) The ordered setup steps (authoring order); skip distros-excluded ones.
+        # 2) The ordered setup steps (authoring order); skip family-excluded ones.
         for step in prep.setup:
-            if step.distros and spec.distro_key not in step.distros:
+            if step.distros and spec.family not in step.distros:
                 continue
             result = self._run_setup_step(host, ssh, step)
             prep_phase.append(result)

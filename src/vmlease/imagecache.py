@@ -46,6 +46,10 @@ LABEL_PURPOSE = "vmlease-purpose"
 LABEL_CACHE_KEY = "vmlease-cache-key"
 LABEL_SCHEMA = "vmlease-schema"
 LABEL_DISTRO = "vmlease-distro"
+# The distro VERSION (e.g. ``"22.04"``, or ``"rolling"`` for a rolling family) —
+# a supersession-group discriminant so a sibling version is never pruned (D-9).
+# ``LABEL_DISTRO`` stays family-only.
+LABEL_VERSION = "vmlease-version"
 LABEL_ARCH = "vmlease-arch"
 LABEL_SOURCE_FP = "vmlease-source-fp"
 LABEL_BUILT = "vmlease-built"
@@ -101,7 +105,7 @@ def base_fingerprint(profile: DistroProfile, arch: str, deps: ResolveDeps) -> st
     The single per-run-variable hashed input. Two sources, one uniform call:
 
     - **native** (``not profile.needs_rescue_write``) → the arch-blind provider
-      image slug ``profile.default_image``; the probe-confirmed Hetzner system
+      image slug ``profile.image``; the probe-confirmed Hetzner system
       image does not drift under its slug, so the slug *is* the fingerprint.
     - **rescue-write** (Arch *and* golden — both carry a ``rescue_image``) → the
       digest from ``profile.rescue_image.resolve_and_verify(deps).expected_sha256``
@@ -118,7 +122,7 @@ def base_fingerprint(profile: DistroProfile, arch: str, deps: ResolveDeps) -> st
     path it shares; supersession is fail-safe — see :func:`resolve_current_keys`).
     """
     if not profile.needs_rescue_write:
-        return profile.default_image
+        return profile.image
     # mypy: needs_rescue_write is True ⇒ rescue_image is not None.
     assert profile.rescue_image is not None
     return profile.rescue_image.resolve_and_verify(deps).expected_sha256
@@ -190,7 +194,7 @@ def content_key_from_base_fp(
     )
     payload = f"{arch}\0{base_fp}\0{canonical_cloud_init}".encode()
     digest = hashlib.sha256(payload).hexdigest()[:_KEY_HASH_HEX_WIDTH]
-    return f"v1-{profile.key}-{digest}"
+    return f"v1-{profile.family}-{digest}"
 
 
 def _truncate_label(value: str) -> str:
@@ -223,14 +227,15 @@ def cache_labels(
 
     ``requires`` is folded to its short group hash (:func:`requires_hash`) and
     emitted as :data:`LABEL_REQUIRES_HASH` so the supersession group identity is
-    ``(distro, arch, requires-hash)`` — a docker variant never supersedes the
-    docker-less one (the reap data-loss guard, D-D correction).
+    ``(family, version, arch, requires-hash)`` — a docker variant never supersedes
+    the docker-less one, and a sibling version is never pruned (D-9 / D-D).
     """
     return {
         LABEL_PURPOSE: PURPOSE_IMAGE_CACHE,
         LABEL_CACHE_KEY: _truncate_label(key),
         LABEL_SCHEMA: SCHEMA_V1,
-        LABEL_DISTRO: _truncate_label(profile.key),
+        LABEL_DISTRO: _truncate_label(profile.family),
+        LABEL_VERSION: _truncate_label(profile.version),
         LABEL_ARCH: _truncate_label(arch),
         LABEL_SOURCE_FP: _truncate_label(source_fp),
         LABEL_BUILT: _truncate_label(run_token),
@@ -264,16 +269,18 @@ def superseded(images: Iterable[Image], current_key: str) -> list[Image]:
     return [img for img in images if img.labels.get(LABEL_CACHE_KEY) != current_key]
 
 
-def group_of(image: Image) -> tuple[str, str, str]:
-    """The ``(distro, arch, requires-hash)`` group an image belongs to (D-D correction).
+def group_of(image: Image) -> tuple[str, str, str, str]:
+    """The ``(family, version, arch, requires-hash)`` group an image belongs to (D-9 / D-D).
 
-    The required-capability set is part of the supersession-group identity (carried
-    as the collision-safe :data:`LABEL_REQUIRES_HASH`), so a docker image and a
-    docker-less image of the same distro+arch are distinct groups and never
-    supersede one another.
+    Both the distro **version** (:data:`LABEL_VERSION`) and the required-capability
+    set (the collision-safe :data:`LABEL_REQUIRES_HASH`) are part of the
+    supersession-group identity, so a sibling version — and a docker vs docker-less
+    image of the same family+version+arch — are distinct groups and never supersede
+    one another. ``LABEL_DISTRO`` stays family-only.
     """
     return (
         image.labels.get(LABEL_DISTRO, ""),
+        image.labels.get(LABEL_VERSION, ""),
         image.labels.get(LABEL_ARCH, ""),
         image.labels.get(LABEL_REQUIRES_HASH, ""),
     )
@@ -281,47 +288,49 @@ def group_of(image: Image) -> tuple[str, str, str]:
 
 def resolve_current_keys(
     images: Iterable[Image],
-    profile_for: Callable[[str], DistroProfile],
+    profile_for: Callable[[str, str], DistroProfile],
     operator: str,
     deps: ResolveDeps,
     warn: Callable[[str], None],
-) -> dict[tuple[str, str, str], str]:
-    """Resolve each present ``(distro, arch, requires-hash)`` group's current key (D10).
+) -> dict[tuple[str, str, str, str], str]:
+    """Resolve each present ``(family, version, arch, requires-hash)`` group's key (D-9/D10).
 
-    For every distinct ``(distro, arch, requires-hash)`` group present in
+    For every distinct ``(family, version, arch, requires-hash)`` group present in
     ``images``, resolve that group's current content key (reusing
     :func:`base_fingerprint` + :func:`content_key` through the injected ``deps``
     seam, with the group's recorded ``requires`` recovered from
-    :func:`_requires_of`) and return the ``{(distro, arch, requires-hash):
-    current_key}`` mapping. Because ``requires`` is part of the group identity, a
-    docker group and a docker-less group of one distro+arch each resolve their own
-    current key — neither supersedes the other (the reap data-loss guard).
+    :func:`_requires_of`) and return the ``{(family, version, arch, requires-hash):
+    current_key}`` mapping. Because both ``version`` and ``requires`` are part of
+    the group identity, a sibling version — and a docker vs docker-less group of one
+    family+version+arch — each resolve their own current key; neither supersedes the
+    other (the reap data-loss guard).
 
     **Fail-safe** (D10): a group whose current key cannot be resolved — e.g. a
-    rescue-write mirror is down and ``resolve_and_verify`` raises — is **skipped
-    and warned**, never treated as fully superseded. The group is simply absent
-    from the returned mapping (the caller keeps every image in an unmapped
-    group), so an unverifiable group is never deleted. Resolvable groups are
-    still resolved (partial success). ``profile_for`` maps a distro key to its
-    profile (e.g. ``vmlease.distro.get_profile``); ``warn`` is the injected
+    rescue-write mirror is down and ``resolve_and_verify`` raises, OR an OLD image
+    carries no :data:`LABEL_VERSION` so ``version=""`` and ``profile_for(family, "")``
+    raises — is **skipped and warned**, never treated as fully superseded. The group
+    is simply absent from the returned mapping (the caller keeps every image in an
+    unmapped group), so an unverifiable group is never deleted. Resolvable groups are
+    still resolved (partial success). ``profile_for`` maps a ``(family, version)`` to
+    its profile (e.g. ``vmlease.distro.get_profile``); ``warn`` is the injected
     sink for the skip notice (no I/O in this module).
     """
-    groups: dict[tuple[str, str, str], str] = {}
-    seen: set[tuple[str, str, str]] = set()
+    groups: dict[tuple[str, str, str, str], str] = {}
+    seen: set[tuple[str, str, str, str]] = set()
     for image in images:
         group = group_of(image)
         if group in seen:
             continue
         seen.add(group)
-        distro_key, arch, _requires_hash = group
+        family, version, arch, _requires_hash = group
         requires = _requires_of(image)
         try:
-            profile = profile_for(distro_key)
+            profile = profile_for(family, version)
             groups[group] = content_key(profile, arch, operator, requires, deps)
         except Exception as exc:  # fail-safe: any resolve failure keeps the group (never delete)
             warn(
                 f"cannot resolve current cache key for group "
-                f"(distro={distro_key!r}, arch={arch!r}, requires={list(requires)!r}): "
-                f"{exc}; keeping its images"
+                f"(family={family!r}, version={version!r}, arch={arch!r}, "
+                f"requires={list(requires)!r}): {exc}; keeping its images"
             )
     return groups

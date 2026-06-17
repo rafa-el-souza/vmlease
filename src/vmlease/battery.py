@@ -71,7 +71,7 @@ from types import MappingProxyType
 
 from vmlease.assertions import _ASSERTIONS
 from vmlease.capabilities import known_capabilities
-from vmlease.distro import _SYSTEM_UPDATE_BY_MANAGER, PROFILES
+from vmlease.distro import _SYSTEM_UPDATE_BY_MANAGER, FAMILIES
 from vmlease.model import (
     Assertion,
     Battery,
@@ -102,8 +102,13 @@ def _known_managers() -> frozenset[str]:
 
 
 def _known_distros() -> frozenset[str]:
-    """The known distro selector / allowlist set (the profile registry's keys)."""
-    return frozenset(PROFILES)
+    """The known **family** selector / allowlist set (the registry's family names).
+
+    A prep selector keys on the distro **family** (D-11) — version-agnostic — so a
+    ``distros = ["ubuntu"]`` step or an ``[prep.packages]`` ``ubuntu`` key matches
+    every ubuntu host regardless of its version.
+    """
+    return FAMILIES
 
 
 class BatteryError(ValueError):

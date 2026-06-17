@@ -139,7 +139,7 @@ def build_create_argv(spec: HostSpec, user_data_path: str) -> list[str]:
         "server",
         "create",
         "--name",
-        spec.name,
+        spec.server_name,
         "--image",
         spec.image,
         "--type",

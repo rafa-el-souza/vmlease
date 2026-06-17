@@ -7,7 +7,7 @@ capability). Each capability is realized per **package-manager** by an inert
 fragment — held in a two-level read-only registry keyed ``capability →
 manager → recipe``.
 
-This mirrors :mod:`vmlease.distro`'s ``PROFILES`` / ``get_profile`` /
+This mirrors :mod:`vmlease.distro`'s ``get_profile`` /
 ``UnknownDistroError`` idiom (frozen data + a typed accessor), NOT the
 ``RescueImageSpec`` Protocol: a recipe is inert data with no call-time I/O and no
 trust gate, and the per-manager differences are data, not algorithm — so a
@@ -112,7 +112,7 @@ _DOCKER_PACKAGES_PACMAN = (
 # The capability registry: ``capability → package_manager → recipe``. Both levels
 # are frozen (``MappingProxyType``) — a static registry populated once at import;
 # a runtime mutation would be a bug, so the type system + runtime both forbid it
-# (immutability rule; global-state hygiene), mirroring ``distro.PROFILES``.
+# (immutability rule; global-state hygiene), mirroring ``distro``'s registry.
 #
 # Docker is the v1 vocabulary (the only capability). The recipe content is the
 # byte-identical move of the apt/dnf docker install blocks + Arch's static bundle +

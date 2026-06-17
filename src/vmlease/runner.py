@@ -1,6 +1,6 @@
-"""Runner — compose a matrix into host specs, plan it, and execute it.
+"""Runner — compose a run request into host specs, plan it, and execute it.
 
-Turns a (battery, distro-keys, server-type) matrix into labelled
+Turns a (battery, distro-keys, server-type) run request into labelled
 :class:`~vmlease.model.HostSpec` objects, gates them through the cost guard, and
 either renders a ``plan`` that makes **zero** provider calls or runs the
 provision -> probe -> teardown loop. Plan and execute build their specs from the
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     from vmlease.distro import DistroProfile
     from vmlease.keypair import Keypair
-    from vmlease.model import Host, Image, UploadSpec
+    from vmlease.model import Host, Image, ResolvedHost, UploadSpec
     from vmlease.providers import Provider
     from vmlease.rescue_image import ResolveDeps
     from vmlease.ssh import SshRunner
@@ -70,87 +70,94 @@ def _kept_note(host: Host, operator: str, key_path: Path) -> str:
 
 @dataclass(frozen=True)
 class KeepPolicy:
-    """Which hosts to leave live after a run. ``keep_all`` keeps every host; else
-    only hosts whose ``distro_key`` is in ``distros``. The empty default keeps none."""
+    """Which hosts to leave live after a run. ``keep_all`` keeps every host; else a
+    host is kept iff its bare ``name`` is in ``names`` OR its ``family`` is in
+    ``families``. The empty default keeps none. The ``family:``-prefix split is the
+    CLI's job, so ``keeps`` is a pure membership test (D-7)."""
 
     keep_all: bool = False
-    distros: frozenset[str] = frozenset()
+    names: frozenset[str] = frozenset()
+    families: frozenset[str] = frozenset()
 
-    def keeps(self, distro_key: str) -> bool:
-        return self.keep_all or distro_key in self.distros
+    def keeps(self, name: str, family: str) -> bool:
+        return self.keep_all or name in self.names or family in self.families
 
     @property
     def any_kept(self) -> bool:
-        return self.keep_all or bool(self.distros)
+        return self.keep_all or bool(self.names) or bool(self.families)
 
 
 @dataclass(frozen=True)
-class Matrix:
-    """A run request: one workload across N distros on one server type.
+class RunRequest:
+    """A run request: one workload across N resolved hosts.
 
     Attributes:
         workload: The injected :class:`~vmlease.workload.Workload` to run on every
             host (e.g. ``ProbeWorkload`` for the probe battery). The runner never
             names a concrete impl — the caller constructs and injects it.
-        distro_keys: Which :mod:`vmlease.distro` profiles to provision.
-        server_type: The (cheap, allowlisted) instance size for every host.
+        hosts: The resolved hosts to provision (each carries its own ``os``,
+            ``image``, ``server_type``, ``firewall``, ``requires`` — D-3). The
+            expander (:mod:`vmlease.hosts`) produces these with unique names.
         run_token: The determinism seam for the run-id (a slug/timestamp the
             caller supplies — NOT read from the clock here).
-        firewall: Optional provider firewall name attached to every host
-            (``""`` = none).
         uploads: Files scp'd onto every host after readiness, before the workload
             (``()`` = none). Validated host-independently before any spend.
-        requires: The vmlease-provided capabilities every host in the run needs
-            (a provisioning attribute, default-off — ``()`` means no capability).
-            The CLI lifts this from the battery and canonicalizes it; the runner
-            propagates it onto every :class:`~vmlease.model.HostSpec`.
+        keep_policy: Which hosts to leave live after the run (default keeps none).
     """
 
     workload: Workload
-    distro_keys: tuple[str, ...]
-    server_type: str
+    hosts: tuple[ResolvedHost, ...]
     run_token: str
-    firewall: str = ""
     uploads: tuple[UploadSpec, ...] = ()
-    requires: tuple[str, ...] = ()
     keep_policy: KeepPolicy = KeepPolicy()
 
 
-def build_host_specs(matrix: Matrix) -> list[HostSpec]:
-    """Turn a :class:`Matrix` into one labelled :class:`HostSpec` per distro.
+def build_host_specs(req: RunRequest) -> list[HostSpec]:
+    """Turn a :class:`RunRequest` into one labelled :class:`HostSpec` per host.
 
-    Pure + deterministic (the run-id derives from ``matrix.run_token``). Every
-    spec carries the ``vmlease=<run-id>`` label so the safety layer can reap
-    the whole run. Raises :class:`~vmlease.distro.UnknownDistroError` for an
-    unknown distro key.
+    Pure + deterministic (the run-id derives from ``req.run_token``). Each host's
+    bare identity (``name``) becomes the spec's identity and is woven into the
+    provider ``server_name`` (``vmlease-{run_id}-{name}``) so it cannot collide
+    across runs. The image is **baked** from the resolved host (no re-resolution).
+    Every spec carries the ``vmlease=<run-id>`` label so the safety layer can reap
+    the whole run. Asserts bare-``name`` uniqueness fail-closed (the D-6 backstop)
+    before returning — a duplicate raises rather than surfacing as a provider
+    ``create --name`` failure. Makes **no** provider calls.
     """
-    run_id = make_run_id(matrix.run_token)
+    run_id = make_run_id(req.run_token)
     labels = run_label(run_id)
-    requires = canonical_requires(matrix.requires)
+    seen: set[str] = set()
     specs: list[HostSpec] = []
-    for key in matrix.distro_keys:
-        profile = get_profile(key)
-        # The keep marker is PER-DISTRO (a --keep subset leaves only some hosts
+    for h in req.hosts:
+        if h.name in seen:
+            raise ValueError(
+                f"duplicate host name {h.name!r} in the run request; host names "
+                f"must be unique (the expander guarantees this — a collision here "
+                f"is a bug)"
+            )
+        seen.add(h.name)
+        # The keep marker is PER-HOST (a --keep subset leaves only some hosts
         # live), so each spec's labels are built from the run label + the keep
-        # marker when this distro is kept.
+        # marker when this host's name/family is kept.
         host_labels = dict(labels)
-        if matrix.keep_policy.keeps(key):
+        if req.keep_policy.keeps(h.name, h.os.family):
             host_labels[LABEL_KEEP] = "1"
         specs.append(
             HostSpec(
-                name=f"vmlease-{run_id}-{key}",
-                image=profile.default_image,
-                server_type=matrix.server_type,
-                distro_key=key,
+                name=h.name,
+                image=h.image,
+                server_type=h.server_type,
                 labels=host_labels,
-                firewall=matrix.firewall,
-                requires=requires,
+                firewall=h.firewall,
+                requires=canonical_requires(h.requires),
+                os=h.os,
+                server_name=f"vmlease-{run_id}-{h.name}",
             )
         )
     return specs
 
 
-def validate_uploads(matrix: Matrix) -> None:
+def validate_uploads(req: RunRequest) -> None:
     """Validate every upload's source + remote dest, fail-closed, before spend.
 
     Host-independent (the local file and remote path are the same for every
@@ -159,12 +166,12 @@ def validate_uploads(matrix: Matrix) -> None:
     at the top of both ``plan`` (zero provider calls) and ``execute`` (before the
     provision loop), so a bad ``--upload`` aborts before any host is created.
     """
-    for spec in matrix.uploads:
+    for spec in req.uploads:
         validate_upload_source(spec.local)
         validate_remote_dest(spec.remote)
 
 
-def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
+def plan(req: RunRequest, *, cost_guard: CostGuard | None = None) -> list[PlanItem]:
     """Render the dry-run plan. Makes **zero** provider calls.
 
     Builds the host specs (the same ones a real run would provision), validates
@@ -179,19 +186,19 @@ def plan(matrix: Matrix, *, cost_guard: CostGuard | None = None) -> list[PlanIte
     always shows the cold image (a hit only changes which image is *created*, not
     the host set), keeping the dry-run faithful and call-free.
     """
-    validate_uploads(matrix)
-    specs = build_host_specs(matrix)
+    validate_uploads(req)
+    specs = build_host_specs(req)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
-    workload_summary = matrix.workload.plan_summary
+    workload_summary = req.workload.plan_summary
     return [
         PlanItem(
             host_name=s.name,
             image=s.image,
             server_type=s.server_type,
-            distro_key=s.distro_key,
             workload_summary=workload_summary,
             requires=s.requires,
+            os=s.os,
         )
         for s in specs
     ]
@@ -222,7 +229,7 @@ OnReady = Callable[["Host", "SshRunner", "Provider"], R]
 
 
 def execute(
-    matrix: Matrix,
+    req: RunRequest,
     provider: Provider,
     ssh_factory: Callable[[str, Keypair], SshRunner],
     keypair: Keypair,
@@ -244,14 +251,14 @@ def execute(
     rescue-write / become reachable is recorded as a ``HostRun`` with an error
     detail and zero results (NOT a raise), so :func:`execute` always returns
     one ``HostRun`` per requested host and the caller always writes a results file.
-    The injected ``matrix.workload`` owns what runs on each ready host. The keypair
-    is cleaned once at the end — UNLESS the matrix's ``keep_policy`` keeps any host,
+    The injected ``req.workload`` owns what runs on each ready host. The keypair
+    is cleaned once at the end — UNLESS the request's ``keep_policy`` keeps any host,
     which leaves the host(s) standing and skips that cleanup (see ``keep_policy``).
 
     ``ssh_factory`` builds an :class:`~vmlease.ssh.SshRunner` for the operator
     + keypair (injected so tests pass a fake). ``rescue_writer`` (injected) is
-    REQUIRED when the matrix contains a ``needs_rescue_write`` distro (e.g. arch).
-    ``cost_guard`` re-checks the matrix before any provider call.
+    REQUIRED when the request contains a ``needs_rescue_write`` distro (e.g. arch).
+    ``cost_guard`` re-checks the request before any provider call.
 
     ``max_parallel`` runs up to N hosts concurrently (default 1 = serial). Each
     host is an independent, self-contained :func:`_run_one_host` (own create /
@@ -259,7 +266,7 @@ def execute(
     the gpg keyring — is read-only after setup, so concurrency is safe and the
     teardown-always guarantee holds per thread. The work is I/O-bound (subprocess
     / ssh waits release the GIL), so a thread pool is the right tool. Results are
-    returned in **matrix order** regardless of completion order. Running hosts
+    returned in **request order** regardless of completion order. Running hosts
     concurrently also sidesteps Hetzner's recycled-IP-into-the-next-host behavior
     (hosts overlap, so an IP is not freed mid-run).
 
@@ -268,7 +275,7 @@ def execute(
     or via ``as_completed`` in parallel mode (NOT from a worker thread, so a sink
     that does I/O sees no concurrent calls). It lets the caller persist results
     incrementally (so an abort still leaves the finished hosts on disk) without
-    changing the matrix-ordered aggregate return.
+    changing the request-ordered aggregate return.
 
     ``resolve_deps`` (injected, optional) activates the **cache-aware** restore
     path: when present, each host first tries the content-addressed cached image
@@ -280,21 +287,21 @@ def execute(
     ``reap_bad_cache_image`` (opt-in, default off) reaps the source image when a
     *restored* host fails readiness (G4); default is a hint only (the image is
     named in the failure detail but kept, so a real fault is not masked).
-    ``matrix.keep_policy`` decides which hosts are left RUNNING (billable) instead
+    ``req.keep_policy`` decides which hosts are left RUNNING (billable) instead
     of being torn down: a kept host carries the ``LABEL_KEEP`` marker (stamped on its
     spec in :func:`build_host_specs`), leaves a KEPT note + a structured
     :class:`~vmlease.model.KeptHost` record (how to SSH in), and — when ANY host is
     kept — the keypair is NOT cleaned, so the printed ``ssh -i <path>`` points at a
     live file.
     """
-    validate_uploads(matrix)
-    specs = build_host_specs(matrix)
+    validate_uploads(req)
+    specs = build_host_specs(req)
     guard = cost_guard or CostGuard()
     guard.check([s.server_type for s in specs])
 
     def _one(spec: HostSpec) -> HostRun:
         return _run_one_host(
-            spec, matrix.workload, provider, ssh_factory, keypair, operator, rescue_writer, matrix.uploads,
+            spec, req.workload, provider, ssh_factory, keypair, operator, rescue_writer, req.uploads,
             resolve_deps=resolve_deps, reap_bad_cache_image=reap_bad_cache_image,
         )
 
@@ -313,7 +320,7 @@ def execute(
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(max_workers=min(max_parallel, len(specs))) as pool:
-            # Submit keeps a future->index map so the aggregate stays in matrix
+            # Submit keeps a future->index map so the aggregate stays in request
             # order; as_completed lets the main thread call the sink as each host
             # finishes (the workers never touch on_host_complete).
             futures = {pool.submit(_one, spec): idx for idx, spec in enumerate(specs)}
@@ -329,7 +336,7 @@ def execute(
                 # propagating BaseException (e.g. a worker's KeyboardInterrupt) would
                 # otherwise drop hosts that already finished cleanly but whose
                 # as_completed turn hadn't arrived. Fire on_host_complete for each
-                # done, non-cancelled, not-yet-recorded future (in matrix order) so
+                # done, non-cancelled, not-yet-recorded future (in request order) so
                 # their results persist like the serial path, then re-raise.
                 for future, idx in sorted(futures.items(), key=lambda kv: kv[1]):
                     if ordered[idx] is not None or future.cancelled() or not future.done():
@@ -346,7 +353,7 @@ def execute(
         # When the keep policy keeps ANY host the private key must SURVIVE the run
         # so the printed ``ssh -i <path>`` points at a real file the operator can use
         # against the still-live host(s). Otherwise the key dir is reaped as usual.
-        if not matrix.keep_policy.any_kept:
+        if not req.keep_policy.any_kept:
             keypair.cleanup()
 
 
@@ -394,16 +401,17 @@ def _run_one_host(
     """
     from vmlease.model import HostRun
 
-    profile = get_profile(spec.distro_key)
+    profile = get_profile(spec.os.family, spec.os.version)
 
     def cold_plan_create(_profile: DistroProfile) -> tuple[str, str, bool]:
-        # ``run``'s COLD path: the profile's default image + the full cloud-init +
+        # ``run``'s COLD path: the spec's baked image + the full cloud-init +
         # the profile's own rescue flag. A rescue-write distro's base host gets the
         # SAME cloud-init; the written cloudimg re-applies it from the hetzner
         # datasource. cloud-init is rendered (+ validated) before create, so a
-        # template defect fails before spend.
+        # template defect fails before spend. The image is the spec's baked
+        # ``image`` (so plan/execute can't drift from the resolved version).
         cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
-        return _profile.default_image, cloud_init, _profile.needs_rescue_write
+        return spec.image, cloud_init, _profile.needs_rescue_write
 
     # Build the candidate list. The cold candidate is ALWAYS the fallback; a cache
     # hit prepends a restore candidate (and records the source image for the G4
@@ -582,7 +590,7 @@ def _lookup_cache_image(
         key = content_key(profile, arch, operator, requires, deps)
         images = provider.list_images(label_selector_purpose())
     except Exception as exc:  # lookup failure → advisory miss, never a host failure
-        warn(f"cache lookup failed for {profile.key!r} (arch={arch!r}); using cold path: {exc}")
+        warn(f"cache lookup failed for {profile.family!r} (arch={arch!r}); using cold path: {exc}")
         return None
     return _first_matching_image(images, key=key, arch=arch, target_disk=target_disk)
 
@@ -675,7 +683,7 @@ def _with_ready_host(
         if needs_rescue:
             if rescue_writer is None:
                 raise RuntimeError(
-                    f"distro {profile.key!r} needs a rescue-write transform but no "
+                    f"distro {profile.family!r} needs a rescue-write transform but no "
                     f"rescue_writer was provided to execute()"
                 )
             rescue_writer(host, profile)
@@ -702,7 +710,8 @@ def _with_ready_host(
                             name=host.name,
                             id=host.id,
                             ipv4=host.ipv4,
-                            distro=spec.distro_key,
+                            family=spec.os.family,
+                            version=spec.os.version,
                             operator=operator,
                             key_path=str(keypair.private_key_path),
                         )
@@ -922,7 +931,7 @@ def build_one_image(
         # the profile's own rescue flag (a rescue-write distro's builder is written
         # then prepped before the snapshot captures it).
         cloud_init = render_cloudinit(_profile, operator, keypair.public_key, spec.requires)
-        return _profile.default_image, cloud_init, _profile.needs_rescue_write
+        return _profile.image, cloud_init, _profile.needs_rescue_write
 
     return _with_ready_host(
         spec,

@@ -28,6 +28,19 @@ class Outcome(NamedTuple):
     stderr: str
 
 
+class Os(NamedTuple):
+    """A host's operating system as a ``(family, version)`` pair.
+
+    Immutable + hashable (a ``NamedTuple``) so it can key dicts and feed label
+    derivation. ``family`` is the :mod:`vmlease.distro` family selector (e.g.
+    ``"ubuntu"``); ``version`` is the distro version (e.g. ``"24.04"``) or
+    :data:`vmlease.distro.ROLLING` for rolling-release families.
+    """
+
+    family: str
+    version: str
+
+
 @runtime_checkable
 class Assertion(Protocol):
     """A predicate over a probe's :class:`Outcome` — structural typing only.
@@ -129,8 +142,8 @@ class PrepStep:
         command: The **resolved** shell run over SSH as the operator (``sudo``
             inline where root is needed) — the verbatim inline ``run`` block, or
             the contents of the step's ``script`` file. Runs verbatim.
-        distros: The distro-key allowlist this step runs on (``()`` — the default
-            — means every distro). A host whose distro is excluded skips the step.
+        distros: The family allowlist this step runs on (``()`` — the default
+            — means every family). A host whose family is excluded skips the step.
         required: When ``True`` (the default), a non-zero exit aborts the host
             (a hard prep failure); when ``False``, the failure is recorded and the
             phase continues (a soft prep failure).
@@ -168,12 +181,12 @@ class PrepStepResult:
 
 @dataclass(frozen=True)
 class Prep:
-    """A battery's declared prep phase: per-distro packages + ordered setup steps.
+    """A battery's declared prep phase: per-family packages + ordered setup steps.
 
     ``packages`` is a frozen mapping ``{selector: tuple[str, ...]}`` whose every
-    key is a known package-manager OR a known distro (the two name-sets are
+    key is a known package-manager OR a known family (the two name-sets are
     disjoint); the effective per-host set is the union of the host's manager list
-    and its distro list, deduplicated, manager entries first. ``setup`` is the
+    and its family list, deduplicated, manager entries first. ``setup`` is the
     ordered :class:`PrepStep` list, run in authoring order after the package pass.
     """
 
@@ -204,22 +217,43 @@ class Battery:
 
 
 @dataclass(frozen=True)
+class ResolvedHost:
+    """A fully-resolved host request: bare identity + ``(family, version)`` os.
+
+    The output of the expander's resolve phase (:mod:`vmlease.hosts`) and the
+    input to ``build_host_specs``. ``name`` is the host's bare identity (auto-named
+    or explicit, NOT the provider server name — that is derived from it). ``image``
+    is baked from the registry so no version re-resolution happens downstream.
+    """
+
+    name: str
+    os: Os
+    image: str
+    server_type: str
+    firewall: str = ""
+    requires: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class HostSpec:
     """A request for one VM: which image, which size, labelled for teardown.
 
     Attributes:
-        name: Provider-unique server name (carries the run-id for reaping).
+        name: The host's bare identity (used by ``--keep``, the results record,
+            and the matrix column).
         image: Provider image slug (e.g. ``"ubuntu-24.04"``).
         server_type: Provider size slug (e.g. ``"cpx22"``).
+        os: The host's ``(family, version)`` os.
+        server_name: The provider-unique server name (carries the run-id for
+            reaping; ``vmlease-{run_id}-{name}``).
         labels: Key/value labels applied to the resource (always includes the
             ``vmlease=<run-id>`` label the safety layer adds).
-        distro_key: The :mod:`vmlease.distro` profile key (e.g. ``"ubuntu"``).
         firewall: Optional provider firewall name to attach at create time
             (``""`` = none). Restricting inbound to the operator's IP is good
             hygiene for a host that boots an unconfigured cloud image.
         requires: The vmlease-provided capabilities this host needs (canonical
             order, default-off — ``()`` means no capability). Propagated from the
-            run's :class:`~vmlease.runner.Matrix` onto every host so the runner
+            run's :class:`~vmlease.runner.RunRequest` onto every host so the runner
             (and the cache key) can gate capability inclusion per host without
             reading the opaque battery.
     """
@@ -227,10 +261,16 @@ class HostSpec:
     name: str
     image: str
     server_type: str
-    distro_key: str
+    os: Os
+    server_name: str
     labels: dict[str, str] = field(default_factory=dict)
     firewall: str = ""
     requires: tuple[str, ...] = ()
+
+    @property
+    def family(self) -> str:
+        """The host's distro family (from :attr:`os`)."""
+        return self.os.family
 
 
 @dataclass(frozen=True)
@@ -349,12 +389,16 @@ class ProbeResult:
 @dataclass(frozen=True)
 class KeptHost:
     """Reattach coordinates for a host left live by ``--keep`` — the structured
-    record a future ``vmlease attach`` reads (and the durable form of the KEPT note)."""
+    record a future ``vmlease attach`` reads (and the durable form of the KEPT note).
+
+    ``name`` is the bare host identity; ``family`` + ``version`` are the host's
+    ``os`` decomposed (so the reattach record is version-aware, D-8)."""
 
     name: str
     id: str
     ipv4: str
-    distro: str
+    family: str
+    version: str
     operator: str
     key_path: str
 
@@ -394,11 +438,12 @@ class PlanItem:
     (e.g. ``probes=3`` for the probe battery) — the plan does not assume probes.
     ``requires`` surfaces the host's vmlease-provided capabilities (canonical
     order, ``()`` when none) so the operator can review them before any spend.
+    ``os`` carries the host's ``(family, version)``.
     """
 
     host_name: str
     image: str
     server_type: str
-    distro_key: str
     workload_summary: str
+    os: Os
     requires: tuple[str, ...] = ()

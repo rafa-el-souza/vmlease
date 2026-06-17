@@ -16,17 +16,18 @@ the timestamp and run-id come from the raw document, never the clock. The split
 mirrors ``results.py`` — a pure :func:`summarize_results` builder + a thin
 :func:`write_summary` I/O wrapper + a deterministic :func:`summary_filename`.
 
-Summary shape (``schema_version`` ``"3"``)::
+Summary shape (``schema_version`` ``"4"``)::
 
     {
-      "schema_version": "3",
+      "schema_version": "4",
       "source_raw": "<path or name of the raw file, informational>",
       "run_id": "<from the raw doc>",
       "timestamp": "<from the raw doc>",
       "battery": "<battery name, or null when --battery not supplied>",
       "hosts": [
         {
-          "name": "...", "distro": "...", "image": "...", "detail": "...",
+          "name": "...",                 # bare host identity (the matrix key)
+          "family": "...", "version": "...", "image": "...", "detail": "...",
           "prep_phase": {                  # step-id-keyed; {} when no [prep]
             "uv": {"exit": 0, "required": true, "verdict": "", "stderr_tail": ""}
           },
@@ -49,7 +50,7 @@ Summary shape (``schema_version`` ``"3"``)::
           "not_run": ["destroy"]             # only when --battery supplied
         }
       ],
-      "matrix": {"sandbox start": {"ubuntu": "FAIL", "fedora": "PASS"}},
+      "matrix": {"sandbox start": {"ubuntu-2204": "FAIL", "ubuntu-2404": "PASS"}},
       "totals": {"PASS": 3, "FAIL": 1, "TIMEOUT": 0, "PASS_NO_ASSERTIONS": 2,
                  "PREP_SOFT_FAIL": 0, "PREP_HARD_FAIL": 0}
     }
@@ -82,7 +83,7 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 # Constants — single source of truth for verdict strings + the contract knobs
 # --------------------------------------------------------------------------- #
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -317,17 +318,23 @@ def summarize_results(
 
     hosts: list[dict[str, Any]] = []
     totals = dict.fromkeys(ALL_VERDICTS, 0)
-    # matrix[command][distro] -> list of verdicts, collapsed worst-of at the end.
+    # matrix[command][name] -> list of verdicts, collapsed worst-of at the end.
+    # Keyed on the bare host NAME (D-8) so N same-family hosts get distinct columns.
     matrix_acc: dict[str, dict[str, list[str]]] = {}
 
     for raw_host in raw_doc["hosts"]:
-        distro = str(raw_host.get("distro", ""))
+        # The raw `"distro"` IS the family (back-compat). `name` is the bare host
+        # identity; forward-only fallback to `distro` when a pre-schema file has no
+        # `"name"` — the raw name is used AS-IS (no stripping/normalizing heuristic).
+        family = str(raw_host.get("distro", ""))
+        name = str(raw_host.get("name") or family)
+        version = str(raw_host.get("version", ""))
         probes = [_summarize_probe(p, command_map) for p in raw_host.get("probes", [])]
         observed_ids = {p["id"] for p in probes}
 
         for probe in probes:
             totals[probe["verdict"]] += 1
-            cell = matrix_acc.setdefault(probe["command"], {}).setdefault(distro, [])
+            cell = matrix_acc.setdefault(probe["command"], {}).setdefault(name, [])
             cell.append(probe["verdict"])
 
         raw_prep = raw_host.get("prep_phase", [])
@@ -336,8 +343,9 @@ def summarize_results(
         )
 
         host_record: dict[str, Any] = {
-            "name": str(raw_host.get("name", "")),
-            "distro": distro,
+            "name": name,
+            "family": family,
+            "version": version,
             "image": str(raw_host.get("image", "")),
             "detail": str(raw_host.get("detail", "")),
             "prep_phase": prep_phase,
@@ -348,8 +356,8 @@ def summarize_results(
         hosts.append(host_record)
 
     matrix = {
-        command: {distro: _worst_of(verdicts) for distro, verdicts in by_distro.items()}
-        for command, by_distro in matrix_acc.items()
+        command: {name: _worst_of(verdicts) for name, verdicts in by_name.items()}
+        for command, by_name in matrix_acc.items()
     }
 
     return {

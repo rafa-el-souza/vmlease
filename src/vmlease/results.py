@@ -29,7 +29,8 @@ def serialize_run(run_id: str, timestamp: str, host_runs: list[HostRun]) -> str:
         "hosts": [
             {
                 "name": hr.host_spec.name,
-                "distro": hr.host_spec.distro_key,
+                "distro": hr.host_spec.os.family,
+                "version": hr.host_spec.os.version,
                 "image": hr.host_spec.image,
                 "restored_image": hr.restored_image,
                 "kept_host": (
@@ -37,7 +38,8 @@ def serialize_run(run_id: str, timestamp: str, host_runs: list[HostRun]) -> str:
                         "name": hr.kept_host.name,
                         "id": hr.kept_host.id,
                         "ipv4": hr.kept_host.ipv4,
-                        "distro": hr.kept_host.distro,
+                        "family": hr.kept_host.family,
+                        "version": hr.kept_host.version,
                         "operator": hr.kept_host.operator,
                         "key_path": hr.kept_host.key_path,
                     }
