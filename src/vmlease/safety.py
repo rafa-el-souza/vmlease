@@ -285,3 +285,34 @@ def reap_except_kept(provider: Provider, run_id: str) -> list[Host]:
     for host in hosts:
         provider.destroy(host)
     return hosts
+
+
+class LiveRunError(Exception):
+    """The run-token already has live provider hosts (a cross-run collision).
+
+    Deliberately subclasses :class:`Exception` (NOT :class:`ValueError`, unlike
+    :class:`CostGuardError` / :class:`UploadError`) so the broad ``ValueError`` /
+    ``ProviderError`` handlers in the run command never swallow it — the caller
+    catches it in its own ``except`` branch and maps it to a distinct exit code
+    (D-17)."""
+
+
+def assert_no_live_run(provider: Provider, run_id: str, run_token: str) -> None:
+    """Fail closed if ``run_id`` already labels live provider hosts (D-17).
+
+    The run-token is the determinism seam (``run_id = make_run_id(token)``), so a
+    token identifies exactly one live run — two live runs sharing it would collide
+    on derived ``server_name``s and the second's label-keyed teardown could destroy
+    the first's hosts. Reuses the same ``provider.list_labeled(run_id)`` read
+    ``status`` / ``reap`` make. Pure: no printing / ``sys.exit``. Raises
+    :class:`LiveRunError` (listing the live host names + reap/different-token hint)
+    when any host is found; a :class:`~vmlease.providers.ProviderError` from the
+    read **propagates** (the caller maps it to a non-zero exit — never fail-open).
+    """
+    live = provider.list_labeled(run_id)
+    if live:
+        names = sorted(h.name for h in live)
+        raise LiveRunError(
+            f"run-token already has {len(live)} live host(s): {names}; reap them with "
+            f"`vmlease reap --run-token {run_token}` (or use a different --run-token)"
+        )

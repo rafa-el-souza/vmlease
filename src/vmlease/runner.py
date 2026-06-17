@@ -720,7 +720,8 @@ def _with_ready_host(
                             name=host.name,
                             id=host.id,
                             ipv4=host.ipv4,
-                            distro=spec.distro_key,
+                            family=spec.os.family,
+                            version=spec.os.version,
                             operator=operator,
                             key_path=str(keypair.private_key_path),
                         )

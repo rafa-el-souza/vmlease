@@ -407,12 +407,16 @@ class ProbeResult:
 @dataclass(frozen=True)
 class KeptHost:
     """Reattach coordinates for a host left live by ``--keep`` — the structured
-    record a future ``vmlease attach`` reads (and the durable form of the KEPT note)."""
+    record a future ``vmlease attach`` reads (and the durable form of the KEPT note).
+
+    ``name`` is the bare host identity; ``family`` + ``version`` are the host's
+    ``os`` decomposed (so the reattach record is version-aware, D-8)."""
 
     name: str
     id: str
     ipv4: str
-    distro: str
+    family: str
+    version: str
     operator: str
     key_path: str
 

@@ -2192,6 +2192,114 @@ class TestKeepPolicy(unittest.TestCase):
         self.assertTrue(runner.KeepPolicy(families=frozenset({"x"})).any_kept)
 
 
+class TestLiveRunPreflight(unittest.TestCase):
+    def _provider_with_live_host(self, run_id: str) -> FakeProvider:
+        prov = FakeProvider()
+        prov.create_with_cloudinit(
+            model.HostSpec(
+                name="ubuntu", image="ubuntu-24.04", server_type="cpx22",
+                distro_key="ubuntu", labels={safety.LABEL_KEY: run_id},
+                server_name=f"vmlease-{run_id}-ubuntu",
+            ),
+            "ci",
+        )
+        return prov
+
+    # --- safety.assert_no_live_run ---------------------------------------- #
+    def test_live_run_error_is_exception_not_value_error(self) -> None:
+        self.assertTrue(issubclass(safety.LiveRunError, Exception))
+        self.assertFalse(issubclass(safety.LiveRunError, ValueError))
+
+    def test_assert_no_live_run_raises_on_live_hosts(self) -> None:
+        run_id = safety.make_run_id("tok-live")
+        prov = self._provider_with_live_host(run_id)
+        with self.assertRaises(safety.LiveRunError) as ctx:
+            safety.assert_no_live_run(prov, run_id, "tok-live")
+        msg = str(ctx.exception)
+        self.assertIn("ubuntu", msg)  # the live host name
+        self.assertIn("vmlease reap --run-token tok-live", msg)  # the hint
+
+    def test_assert_no_live_run_clean_does_not_raise(self) -> None:
+        run_id = safety.make_run_id("tok-clean")
+        safety.assert_no_live_run(FakeProvider(), run_id, "tok-clean")  # must not raise
+
+    def test_assert_no_live_run_propagates_provider_error(self) -> None:
+        class _Boom(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("api down")
+
+        with self.assertRaises(providers.ProviderError):
+            safety.assert_no_live_run(_Boom(), "rid", "tok")
+
+    # --- _cmd_run wiring -------------------------------------------------- #
+    def _run_cmd(self, d: str, prov: FakeProvider, token: str) -> tuple[int, str, list[str]]:
+        from unittest import mock
+        battery = _write_battery_bundle(d, _DEMO_BATTERY)
+        ns = cli.build_parser().parse_args([
+            "run", "--battery", battery, "--hosts", "ubuntu",
+            "--results-dir", str(Path(d) / "r"), "--timestamp", "T", "--run-token", token, "--yes",
+        ])
+        gen_calls: list[str] = []
+
+        def _spy_keygen(rid: str) -> keypair.Keypair:
+            gen_calls.append(rid)
+            return _fake_keypair(Path(d))
+
+        err = io.StringIO()
+        with mock.patch.object(cli, "HetznerProvider", lambda: prov), \
+                mock.patch.object(cli, "generate_keypair", _spy_keygen), \
+                mock.patch.object(cli, "OpenSshRunner", lambda *a, **k: FakeSshRunner()), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = cli._cmd_run(ns, reader=lambda _p: "y")
+        return rc, err.getvalue(), gen_calls
+
+    def test_cmd_run_live_token_exits_2_nothing_provisioned(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            run_id = safety.make_run_id("cli-live")
+            prov = self._provider_with_live_host(run_id)
+            rc, err, gen = self._run_cmd(d, prov, token="cli-live")
+            self.assertEqual(rc, 2)
+            self.assertIn("live host", err)
+            self.assertEqual(gen, [])  # no keypair → nothing provisioned
+
+    def test_cmd_run_preflight_provider_error_exits_1(self) -> None:
+        class _Boom(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise providers.ProviderError("api down")
+
+        with tempfile.TemporaryDirectory() as d:
+            rc, _err, gen = self._run_cmd(d, _Boom(), token="cli-pe")
+            self.assertEqual(rc, 1)
+            self.assertEqual(gen, [])
+
+    def test_cmd_run_clean_token_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, _err, gen = self._run_cmd(d, FakeProvider(), token="cli-ok")
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(gen), 1)  # keypair generated → proceeded past pre-flight
+
+    def test_plan_command_makes_no_preflight_call(self) -> None:
+        from unittest import mock
+
+        class _NoLive(FakeProvider):
+            def list_labeled(self, run_id: str) -> list[Host]:
+                raise AssertionError("plan must make no pre-flight call")
+
+        with tempfile.TemporaryDirectory() as d:
+            battery = _write_battery_bundle(d, _DEMO_BATTERY)
+            with mock.patch.object(cli, "HetznerProvider", _NoLive), redirect_stdout(io.StringIO()):
+                rc = cli.main(["plan", "--battery", battery, "--hosts", "ubuntu", "--run-token", "cli-plan"])
+            self.assertEqual(rc, 0)
+
+    # --- KeptHost reattach record carries name/family/version ------------- #
+    def test_kept_host_record_carries_name_family_version(self) -> None:
+        kh = model.KeptHost(
+            name="ubuntu-2204", id="id-1", ipv4="10.0.0.1",
+            family="ubuntu", version="22.04", operator="probe", key_path="/k",
+        )
+        self.assertEqual((kh.name, kh.family, kh.version), ("ubuntu-2204", "ubuntu", "22.04"))
+
+
 # --------------------------------------------------------------------------- #
 # cli — plan subcommand (zero provider calls)
 # --------------------------------------------------------------------------- #
@@ -4326,7 +4434,8 @@ class TestKeepFlag(unittest.TestCase):
         self.assertIsNotNone(kept)
         assert kept is not None  # narrow for the type checker
         self.assertEqual(kept.name, "ubuntu")  # bare identity post-cutover
-        self.assertEqual(kept.distro, "ubuntu")
+        self.assertEqual(kept.family, "ubuntu")
+        self.assertEqual(kept.version, "24.04")
         self.assertEqual(kept.ipv4, "10.0.0.1")  # the ubuntu host's ip
         self.assertEqual(kept.operator, "probe")
         self.assertEqual(kept.key_path, str(kp.private_key_path))
@@ -4543,7 +4652,8 @@ class TestKeepFlag(unittest.TestCase):
                 "name": "ubuntu",
                 "id": "id-ubuntu",
                 "ipv4": "10.0.0.1",
-                "distro": "ubuntu",
+                "family": "ubuntu",
+                "version": "24.04",
                 "operator": "probe",
                 "key_path": str(kp.private_key_path),
             },
@@ -5330,7 +5440,16 @@ class TestCliRun(unittest.TestCase):
                 raise KeyboardInterrupt("operator hit Ctrl-C")
 
         class _ReapFails(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self._calls = 0
+
             def list_labeled(self, run_id: str) -> list[Host]:
+                # the D-17 pre-flight reads first (clean token → []); the LATER
+                # backstop reap is the one that fails.
+                self._calls += 1
+                if self._calls == 1:
+                    return []
                 raise providers.ProviderError("request timeout")
 
         prov = _ReapFails()
@@ -6891,6 +7010,38 @@ class TestCliBuildImage(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(prov.created, [])  # no builder
         self.assertEqual(prov.created_images, [])  # no new image
+        self.assertIn("already cached", out)
+
+    def test_build_image_live_token_exits_2(self) -> None:
+        # D-17: a build-image whose run-token already has live hosts is refused
+        # (exit 2) before any build.
+        run_id = safety.make_run_id("bird")
+        prov = FakeProvider()
+        prov.create_with_cloudinit(
+            model.HostSpec(name="x", image="i", server_type="cpx22", distro_key="ubuntu",
+                           labels={safety.LABEL_KEY: run_id}), "ci")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _o, err = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 2)
+        self.assertIn("live host", err)
+        self.assertEqual(prov.created_images, [])  # nothing built
+
+    def test_build_image_cached_noop_skips_preflight(self) -> None:
+        # the idempotent no-op returns 0 BEFORE the pre-flight — even with a live host
+        # on the token, a cached build stays a free no-op (pre-flight NOT reached).
+        run_id = safety.make_run_id("bird")
+        prov = FakeProvider()
+        prov.images["img-cur"] = self._cache_img(key=self._key(), img_id="img-cur")
+        prov.create_with_cloudinit(
+            model.HostSpec(name="x", image="i", server_type="cpx22", distro_key="ubuntu",
+                           labels={safety.LABEL_KEY: run_id}), "ci")
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _e = self._run(
+                prov, ["build-image", "--distro", "ubuntu", "--run-token", "bird", "--yes"], tmp=d,
+            )
+        self.assertEqual(rc, 0)  # no-op wins over the pre-flight
         self.assertIn("already cached", out)
 
     def test_at_cap_s_empty_refuses_exit_1_no_builder(self) -> None:

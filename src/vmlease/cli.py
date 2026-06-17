@@ -86,7 +86,9 @@ from vmlease.safety import (
     CostGuardError,
     ImageQuotaError,
     ImageQuotaGuard,
+    LiveRunError,
     UploadError,
+    assert_no_live_run,
     label_selector_purpose,
     make_run_id,
     reap,
@@ -280,6 +282,24 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
 
     _warn_battery(battery)
     print(f"battery: {battery.name}  ({len(battery.probes)} probes)")
+
+    # Cross-run safety pre-flight (D-17): refuse to start if this run-token already
+    # has live hosts (a shared token would collide on server_names and the
+    # label-keyed teardown could destroy the other run's hosts). Runs AFTER the pure
+    # local checks (battery / cost-guard / --keep / dup-name) and BEFORE the billing
+    # confirm — the first provider call (a read). A LiveRunError → exit 2 (fail
+    # closed); a ProviderError (liveness unverifiable) → exit 1 (never fail-open).
+    run_id = make_run_id(args.run_token)
+    provider = HetznerProvider()
+    try:
+        assert_no_live_run(provider, run_id, args.run_token)
+    except LiveRunError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     print(f"about to PROVISION {len(items)} real host(s) (billable):")
     for it in items:
         requires_note = f"  requires={list(it.requires)}" if it.requires else ""
@@ -312,14 +332,11 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
                 file=sys.stderr,
             )
 
-    run_id = make_run_id(args.run_token)
     try:
         keypair = generate_keypair(run_id)
     except KeypairError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-
-    provider = HetznerProvider()
 
     def _ssh_factory(operator: str, kp: object) -> OpenSshRunner:
         return OpenSshRunner(operator, keypair.private_key_path, probe_timeout_default=args.probe_timeout)
@@ -563,6 +580,20 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     if already and not args.rebuild:
         print(f"already cached (key {key}); nothing to do")
         return 0
+
+    # Cross-run safety pre-flight (D-17): refuse to start if this run-token already
+    # has live hosts. Placed AFTER the idempotent no-op (a cached build is a free
+    # no-op and must not do a needless live read) and BEFORE the quota/prune/confirm
+    # block. LiveRunError → exit 2 (fail closed); ProviderError → exit 1 (never
+    # fail-open).
+    try:
+        assert_no_live_run(provider, run_id, args.run_token)
+    except LiveRunError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # Quota + D8(B) prune ordering. S = same-(distro, arch, requires-hash) cache
     # images whose key differs from K_new (this group's superseded predecessors).
