@@ -34,6 +34,7 @@ from vmlease import (
     cli,
     cloudinit,
     distro,
+    hosts,
     imagecache,
     keypair,
     model,
@@ -398,6 +399,100 @@ class TestOsAndResolvedHost(unittest.TestCase):
         )
         self.assertEqual(item.os, model.Os("", ""))
         self.assertEqual(item.distro_key, "ubuntu")
+
+
+class TestHostsParse(unittest.TestCase):
+    def test_bare_family(self) -> None:
+        self.assertEqual(hosts.parse("ubuntu"), [hosts.HostEntry(None, "ubuntu", None)])
+
+    def test_name_prefix(self) -> None:
+        self.assertEqual(hosts.parse("api=ubuntu"), [hosts.HostEntry("api", "ubuntu", None)])
+
+    def test_version_suffix(self) -> None:
+        self.assertEqual(hosts.parse("ubuntu@22.04"), [hosts.HostEntry(None, "ubuntu", "22.04")])
+
+    def test_name_and_version(self) -> None:
+        self.assertEqual(
+            hosts.parse("api=ubuntu@22.04"), [hosts.HostEntry("api", "ubuntu", "22.04")]
+        )
+
+    def test_comma_separates_two_entries(self) -> None:
+        self.assertEqual(
+            hosts.parse("ubuntu,debian"),
+            [hosts.HostEntry(None, "ubuntu", None), hosts.HostEntry(None, "debian", None)],
+        )
+
+    def test_no_grouping_shorthand_is_two_entries(self) -> None:
+        # The comma is the entry separator: "ubuntu@22.04,24.04" is TWO entries
+        # (the bogus "24.04" family is rejected later, at resolve — not here).
+        self.assertEqual(
+            hosts.parse("ubuntu@22.04,24.04"),
+            [hosts.HostEntry(None, "ubuntu", "22.04"), hosts.HostEntry(None, "24.04", None)],
+        )
+
+    def test_split_on_first_delimiters(self) -> None:
+        # split on FIRST '=' then FIRST '@'
+        self.assertEqual(
+            hosts.parse("a=b=c"), [hosts.HostEntry("a", "b=c", None)]
+        )
+        self.assertEqual(
+            hosts.parse("ubuntu@22@04"), [hosts.HostEntry(None, "ubuntu", "22@04")]
+        )
+
+    def test_empty_string_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("")
+
+    def test_double_comma_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("ubuntu,,debian")
+
+    def test_trailing_comma_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("ubuntu,")
+
+    def test_empty_family_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("@22.04")
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("name=@22.04")
+
+    def test_empty_version_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("ubuntu@")
+
+    def test_empty_name_errors(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.parse("=ubuntu")
+
+
+class TestHostsValidateName(unittest.TestCase):
+    def test_accepts_valid_names(self) -> None:
+        for name in ("ubuntu", "ubuntu-2204", "api", "a", "a1", "x" * 63):
+            hosts.validate_name(name)  # must not raise
+
+    def test_rejects_uppercase_and_underscore(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.validate_name("My_Host")
+
+    def test_rejects_empty(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.validate_name("")
+
+    def test_rejects_too_long(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.validate_name("x" * 64)
+
+    def test_rejects_leading_and_trailing_hyphen(self) -> None:
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.validate_name("-ubuntu")
+        with self.assertRaises(hosts.HostSpecError):
+            hosts.validate_name("ubuntu-")
+
+    def test_rejects_delimiter_chars(self) -> None:
+        for name in ("a@b", "a=b", "a:b", "a,b"):
+            with self.assertRaises(hosts.HostSpecError):
+                hosts.validate_name(name)
 
 
 # --------------------------------------------------------------------------- #
