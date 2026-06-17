@@ -250,7 +250,7 @@ def _run_request(
 ) -> runner.RunRequest:
     """Build a :class:`~vmlease.runner.RunRequest` from a list of distro families
     via the real expander (parse → resolve), mirroring the old positional signature
-    positional signature so runner/CLI tests migrate mechanically. Each ``distros``
+    so runner/CLI tests migrate mechanically. Each ``distros``
     item is a ``--hosts`` entry string (``family`` or ``family@version``)."""
     resolved = hosts.resolve(
         hosts.parse(",".join(distros)),
