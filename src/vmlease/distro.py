@@ -13,7 +13,7 @@ any particular battery. A consumer selects profiles by key in its matrix.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from vmlease.archimage import DEFAULT_ARCH_KEY_FINGERPRINT
@@ -221,8 +221,35 @@ _PROFILES: dict[str, DistroProfile] = {
     ),
 }
 
-# The public, read-only view: any `PROFILES[k] = ...` / `del` raises TypeError.
-PROFILES: Mapping[str, DistroProfile] = MappingProxyType(_PROFILES)
+# The authoritative registry, keyed by ``(family, version)`` (D-4). The base
+# per-family profiles in ``_PROFILES`` are each at that family's default version;
+# sibling versions are derived DRY via :func:`dataclasses.replace`, overriding
+# ONLY ``version`` + ``default_image`` so the package sets etc. stay single-source.
+_REGISTRY: dict[tuple[str, str], DistroProfile] = {
+    (profile.family, profile.version): profile for profile in _PROFILES.values()
+}
+_REGISTRY.update({
+    ("ubuntu", "22.04"): replace(_PROFILES["ubuntu"], version="22.04", default_image="ubuntu-22.04"),
+    ("debian", "12"): replace(_PROFILES["debian"], version="12", default_image="debian-12"),
+    ("fedora", "44"): replace(_PROFILES["fedora"], version="44", default_image="fedora-44"),
+})
+
+# Per-family default version — an EXPLICIT table (D-4), NOT first-entry-wins, so a
+# bare-family lookup is order-independent. Rolling families take ``ROLLING``.
+_DEFAULT_VERSION: Mapping[str, str] = MappingProxyType({
+    "ubuntu": "24.04",
+    "debian": "13",
+    "fedora": "43",
+    "arch": ROLLING,
+})
+
+# Deprecated read-only **family → default-profile** view (removed in the contract
+# group). Derived from the registry + the explicit default table so legacy
+# ``PROFILES[family]`` / ``frozenset(PROFILES)`` readers are unchanged. Any
+# `PROFILES[k] = ...` / `del` raises TypeError.
+PROFILES: Mapping[str, DistroProfile] = MappingProxyType({
+    family: _REGISTRY[(family, version)] for family, version in _DEFAULT_VERSION.items()
+})
 
 # The default distro matrix.
 DEFAULT_DISTRO_KEYS: tuple[str, ...] = ("ubuntu", "debian", "fedora", "arch")
@@ -265,11 +292,28 @@ class UnknownPackageManagerError(KeyError):
     """A profile's package manager has no known system-update command + no override."""
 
 
-def get_profile(key: str) -> DistroProfile:
-    """Return the profile for ``key`` or raise :class:`UnknownDistroError`."""
-    try:
-        return PROFILES[key]
-    except KeyError as exc:
+def get_profile(family: str, version: str | None = None) -> DistroProfile:
+    """Return the profile for ``family`` (its default version) or ``(family, version)``.
+
+    A bare ``family`` resolves through the explicit per-family default version
+    (:data:`_DEFAULT_VERSION`), so today's single-arg callers are unchanged.
+    Raises :class:`UnknownDistroError` for an unknown family, or for a known
+    family with an unknown version (rolling families such as ``arch`` accept only
+    :data:`ROLLING` — ``get_profile("arch", "24.04")`` errors; bare ``arch`` →
+    the rolling entry).
+    """
+    known_families = sorted({fam for fam, _v in _REGISTRY})
+    if family not in known_families:
         raise UnknownDistroError(
-            f"no distro profile for {key!r}; known: {sorted(PROFILES)}"
+            f"no distro profile for {family!r}; known families: {known_families}"
+        )
+    if version is None:
+        version = _DEFAULT_VERSION[family]
+    try:
+        return _REGISTRY[(family, version)]
+    except KeyError as exc:
+        known_versions = sorted(v for fam, v in _REGISTRY if fam == family)
+        raise UnknownDistroError(
+            f"no distro profile for {family!r}@{version!r}; "
+            f"known versions for {family!r}: {known_versions}"
         ) from exc

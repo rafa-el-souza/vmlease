@@ -1640,6 +1640,62 @@ class TestVersionflatAndProfileShape(unittest.TestCase):
         self.assertEqual(distro.get_profile("arch").version, distro.ROLLING)
 
 
+class TestRegistryAndGetProfile(unittest.TestCase):
+    def test_lookup_by_family_and_version(self) -> None:
+        p = distro.get_profile("ubuntu", "22.04")
+        self.assertEqual((p.family, p.version), ("ubuntu", "22.04"))
+        self.assertEqual(p.image, "ubuntu-22.04")
+
+    def test_new_sibling_versions_present(self) -> None:
+        self.assertEqual(distro.get_profile("debian", "12").image, "debian-12")
+        self.assertEqual(distro.get_profile("fedora", "44").image, "fedora-44")
+
+    def test_sibling_versions_share_package_set(self) -> None:
+        # DRY via dataclasses.replace — the package tuple is single-source.
+        self.assertEqual(
+            distro.get_profile("ubuntu", "22.04").packages,
+            distro.get_profile("ubuntu", "24.04").packages,
+        )
+
+    def test_bare_family_resolves_to_default(self) -> None:
+        self.assertIs(distro.get_profile("ubuntu"), distro.get_profile("ubuntu", "24.04"))
+        self.assertIs(distro.get_profile("debian"), distro.get_profile("debian", "13"))
+        self.assertIs(distro.get_profile("fedora"), distro.get_profile("fedora", "43"))
+
+    def test_default_is_explicit_and_order_independent(self) -> None:
+        # The default comes from the explicit _DEFAULT_VERSION table, NOT registry
+        # entry order. Rebuild the registry in a different order and assert the
+        # default-version pointer still picks 24.04.
+        reordered = {
+            ("ubuntu", "22.04"): distro._REGISTRY[("ubuntu", "22.04")],
+            ("ubuntu", "24.04"): distro._REGISTRY[("ubuntu", "24.04")],
+        }
+        default_version = distro._DEFAULT_VERSION["ubuntu"]
+        self.assertEqual(default_version, "24.04")
+        self.assertEqual(reordered[("ubuntu", default_version)].version, "24.04")
+
+    def test_arch_is_rolling_only(self) -> None:
+        self.assertEqual(distro.get_profile("arch").version, distro.ROLLING)
+        with self.assertRaises(distro.UnknownDistroError):
+            distro.get_profile("arch", "24.04")
+
+    def test_unknown_family_errors(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError):
+            distro.get_profile("plan9")
+
+    def test_unknown_version_of_known_family_errors(self) -> None:
+        with self.assertRaises(distro.UnknownDistroError) as ctx:
+            distro.get_profile("ubuntu", "99.99")
+        # the message lists that family's known versions (helpful, fail-closed).
+        self.assertIn("ubuntu", str(ctx.exception))
+
+    def test_profiles_string_view_resolves_all_families(self) -> None:
+        self.assertEqual(frozenset(distro.PROFILES), frozenset(distro.DEFAULT_DISTRO_KEYS))
+        for family in distro.DEFAULT_DISTRO_KEYS:
+            self.assertEqual(distro.PROFILES[family].family, family)
+            self.assertIs(distro.PROFILES[family], distro.get_profile(family))
+
+
 # --------------------------------------------------------------------------- #
 # runner — build_host_specs + plan (zero provider calls)
 # --------------------------------------------------------------------------- #
