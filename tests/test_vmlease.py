@@ -2690,6 +2690,7 @@ class TestCliLint(unittest.TestCase):
                         "--run-token", "lint-run",
                     ]),
                     reader=lambda _prompt: "n",
+                    provider_factory=FakeProvider,
                 )
             self.assertEqual(rc, 0)  # advisory only — does not gate
             self.assertIn("warning:", err.getvalue())
@@ -4371,7 +4372,7 @@ class TestKeepFlag(unittest.TestCase):
             # --keep confirm → must abort before any keypair is generated.
             answers = iter(["y", "n"])
             with mock.patch.object(cli, "generate_keypair", _spy_keygen), redirect_stdout(buf):
-                rc = cli._cmd_run(ns, reader=lambda _p: next(answers))
+                rc = cli._cmd_run(ns, reader=lambda _p: next(answers), provider_factory=FakeProvider)
             self.assertEqual(rc, 0)
             self.assertIn("aborted", buf.getvalue())
             self.assertEqual(generated, [])  # no keypair → no provisioning
@@ -5146,7 +5147,7 @@ class TestCliRun(unittest.TestCase):
             ])
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = cli._cmd_run(ns, reader=lambda _p: "n")
+                rc = cli._cmd_run(ns, reader=lambda _p: "n", provider_factory=FakeProvider)
             self.assertEqual(rc, 0)
             self.assertIn("aborted", buf.getvalue())
             self.assertFalse((Path(d) / "r").exists())  # no results written
@@ -5165,7 +5166,8 @@ class TestCliRun(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     rc = cli.main([
@@ -5182,7 +5184,8 @@ class TestCliRun(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
+            with mock.patch.object(cli, "HetznerProvider", FakeProvider), \
+                 mock.patch.object(cli, "generate_keypair", lambda rid: _fake_keypair(Path(d))):
                 buf = io.StringIO()
                 with redirect_stderr(buf):
                     rc = cli.main([
@@ -7538,6 +7541,11 @@ class TestCliReapImages(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(cli, "HetznerProvider", lambda: prov))
+            # keyring import shells out to real gpg (and may fetch the pinned
+            # key) — stub it so this class stays hermetic, as its docstring claims.
+            stack.enter_context(mock.patch.object(
+                cli, "ensure_arch_keyring", lambda keyring_path, run, fingerprint="": None
+            ))
             stack.enter_context(redirect_stdout(out))
             stack.enter_context(redirect_stderr(err))
             if resolve_current_keys is not None:

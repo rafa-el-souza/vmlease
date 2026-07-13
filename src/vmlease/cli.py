@@ -227,7 +227,12 @@ def _confirm(prompt: str, *, assume_yes: bool, reader: Callable[[str], str]) -> 
     return answer in ("y", "yes")
 
 
-def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
+def _cmd_run(
+    args: argparse.Namespace,
+    *,
+    reader: Callable[[str], str] = input,
+    provider_factory: Callable[[], Provider] | None = None,
+) -> int:
     try:
         battery = load_battery(Path(args.battery))
         req = _run_request_from_args(
@@ -302,7 +307,9 @@ def _cmd_run(args: argparse.Namespace, *, reader: Callable[[str], str] = input) 
     # confirm — the first provider call (a read). A LiveRunError → exit 2 (fail
     # closed); a ProviderError (liveness unverifiable) → exit 1 (never fail-open).
     run_id = make_run_id(args.run_token)
-    provider = HetznerProvider()
+    # None (not a HetznerProvider default) so the module global is resolved at
+    # CALL time — tests may inject the factory OR patch cli.HetznerProvider.
+    provider = (provider_factory or HetznerProvider)()
     try:
         assert_no_live_run(provider, run_id, args.run_token)
     except LiveRunError as exc:
@@ -525,7 +532,12 @@ def _backstop_reap_builder(provider: Provider, run_id: str, run_token: str, pref
         )
 
 
-def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] = input) -> int:
+def _cmd_build_image(
+    args: argparse.Namespace,
+    *,
+    reader: Callable[[str], str] = input,
+    provider_factory: Callable[[], Provider] | None = None,
+) -> int:
     """Build a content-addressed snapshot cache image (D8/D11 + the G5-G10 paths).
 
     Resolves the recipe's content key ONCE (one base-fingerprint resolve), no-ops
@@ -570,7 +582,7 @@ def _cmd_build_image(args: argparse.Namespace, *, reader: Callable[[str], str] =
     # can never compute divergent keys from a second parser inventing a different
     # order. `--requires` is repeatable; default `()` builds the capability-less variant.
     requires = canonical_requires(tuple(args.requires or ()))
-    provider = HetznerProvider()
+    provider = (provider_factory or HetznerProvider)()
 
     # Resolve the base fingerprint ONCE (the expensive, network/gpg step for a
     # rescue-write distro) and derive BOTH the content key and the source-fp label
@@ -826,10 +838,12 @@ def _cmd_summarize(args: argparse.Namespace) -> int:
     return overall_exit_code(summary)
 
 
-def _cmd_reap(args: argparse.Namespace) -> int:
+def _cmd_reap(
+    args: argparse.Namespace, *, provider_factory: Callable[[], Provider] | None = None
+) -> int:
     run_id = make_run_id(args.run_token)
     try:
-        reaped = reap(HetznerProvider(), run_id)
+        reaped = reap((provider_factory or HetznerProvider)(), run_id)
     except ProviderError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -880,7 +894,9 @@ def _reap_images_superseded_set(
         keyring_dir.cleanup()
 
 
-def _cmd_reap_images(args: argparse.Namespace) -> int:
+def _cmd_reap_images(
+    args: argparse.Namespace, *, provider_factory: Callable[[], Provider] | None = None
+) -> int:
     """Reap cached snapshot images as a persistent class (D10 — the ``reap-images`` verb).
 
     Filters (AND of every *given* predicate, within the ``--distro`` scope):
@@ -917,7 +933,7 @@ def _cmd_reap_images(args: argparse.Namespace) -> int:
             print(f"error: --older-than {args.older_than!r} is not a valid ISO-8601 cutoff: {exc}", file=sys.stderr)
             return 2
 
-    provider = HetznerProvider()
+    provider = (provider_factory or HetznerProvider)()
     try:
         images = provider.list_images(label_selector_purpose())
     except ProviderError as exc:
@@ -984,10 +1000,12 @@ def _created_before(image: Image, cutoff: object) -> bool:
     return created < cutoff
 
 
-def _cmd_status(args: argparse.Namespace) -> int:
+def _cmd_status(
+    args: argparse.Namespace, *, provider_factory: Callable[[], Provider] | None = None
+) -> int:
     run_id = make_run_id(args.run_token)
     try:
-        hosts = HetznerProvider().list_labeled(run_id)
+        hosts = (provider_factory or HetznerProvider)().list_labeled(run_id)
     except ProviderError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
