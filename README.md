@@ -5,8 +5,8 @@ project-agnostic VM-provisioning + probe harness. Built for empirical checks tha
 (the "ratified ≠ validated" gate): spin a disposable VM per host, run a declarative battery of probes,
 capture structured results, and guarantee teardown by default.
 
-> Graduated from `probehost` (developed inside the `internal-tooling` skill tree, HEAD `efb8f38`) into this
-> standalone repo. The behavior is a faithful port; the package/label were renamed `probehost` → `vmlease`.
+> Graduated from `probehost`, an internal test-harness module, into this standalone repo. The behavior
+> is a faithful port; the package/label were renamed `probehost` → `vmlease`.
 
 ## What it does
 

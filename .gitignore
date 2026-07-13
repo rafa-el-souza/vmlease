@@ -1,5 +1,6 @@
-# internal-tooling per-project state (untracked while the repo is local; revisit on going public)
+# Spec-workflow state — only openspec/specs/ is published
 openspec/explorations/
+openspec/changes/
 
 # Local agent tooling — not committed
 .claude/
