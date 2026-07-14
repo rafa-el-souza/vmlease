@@ -1,5 +1,7 @@
 # vmlease
 
+[![CI](https://github.com/rafa-el-souza/vmlease/actions/workflows/ci.yml/badge.svg)](https://github.com/rafa-el-souza/vmlease/actions/workflows/ci.yml)
+
 Provision throwaway cloud VMs, run a workload over SSH, and tear them down by default (or keep one live to debug) — a small,
 project-agnostic VM-provisioning + probe harness. Built for empirical checks that need a fresh, real host
 (the "ratified ≠ validated" gate): spin a disposable VM per host, run a declarative battery of probes,
