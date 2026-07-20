@@ -4,6 +4,8 @@ openspec/changes/
 
 # Local agent tooling — not committed
 .claude/
+# Containerized-gate HOME (uv caches/toolchains inside no-mistakes runs)
+.nm-home/
 
 # Python
 __pycache__/
