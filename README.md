@@ -575,14 +575,15 @@ automatically and is never the rescue key.
 All project commands run through the `Makefile` (which wraps `uv`):
 
 ```
-make install     # sync the env + dev tools
-make lint        # strict lint  (ruff)
-make typecheck   # strict types (mypy --strict)
-make test        # run the suite (warnings = errors)
-make coverage    # suite under coverage + report (fails below the floor)
-make format      # apply ruff's SAFE autofixes
-make check       # the full gate: lint -> typecheck -> test -> coverage
-make hooks       # install the gate as a pre-commit hook
+make install       # sync the env + dev tools
+make lint          # strict lint  (ruff)
+make lint-battery  # shellcheck the example battery (needs shellcheck)
+make typecheck     # strict types (mypy --strict)
+make test          # run the suite (warnings = errors)
+make coverage      # suite under coverage + report (fails below the floor)
+make format        # apply ruff's SAFE autofixes
+make check         # the full gate: lint -> lint-battery -> typecheck -> test -> coverage
+make hooks         # install the gate as a pre-commit hook
 ```
 
 > `ruff format` is **banned** (it has a code-mangling bug) — excluded in
