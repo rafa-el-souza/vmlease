@@ -24,6 +24,8 @@ def _build(key: str, value: object) -> Assertion:
 
 
 class TestRegistryShape(unittest.TestCase):
+    """The `_ASSERTIONS` registry has exactly the twelve documented keys, and built objects satisfy the `Assertion` protocol."""
+
     def test_exactly_the_twelve_keys(self) -> None:
         self.assertEqual(
             set(_ASSERTIONS),
@@ -51,6 +53,8 @@ class TestRegistryShape(unittest.TestCase):
 
 
 class TestExit(unittest.TestCase):
+    """The `exit`/`exit_not` assertions, including the no-range-check on out-of-0..255 ints (D8#9) and bool/non-int rejection."""
+
     def test_exit_pass(self) -> None:
         a = _build("exit", 0)
         self.assertIsNone(a.check(Outcome(0, "", "")))
@@ -85,6 +89,8 @@ class TestExit(unittest.TestCase):
 
 
 class TestSubstringHas(unittest.TestCase):
+    """The `stdout_has`/`stderr_has` substring-presence assertions, including list conjunction and the empty-stream case."""
+
     def test_pass(self) -> None:
         a = _build("stdout_has", "READY")
         self.assertIsNone(a.check(Outcome(0, "all READY now", "")))
@@ -119,6 +125,8 @@ class TestSubstringHas(unittest.TestCase):
 
 
 class TestSubstringLacks(unittest.TestCase):
+    """The `stdout_lacks`/`stderr_lacks` substring-absence assertions, including list conjunction and the empty-stream vacuous pass (D8)."""
+
     def test_pass(self) -> None:
         a = _build("stdout_lacks", "ERROR")
         self.assertIsNone(a.check(Outcome(0, "all good", "")))
@@ -149,6 +157,8 @@ class TestSubstringLacks(unittest.TestCase):
 
 
 class TestEmptyList(unittest.TestCase):
+    """List-shaped assertion values reject an empty list, a non-string element, and the wrong value shape."""
+
     def test_empty_list_rejected_naming_key(self) -> None:
         with self.assertRaises(ValueError) as ctx:
             _build("stdout_has", [])
@@ -164,6 +174,8 @@ class TestEmptyList(unittest.TestCase):
 
 
 class TestEmpty(unittest.TestCase):
+    """The `stdout_empty`/`stderr_empty` assertions, including `False` asserting non-emptiness (D8#4)."""
+
     def test_stdout_empty_true_pass_on_blank(self) -> None:
         a = _build("stdout_empty", True)
         self.assertIsNone(a.check(Outcome(0, "   \n", "")))
@@ -198,6 +210,8 @@ class TestEmpty(unittest.TestCase):
 
 
 class TestRegexMatches(unittest.TestCase):
+    """The `stdout_matches`/`stderr_matches` regex assertions, including unanchored search and list conjunction."""
+
     def test_stdout_happy(self) -> None:
         a = _build("stdout_matches", r"READ[Yy]")
         self.assertIsNone(a.check(Outcome(0, "all READY now", "")))
@@ -241,6 +255,8 @@ class TestRegexMatches(unittest.TestCase):
 
 
 class TestRegexMatchesNot(unittest.TestCase):
+    """The `stdout_matches_not`/`stderr_matches_not` regex-absence assertions, including list conjunction and the empty-stream vacuous pass."""
+
     def test_pass_when_absent(self) -> None:
         a = _build("stdout_matches_not", r"ERROR")
         self.assertIsNone(a.check(Outcome(0, "all good", "")))
