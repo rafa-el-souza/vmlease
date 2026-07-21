@@ -4,7 +4,7 @@ openspec/changes/
 
 # Local agent tooling — not committed
 .claude/
-# Containerized-gate HOME (uv caches/toolchains inside no-mistakes runs)
+# Containerized-gate HOME (uv cache/tool state) - see .no-mistakes.yaml
 .nm-home/
 # no-mistakes tooling output (evidence, state) - never tracked
 .no-mistakes/
