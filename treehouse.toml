@@ -3,5 +3,10 @@ root = ""
 
 # Worktree root directory (relative to repo root or absolute path).
 # Worktrees are placed under {root}/.treehouse/. Default: $HOME
-# max_trees = 4 is the fleet-wide concurrency ceiling (workflow design:
-# firstmate has no dispatch cap of its own; the pool is the structural limit).
+# max_trees = 4 is THIS REPO's concurrency ceiling, and the pool is the only
+# structural limit on crewmates: the firstmate has no dispatch cap of its own.
+# The setting is per repo, not fleet-wide - every repo in the rotation carries
+# its own treehouse.toml, so the fleet total is 4 x (number of such repos).
+# Reviewed and accepted as the design on 2026-07-21. An earlier version of this
+# comment called 4 the "fleet-wide concurrency ceiling", which the mechanism
+# never implemented; do not reintroduce that wording.
