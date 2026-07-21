@@ -13,6 +13,14 @@
 # such a pin would also move CI and every local `uv sync`, which is a
 # project-wide version-policy decision, not a gate detail.
 #
+# UV_PYTHON_DOWNLOADS=never enforces that instead of merely asserting it.
+# Nothing today would make uv fetch an interpreter - requires-python is
+# ">=3.11" and the image ships 3.14 - but the moment something narrows the
+# range (a ceiling in pyproject.toml, a .python-version, an image bumped past
+# it), uv's default is to quietly download a second interpreter into .nm-home
+# and pay for it on every gate run. With downloads off, that divergence fails
+# loudly at the gate, which is the whole point of the paragraph above.
+#
 # The bootstrap USED to live here (`command -v uv || pip install ... uv`) and
 # had to go: an unattended agent cannot run it. The `>` redirect trips the
 # "shell operator after a sandbox-excluded command" guard, and `pip install`
@@ -28,11 +36,11 @@
 commands:
   lint: >-
     hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
-    'set -e; export HOME="$PWD/.nm-home"
+    'set -e; export HOME="$PWD/.nm-home" UV_PYTHON_DOWNLOADS=never
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
     make lint'
   test: >-
     hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
-    'set -e; export HOME="$PWD/.nm-home"
+    'set -e; export HOME="$PWD/.nm-home" UV_PYTHON_DOWNLOADS=never
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
     make typecheck test coverage'
