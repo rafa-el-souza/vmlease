@@ -25,7 +25,3 @@ commands:
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
     command -v uv >/dev/null || pip install -q --target "$PWD/.nm-home/.local" uv;
     make typecheck test coverage'
-
-test:
-  evidence:
-    store_in_repo: true

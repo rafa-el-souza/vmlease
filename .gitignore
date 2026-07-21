@@ -6,6 +6,8 @@ openspec/changes/
 .claude/
 # Containerized-gate HOME (uv caches/toolchains inside no-mistakes runs)
 .nm-home/
+# no-mistakes tooling output (evidence, state) - never tracked
+.no-mistakes/
 
 # Python
 __pycache__/
