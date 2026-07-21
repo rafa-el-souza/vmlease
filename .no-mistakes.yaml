@@ -2,26 +2,31 @@
 # default branch, never from the pushed branch - changes here land via PR.
 #
 # Every lint/test command runs inside a hardened-run container (rootless
-# podman + gVisor). The fetch profile provides egress for dependency installs
-# (uv bootstrap + uv-managed sync); the container rootfs is read-only, so HOME
-# is redirected into the worktree (.nm-home/, gitignored) - uv caches and tool
-# state persist per-worktree across runs.
+# podman + gVisor). The image ships uv, so there is no bootstrap step; the
+# fetch profile provides egress for `uv sync`. The container rootfs is
+# read-only, so HOME is redirected into the worktree (.nm-home/, gitignored) -
+# uv caches and tool state persist per-worktree across runs.
+#
+# The bootstrap USED to live here (`command -v uv || pip install ... uv`) and
+# had to go: an unattended agent cannot run it. The `>` redirect trips the
+# "shell operator after a sandbox-excluded command" guard, and `pip install`
+# trips the "package install onto the host" guard - both fire on the command
+# line, before anything reaches the container. A gate the fleet cannot run is
+# a gate that produces unvalidated commits at 3am.
 #
 # KNOWN GAP: `make check` upstream also runs lint-battery, which needs
-# shellcheck inside the container; the pinned python-3.13 image has none.
-# lint-battery stays in CI until the image (or a dedicated one) grows
-# shellcheck. Gate = lint + typecheck + test + coverage.
+# shellcheck inside the container; the uv-python-3.14 image has none either.
+# lint-battery stays in CI until some image grows shellcheck.
+# Gate = lint + typecheck + test + coverage.
 
 commands:
   lint: >-
-    hardened-run --profile fetch --image python-3.13 -d "$PWD" -- bash -c
-    'set -e; export HOME="$PWD/.nm-home" PATH="$PWD/.nm-home/.local/bin:$PATH"
+    hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
+    'set -e; export HOME="$PWD/.nm-home"
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
-    command -v uv >/dev/null || pip install -q --target "$PWD/.nm-home/.local" uv;
     make lint'
   test: >-
-    hardened-run --profile fetch --image python-3.13 -d "$PWD" -- bash -c
-    'set -e; export HOME="$PWD/.nm-home" PATH="$PWD/.nm-home/.local/bin:$PATH"
+    hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
+    'set -e; export HOME="$PWD/.nm-home"
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
-    command -v uv >/dev/null || pip install -q --target "$PWD/.nm-home/.local" uv;
     make typecheck test coverage'
