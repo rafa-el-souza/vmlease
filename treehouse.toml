@@ -3,9 +3,6 @@
 # The setting is per repo and every repo gets its own independent pool, so the
 # fleet total is the SUM of max_trees across all repos in the rotation, not this
 # number - this repo can neither see nor enforce what the others set.
-# Per-repo scope is the design settled on 2026-07-21; an earlier version of this
-# comment called 4 the "fleet-wide concurrency ceiling", which the mechanism
-# never implemented.
 max_trees = 4
 
 # Worktree root directory (relative to repo root or absolute path).
