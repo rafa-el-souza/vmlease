@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for vmlease.assertions — the eight non-regex assertion kinds.
+"""Unit tests for vmlease.assertions — all twelve assertion kinds.
 
 stdlib unittest only. Run with:
     uv run python -m unittest discover -s tests -t .
