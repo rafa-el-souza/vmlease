@@ -1,0 +1,27 @@
+# no-mistakes gate config. Trusted-only: the daemon reads this from the
+# default branch, never from the pushed branch - changes here land via PR.
+#
+# Every lint/test command runs inside a hardened-run container (rootless
+# podman + gVisor). The fetch profile provides egress for dependency installs
+# (uv bootstrap + uv-managed sync); the container rootfs is read-only, so HOME
+# is redirected into the worktree (.nm-home/, gitignored) - uv caches and tool
+# state persist per-worktree across runs.
+#
+# KNOWN GAP: `make check` upstream also runs lint-battery, which needs
+# shellcheck inside the container; the pinned python-3.13 image has none.
+# lint-battery stays in CI until the image (or a dedicated one) grows
+# shellcheck. Gate = lint + typecheck + test + coverage.
+
+commands:
+  lint: >-
+    hardened-run --profile fetch --image python-3.13 -d "$PWD" -- bash -c
+    'set -e; export HOME="$PWD/.nm-home" PATH="$PWD/.nm-home/.local/bin:$PATH"
+    USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
+    command -v uv >/dev/null || pip install -q --target "$PWD/.nm-home/.local" uv;
+    make lint'
+  test: >-
+    hardened-run --profile fetch --image python-3.13 -d "$PWD" -- bash -c
+    'set -e; export HOME="$PWD/.nm-home" PATH="$PWD/.nm-home/.local/bin:$PATH"
+    USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
+    command -v uv >/dev/null || pip install -q --target "$PWD/.nm-home/.local" uv;
+    make typecheck test coverage'
