@@ -7,6 +7,12 @@
 # read-only, so HOME is redirected into the worktree (.nm-home/, gitignored) -
 # uv caches and tool state persist per-worktree across runs.
 #
+# The image name below is the single source of the gate's Python version: the
+# image ships exactly one interpreter and `uv sync` selects it, so bumping the
+# image IS the version bump. The repo carries no .python-version on purpose -
+# such a pin would also move CI and every local `uv sync`, which is a
+# project-wide version-policy decision, not a gate detail.
+#
 # The bootstrap USED to live here (`command -v uv || pip install ... uv`) and
 # had to go: an unattended agent cannot run it. The `>` redirect trips the
 # "shell operator after a sandbox-excluded command" guard, and `pip install`
