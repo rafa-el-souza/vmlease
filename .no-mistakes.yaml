@@ -35,12 +35,12 @@
 
 commands:
   lint: >-
-    hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
+    hardened-run --profile fetch --domain dev --image uv-python-3.14 -d "$PWD" -- bash -c
     'set -e; export HOME="$PWD/.nm-home" UV_PYTHON_DOWNLOADS=never
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
     make lint'
   test: >-
-    hardened-run --profile fetch --image uv-python-3.14 -d "$PWD" -- bash -c
+    hardened-run --profile fetch --domain dev --image uv-python-3.14 -d "$PWD" -- bash -c
     'set -e; export HOME="$PWD/.nm-home" UV_PYTHON_DOWNLOADS=never
     USER="${USER:-nm-gate}" LOGNAME="${LOGNAME:-nm-gate}";
     make typecheck test coverage'
